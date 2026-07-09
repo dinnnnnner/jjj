@@ -1,6 +1,6 @@
 ﻿# demo2 项目详细文档
 
-本文档基于当前仓库源码整理，面向开发、联调、测试和后续维护。项目根目录为 `xd/`，Rust 包名为 `demo2`。
+本文档基于当前仓库源码整理，面向开发、联调、测试和后续维护。项目根目录为当前仓库根目录，Rust 包名为 `demo2`。接口协议的完整字段见 `docs/api.md`。
 
 ## 1. 项目概览
 
@@ -41,7 +41,7 @@
 ## 3. 顶层目录结构
 
 ```text
-xd/
+demo2/
   Cargo.toml
   Cargo.lock
   README.md
@@ -49,11 +49,11 @@ xd/
   config.toml
   docker-compose.yml
   docs/
-    architecture.md              旧架构文档，当前存在中文编码损坏
+    api.md                       进程间接口、帧协议、JSON 消息和数据库表结构
+    architecture.md              架构与数据流说明
     project_documentation.md     本文档
-  exports/                       CAN/回放导出文件示例
   scripts/
-    run_demo2.ps1                Windows 一键启动脚本，当前中文提示存在编码损坏
+    run_demo2.ps1                Windows 一键启动脚本
   src/
     lib.rs
     app/
@@ -91,7 +91,6 @@ xd/
 UI 客户端的支撑模块目录。当前 `src/bin/ui_client.rs` 已收缩为约百行的薄入口和 `UiClientApp` 外壳，入口流程、状态、事件处理、业务逻辑和 UI 绘制已下沉到 `src/ui_client/`：
 
 - `alarm.rs`：处理告警状态、CAN 阈值告警、SENT 跳变告警和样本落入曲线缓存。
-- `alarm_db.rs`：维护本地告警事件写 PostgreSQL 的后台线程。
 - `config.rs`：读取 `DEMO2_UI_FEED_ADDR`、`DEMO2_PG_DSN` 和 `config.toml` 中的连接配置。
 - `events.rs`：处理 `UiMsg` 队列消息，包括状态更新、实时样本、告警、CAN 回放结果和报警记录查询结果。
 - `messages.rs`：定义 UI feed 使用的 `TelemetryMsg` 和 `FeedMsg`。
@@ -463,7 +462,6 @@ Health:      127.0.0.1:19012
 
 - `src/bin/ui_client.rs`：薄入口和 `UiClientApp` 外壳资源。
 - `src/ui_client/alarm.rs`：告警规则和实时样本入队。
-- `src/ui_client/alarm_db.rs`：告警事件本地 DB 写入线程。
 - `src/ui_client/config.rs`：feed 地址与 PostgreSQL DSN 的配置读取。
 - `src/ui_client/events.rs`：UI 队列消息分发和实时样本处理。
 - `src/ui_client/messages.rs`：UI feed 消息结构。
@@ -629,7 +627,7 @@ cargo run --bin serial_sender_ui
 
 采集服务读取当前工作目录下的 `config.toml`。如果文件不存在或解析失败，则回退到 `CollectorConfig::default()`。
 
-示例配置位于 `config.toml.example`。注意：当前 `docker-compose.yml` 中 PostgreSQL 密码是 `123456`，而 `config.toml.example` 中 `pg_dsn` 密码为 `postgres`。如果使用仓库自带 Docker Compose，建议把 `pg_dsn` 密码改为 `123456`，或同步修改 Docker Compose 的密码。
+示例配置位于 `config.toml.example`。仓库自带 Docker Compose 的 PostgreSQL 默认密码是 `123456`，示例 DSN 已与该默认值保持一致。
 
 常用配置项：
 
@@ -637,6 +635,7 @@ cargo run --bin serial_sender_ui
 [collector]
 ingress_addr = "127.0.0.1:19010"
 ui_feed_addr = "127.0.0.1:19011"
+control_addr = "127.0.0.1:19013"
 health_addr = "127.0.0.1:19012"
 
 pg_dsn = "host=127.0.0.1 port=5432 user=postgres password=123456 dbname=demo2"
@@ -652,6 +651,7 @@ can_hardware_name = "TC1012"
 can_channel = 0
 can_baud_kbps = 500
 can_data_baud_kbps = 2000
+can_channels = [0, 1]
 can_autostart_tsmaster = true
 
 db_filter_enabled = false
@@ -666,12 +666,6 @@ max_payload = 4096
 bus_capacity = 10000
 ui_feed_capacity = 10000
 ```
-
-当前本地 `config.toml` 中有这些值得注意的设置：
-
-- `ingress_addr = "0.0.0.0:19010"`，允许外部主机连接 TCP ingress。
-- `can_enabled = true`，启动时会尝试打开 CAN。
-- `serial_port = "COM3"` 且 `serial_mode = "demo"`，启动时会尝试打开 COM3。
 
 如果只是跑 TCP sender 联调，可以临时关闭 CAN 和串口：
 
@@ -693,6 +687,7 @@ DEMO2_COLLECTOR_SERIAL_BAUD
 DEMO2_COLLECTOR_SERIAL_MODE
 DEMO2_COLLECTOR_CAN_ENABLED
 DEMO2_COLLECTOR_CAN_CHANNEL
+DEMO2_COLLECTOR_CAN_CHANNELS
 DEMO2_COLLECTOR_CAN_HW_NAME
 DEMO2_COLLECTOR_CAN_TSMASTER_BIN
 DEMO2_COLLECTOR_CAN_AUTOSTART_TSMASTER
@@ -713,6 +708,7 @@ DEMO2_SENT_FILTER_WINDOW
 
 ```text
 DEMO2_UI_FEED_ADDR
+DEMO2_COLLECTOR_CONTROL_ADDR
 DEMO2_PG_DSN
 ```
 
@@ -876,7 +872,7 @@ $env:TSMASTER_BIN = "D:\TSMaster\bin64"
 - 分别为 collector、UI、sender 设置独立 `CARGO_TARGET_DIR`。
 - 通过新 PowerShell 窗口启动各进程。
 
-当前脚本中的中文提示存在编码损坏，但逻辑仍可读。
+脚本会在新 PowerShell 窗口中分别启动 collector、UI 和可选 sender。
 
 ## 10. 数据流
 
@@ -1122,15 +1118,13 @@ Invoke-RestMethod http://127.0.0.1:19012/ready
 
 ## 14. 告警机制
 
-当前仓库中存在两套告警相关逻辑：
+当前告警由 `src/app/alarm_service.rs` 统一评估，并通过 `AlarmRaised` / `AlarmCleared` 事件输出：
 
-1. `src/app/alarm_service.rs` 定义了 `AlarmRule` 和 `AlarmService`，但 `evaluate_sample` 当前为空实现。因此 collector 的通用阈值告警服务目前不会产生新告警。
-2. 接入层和 UI 中存在专项告警：
-   - 串口 demo alarm bit 会发布 `demo_alarm_bit` 告警。
-   - CAN SENT error 会发布 `sent_error_<type>` 告警。
-   - UI 内部有 CAN 阈值、SENT 跳变等展示和记录逻辑。
+1. 通用 sensor 阈值规则：通过 `set_rule(sensor_id, AlarmRule)` 注册，使用 high/low 与 high_clear/low_clear 的滞回机制。
+2. SENT 跳变告警：默认阈值来自 `SentJumpAlarmConfig`，可通过 control 接口更新。
+3. 接入层专项告警：串口 demo alarm bit 和 CAN SENT error 会直接发布告警事件。
 
-如果后续要恢复通用阈值告警，应优先补全 `AlarmService::evaluate_sample`，并明确规则来源、状态存储和恢复条件。
+collector 的 UI feed 和 PostgreSQL 写入器都订阅同一条 processed bus，因此告警会同时进入 UI 和数据库。
 
 ## 15. 滤波机制
 
@@ -1262,13 +1256,7 @@ $env:DEMO2_COLLECTOR_CAN_AUTOSTART_TSMASTER = "0"
 
 ### 16.6 中文显示乱码
 
-已观察到：
-
-- `docs/architecture.md` 中文编码损坏。
-- `scripts/run_demo2.ps1` 中文提示字符串损坏。
-- `ui_client.rs` 中部分中文 UI 文案也已损坏。
-
-这类问题通常不是业务逻辑错误，而是文件编码或历史保存方式导致。建议统一转为 UTF-8，并逐步修复 UI 文案和脚本提示。
+如果后续发现终端或编辑器中中文显示异常，优先确认文件按 UTF-8 打开，并检查 PowerShell 控制台编码。
 
 ## 17. 测试
 
@@ -1337,15 +1325,13 @@ cargo check
 
 当前进展：`ui_client` 已完成从单文件 UI 到 `src/ui_client/` 多模块结构的拆分；独立外部客户端入口 `ui_client` 与单进程演示入口 `ui_client_embedded` 的二进制拆分仍未完成。
 
-### 18.5 修复编码损坏文件
+### 18.5 文档与配置保持同步
 
-建议优先级：
+建议在修改端口、JSON 消息、数据库 schema、环境变量或二进制参数时，同步更新：
 
-1. `ui_client.rs` 中的可见 UI 文案。
-2. `scripts/run_demo2.ps1` 中的中文提示。
-3. 旧 `docs/architecture.md`。
-
-修复后统一保存为 UTF-8。
+1. `docs/api.md`
+2. `README.md`
+3. `config.toml.example`
 
 ## 19. 推荐开发流程
 

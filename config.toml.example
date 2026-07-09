@@ -1,6 +1,7 @@
 ﻿[collector]
 ingress_addr = "127.0.0.1:19010"
 ui_feed_addr = "127.0.0.1:19011"
+control_addr = "127.0.0.1:19013"
 health_addr = "127.0.0.1:19012"
 can_enabled = false
 can_hardware_name = "TC1012"
@@ -8,7 +9,7 @@ can_channel = 0
 can_baud_kbps = 500
 can_data_baud_kbps = 2000
 can_channels = [0, 1]
-pg_dsn = "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=demo2"
+pg_dsn = "host=127.0.0.1 port=5432 user=postgres password=123456 dbname=demo2"
 pg_connect_max_retries = 20
 pg_connect_retry_ms = 1000
 db_filter_cutoff_hz = 4000.0

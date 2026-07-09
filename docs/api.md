@@ -1,0 +1,310 @@
+# demo2 API 文档
+
+本文档描述当前源码实际暴露的进程间接口、帧协议、JSON 消息和数据库表结构。默认地址来自 `CollectorConfig::default()` 和 `config.toml.example`。
+
+## 1. 端口总览
+
+| 接口 | 默认地址 | 协议 | 说明 |
+| --- | --- | --- | --- |
+| TCP ingress | `127.0.0.1:19010` | 自定义二进制帧/TCP | 设备或测试 sender 上传遥测帧。 |
+| UI feed | `127.0.0.1:19011` | JSON Lines/TCP | collector 向 UI 推送遥测、告警和状态消息。 |
+| Health | `127.0.0.1:19012` | HTTP/1.1 | 健康检查和 ready 检查。 |
+| Control | `127.0.0.1:19013` | JSON Lines/TCP | UI 或工具下发 collector 控制命令。 |
+
+## 2. TCP Ingress 帧协议
+
+帧结构：
+
+```text
+magic:      u16 = 0xAA55
+body_len:   u16
+request_id: u64
+kind:       u8
+payload:    [u8; N]
+crc16:      u16
+```
+
+`body_len` 覆盖 `request_id + kind + payload`。CRC16 的计算范围也是 `request_id + kind + payload`。`SimpleFrameCodec` 会处理粘包、拆包、错位恢复、长度上限和 CRC 校验。
+
+常用 `kind`：
+
+| kind | 方向 | 说明 |
+| --- | --- | --- |
+| `0x34` | 设备 -> collector | 遥测上报。 |
+| `0x90` | collector -> 设备 | ACK，payload 当前为 `demo2-ack`。 |
+| `0xF0` | 任意 | 心跳请求。 |
+| `0xF1` | 任意 | 心跳响应。 |
+
+legacy 遥测 payload 是 UTF-8 文本：
+
+```text
+sid=<sensor_id>,value=<float>
+```
+
+示例：
+
+```text
+sid=3,value=47.381
+```
+
+collector 收到合法遥测后会发布 `TelemetrySample`，并回发 `kind = 0x90` 的 ACK。
+
+## 3. UI Feed JSON Lines
+
+UI feed 是 TCP 长连接，不是 HTTP。客户端连接 `ui_feed_addr` 后，collector 每行发送一个 JSON 消息，行尾为 `\n`。
+
+外层消息使用 serde tag：
+
+```json
+{"type":"telemetry","payload":{...}}
+{"type":"alarm","payload":{...}}
+{"type":"status","payload":"..."}
+```
+
+### 3.1 telemetry
+
+```json
+{
+  "type": "telemetry",
+  "payload": {
+    "device_id": "tcp://127.0.0.1:54321",
+    "sensor_id": 0,
+    "axis": "",
+    "alarm_bit": false,
+    "t_sec": 1.23,
+    "value": 47.381,
+    "request_id": 100,
+    "source_kind": "TcpFrame"
+  }
+}
+```
+
+字段说明：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `device_id` | string | 设备标识，例如 `tcp://...`、`serial://COM3` 或 CAN 设备 ID。 |
+| `sensor_id` | integer | 传感器编号。 |
+| `axis` | string | collector 根据 `source_kind` 和 `sensor_id` 推导出的轴名。 |
+| `alarm_bit` | boolean | 上游协议携带的告警位。 |
+| `t_sec` | number | 样本相对时间，单位秒。 |
+| `value` | number | 样本值。 |
+| `request_id` | integer | 原始请求 ID 或入口生成的序号。 |
+| `source_kind` | string | 遥测来源。 |
+
+`source_kind` 当前包括：
+
+```text
+Unknown
+SerialDemo
+SerialSent1
+SerialSent2
+SerialSent3
+CanAxis
+CanSent
+TcpFrame
+FrameStream
+```
+
+`axis` 推导规则：
+
+| 来源 | sensor_id | axis |
+| --- | --- | --- |
+| `SerialDemo` | `0/1/2` | `x/y/z` |
+| `CanAxis` | `0/1/2` | `x/y/z` |
+| `CanSent` | `0/1/2/3/4` | `t1_angle/t1_torque/t2_angle/t2_torque/s_angle` |
+| 其他 | 任意 | 空字符串 |
+
+### 3.2 alarm
+
+```json
+{
+  "type": "alarm",
+  "payload": {
+    "device_id": "can://TC1012",
+    "alarm_id": "sent_torque_jump_t1",
+    "level": "Critical",
+    "message": "T1 torque jump=0.350, warn=0.200, red=0.300, purple=0.400",
+    "raised_at": "...",
+    "cleared": false
+  }
+}
+```
+
+`level` 来自 `AlarmLevel`，当前代码使用 `Info`、`Warning`、`Critical`、`Purple`。`raised_at` 是 Rust `SystemTime` 通过 serde 输出的时间字段；`cleared = true` 表示告警恢复事件。
+
+### 3.3 status
+
+```json
+{"type":"status","payload":"collector serial legacy session started"}
+```
+
+`status` 用于运行状态提示和系统事件转发。
+
+## 4. Control JSON Lines
+
+control 接口是 TCP JSON 行协议。客户端连接 `control_addr`，发送一行 JSON 命令后读取一行 JSON 响应，连接可关闭。
+
+### 4.1 设置 SENT 跳变阈值
+
+请求：
+
+```json
+{
+  "type": "set_sent_jump_thresholds",
+  "torque_warn": 0.2,
+  "torque_red": 0.3,
+  "torque_purple": 0.4,
+  "angle_t_red": 0.2,
+  "angle_s_red": 1.0
+}
+```
+
+成功响应：
+
+```json
+{"ok":true}
+```
+
+失败响应：
+
+```json
+{"ok":false,"error":"SENT jump thresholds must be finite numbers"}
+```
+
+阈值会被规范化：扭矩阈值取绝对值并保证 `warn <= red <= purple`，角度阈值取绝对值。更新成功后 collector 会发布一条 `status` 消息到 UI feed。
+
+## 5. Health HTTP API
+
+### 5.1 `GET /health`
+
+返回 HTTP 200 和 collector 运行状态：
+
+```json
+{
+  "ingress_ready": true,
+  "ui_ready": true,
+  "ingress_connections": 1,
+  "ui_clients": 1,
+  "samples_rx": 12345,
+  "ui_drop": 0,
+  "db_drop": 0,
+  "db_write_fail": 0,
+  "last_db_error": null
+}
+```
+
+### 5.2 `GET /ready`
+
+当 TCP ingress 和 UI feed 都已就绪时返回：
+
+```json
+{"ready":true}
+```
+
+否则返回 HTTP 503：
+
+```json
+{"ready":false}
+```
+
+## 6. 串口协议
+
+collector 的 `serial_mode` 支持：
+
+```text
+legacy
+demo
+sent
+sent1
+sent2
+sent3
+```
+
+`sent1`、`sent2`、`sent3` 在 collector 配置解析时按 SENT 模式处理，具体语义由 SENT 帧 `pause` 字段区分。
+
+SENT 帧固定 10 字节：
+
+```text
+sync marker: 0xF0
+status:      4-bit
+channel_1:   12-bit
+channel_2:   12-bit
+crc:         4-bit
+pause:       4-bit
+```
+
+`pause` 映射：
+
+| pause | 来源 | 发布 sensor |
+| --- | --- | --- |
+| `0x1` | SENT1 | `0/1` |
+| `0x6` | SENT2 | `2/3` |
+| `0xB` | SENT3 | `4` |
+
+## 7. CAN 数据映射
+
+普通 CAN 三轴样本：
+
+| CAN ID | sensor_id | axis |
+| --- | --- | --- |
+| `0x100` | `0` | `x` |
+| `0x102` | `1` | `y` |
+| `0x104` | `2` | `z` |
+
+SENT over CAN 的 `f32` 小端偏移：
+
+| sensor_id | 信号 | offset |
+| --- | --- | --- |
+| `0` | T1 angle | `25` |
+| `1` | T1 torque | `29` |
+| `2` | T2 angle | `1` |
+| `3` | T2 torque | `5` |
+| `4` | S angle | `49` |
+
+`identifier = 3` 表示 SENT error 帧，会被转换为告警事件。
+
+## 8. 数据库表
+
+collector 使用 PostgreSQL，schema 定义在 `src/db/mod.rs`。
+
+### 8.1 telemetry_samples
+
+```text
+id BIGINT GENERATED ALWAYS AS IDENTITY
+ts_ms BIGINT NOT NULL
+created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+device_id TEXT NOT NULL
+sensor_id INTEGER NOT NULL
+axis TEXT NOT NULL DEFAULT ''
+alarm_bit BOOLEAN NOT NULL DEFAULT FALSE
+t_sec DOUBLE PRECISION NOT NULL
+value DOUBLE PRECISION NOT NULL
+request_id BIGINT NOT NULL
+PRIMARY KEY (created_at, id)
+```
+
+该表按 `created_at` 日期范围分区。写入前会调用 `ensure_telemetry_partition_for_day(target_day DATE)` 确保当天分区存在。
+
+### 8.2 alarm_events
+
+```text
+id BIGSERIAL PRIMARY KEY
+ts_ms BIGINT NOT NULL
+created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+device_id TEXT NOT NULL
+alarm_id TEXT NOT NULL
+level TEXT NOT NULL
+message TEXT NOT NULL
+cleared BOOLEAN NOT NULL
+```
+
+### 8.3 system_events
+
+```text
+id BIGSERIAL PRIMARY KEY
+ts_ms BIGINT NOT NULL
+created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+level TEXT NOT NULL
+message TEXT NOT NULL
+```

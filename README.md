@@ -9,6 +9,7 @@
 - CAN 接入：可通过 TSMaster / TC1012 相关配置启用，支持 SENT 数据滤波。
 - UI 数据流：监听 `127.0.0.1:19011`，向 UI 客户端推送 JSON 行流。
 - 健康检查：监听 `127.0.0.1:19012`，提供 `/health` 和 `/ready`。
+- 控制接口：监听 `127.0.0.1:19013`，通过 TCP JSON 行命令更新 SENT 跳变阈值。
 - 告警服务：按传感器阈值触发和恢复告警事件。
 - PostgreSQL 持久化：写入遥测、告警和系统事件，遥测表按日期分区。
 - UI 客户端：展示多传感器实时曲线、状态、告警记录和历史数据回放视图。
@@ -29,7 +30,7 @@ src/
   bin/        collector、UI、sender、DB 工具
 ```
 
-更细的架构说明见 `docs/architecture.md`。注意该文件当前存在编码异常，README 以源码和当前配置为准。
+更细的架构说明见 `docs/architecture.md`，接口协议见 `docs/api.md`。
 
 ## 环境要求
 
@@ -119,6 +120,7 @@ cargo run --bin sender_1min
 [collector]
 ingress_addr = "127.0.0.1:19010"
 ui_feed_addr = "127.0.0.1:19011"
+control_addr = "127.0.0.1:19013"
 health_addr = "127.0.0.1:19012"
 
 pg_dsn = "host=127.0.0.1 port=5432 user=postgres password=123456 dbname=demo2"
@@ -134,6 +136,7 @@ can_hardware_name = "TC1012"
 can_channel = 0
 can_baud_kbps = 500
 can_data_baud_kbps = 2000
+can_channels = [0, 1]
 
 db_filter_enabled = false
 db_filter_order = 10
@@ -168,10 +171,12 @@ CAN SENT 原始值在 `src/ingress/can.rs` 的 `decode_sent_values` 中解析为
 
 - `DEMO2_DISABLE_DB=1`：禁用 PostgreSQL 持久化。
 - `DEMO2_COLLECTOR_SERIAL_PORT` / `DEMO2_COLLECTOR_SERIAL_BAUD` / `DEMO2_COLLECTOR_SERIAL_MODE`：覆盖串口接入。
-- `DEMO2_COLLECTOR_CAN_ENABLED` / `DEMO2_COLLECTOR_CAN_CHANNEL` / `DEMO2_COLLECTOR_CAN_HW_NAME`：覆盖 CAN 接入。
+- `DEMO2_COLLECTOR_CAN_ENABLED` / `DEMO2_COLLECTOR_CAN_CHANNEL` / `DEMO2_COLLECTOR_CAN_CHANNELS` / `DEMO2_COLLECTOR_CAN_HW_NAME`：覆盖 CAN 接入。
 - `DEMO2_COLLECTOR_CAN_TSMASTER_BIN` / `DEMO2_COLLECTOR_CAN_AUTOSTART_TSMASTER`：配置 TSMaster 启动。
+- `DEMO2_COLLECTOR_CAN_BAUD_KBPS` / `DEMO2_COLLECTOR_CAN_DATA_BAUD_KBPS`：覆盖 CAN 仲裁/数据波特率。
 - `DEMO2_SENT_FILTER_ENABLED` / `DEMO2_SENT_FILTER_WINDOW`：覆盖 SENT 滤波配置。
 - `DEMO2_UI_FEED_ADDR`：覆盖 UI 客户端连接的 feed 地址。
+- `DEMO2_COLLECTOR_CONTROL_ADDR`：覆盖 UI 客户端连接的控制接口地址。
 - `DEMO2_PG_DSN`：覆盖 UI 查询历史数据使用的数据库连接串。
 
 ## 二进制入口
@@ -191,7 +196,6 @@ CAN SENT 原始值在 `src/ingress/can.rs` 的 `decode_sent_values` 中解析为
 `ui_client` 的二进制入口仍在 `src/bin/ui_client.rs`，当前入口只负责调用运行器；运行器会先启动内嵌 collector，再启动 egui UI：
 
 - `alarm.rs`：处理告警状态、CAN 阈值告警、SENT 跳变告警和样本落入曲线缓存。
-- `alarm_db.rs`：维护本地告警事件写 PostgreSQL 的后台线程。
 - `config.rs`：读取 UI feed 地址和 PostgreSQL DSN。
 - `events.rs`：处理 UI 队列消息、实时样本、状态更新、CAN 回放结果和报警记录查询结果。
 - `feed.rs`：维护 TCP feed 连接、重连、JSON 行解码、队列投递和 feed 统计。
@@ -252,6 +256,8 @@ cargo run --bin check_db_partition
 `/health` 返回采集、UI、样本数、丢弃计数、数据库写入失败和最近数据库错误等状态；`/ready` 在 ingress 与 UI feed 均就绪时返回 200。
 
 ## 协议概要
+
+完整接口说明见 `docs/api.md`。以下是 TCP legacy 上传协议概要。
 
 TCP legacy 帧格式：
 

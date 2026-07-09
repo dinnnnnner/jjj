@@ -1,349 +1,217 @@
-# demo2 详细架构与实现文档
+# demo2 架构文档
 
-本文档面向当前仓库代码（`demo2` + `tcp_frame_sender`），目标是给出可维护、可联调、可扩展的工程说明。
+本文档面向当前仓库代码，说明 collector、UI、接入协议、事件总线和持久化之间的关系。接口字段和示例见 `docs/api.md`。
 
 ## 1. 项目定位
 
-- `demo2` 是接收端（上位机）核心工程。
-- `tcp_frame_sender` 是测试发送端，用于模拟多传感器 TCP 上报。
-- 当前推荐运行形态是“采集服务 + UI 客户端”分离部署：
-  - `collector_service`：接入设备、解码、会话处理、事件发布、告警计算、可选入库。
-  - `ui_client`：仅消费采集服务推送的 JSON 行流并实时展示。
+`demo2` 是一个 Rust 上位机 MVP，负责设备数据接入、协议解码、事件分发、告警计算、PostgreSQL 持久化和 egui 桌面展示。
 
----
+当前主要运行形态：
 
-## 2. 分层架构（代码映射）
+- `collector_service`：采集服务，负责 TCP / 串口 / CAN 接入、UI feed、control、health 和数据库写入。
+- `ui_client`：桌面 UI，连接 UI feed，并可通过 control 接口更新 SENT 跳变告警阈值。
 
-### 2.1 传输层 `src/transport`
+注意：当前 `ui_client` 入口仍会内嵌启动一份 collector runtime，适合演示。若已经单独启动 `collector_service`，需要注意端口占用。
 
-- 核心 trait：`Transport`
-  - `connect/read/write_all/close`
-- 实现：
-  - `TcpTransport`：主动连接（客户端模式）
-  - `ConnectedTcpTransport`：使用已 accept 的 socket（服务端接入会话）
+## 2. 进程与端口
 
-职责边界：
-- 只处理字节流 I/O，不理解业务字段，不做告警，不做 UI。
+| 组件 | 默认地址 | 说明 |
+| --- | --- | --- |
+| TCP ingress | `127.0.0.1:19010` | 设备或 sender 上传二进制帧。 |
+| UI feed | `127.0.0.1:19011` | collector 向 UI 推送 JSON Lines。 |
+| Health | `127.0.0.1:19012` | HTTP `/health` 和 `/ready`。 |
+| Control | `127.0.0.1:19013` | TCP JSON Lines 控制命令。 |
 
-### 2.2 协议层 `src/protocol`
+## 3. 代码分层
 
-- 核心类型：
-  - `Frame { request_id, kind, payload }`
-  - `FrameCodec` trait
-  - `SimpleFrameCodec`
-- 能力：
-  - 编码/解码
-  - 粘包拆包
-  - 帧头定位（`MAGIC = 0xAA55`）
-  - 长度与 CRC 校验
-  - 异常帧容错（错位时按字节滑动恢复）
+```text
+src/
+  transport/  TCP、串口、CAN 字节流抽象
+  protocol/   SimpleFrame、demo serial、SENT 编解码
+  session/    设备会话、pending 请求、ACK、心跳和连接状态
+  ingress/    TCP、串口、CAN 接入，把外部数据转换为 AppEvent
+  bus/        EventBus 与最新设备快照 Store
+  app/        AlarmService 和业务服务
+  signal/     信号规格、派生信号和滤波
+  db/         PostgreSQL schema 与写入器
+  ui_client/  UI feed、状态、事件处理、回放、记录和视图
+  bin/        可执行入口
+```
 
-### 2.3 会话层 `src/session`
+### 3.1 transport
 
-- 核心类型：
-  - `DeviceSession`
-  - `DeviceSessionHandle`
-  - `SessionConfig`
-- 能力：
-  - 连接状态管理：`Disconnected/Connecting/Handshaking/Ready/Degraded/Reconnecting`
-  - 命令请求-响应匹配（`pending map`）
-  - 命令超时与可重试逻辑
-  - 心跳（`0xF0/0xF1`）
-  - 读到遥测后发布 `TelemetrySample` 并发送 ACK（`kind = 0x90`）
+`Transport` trait 只处理字节流 I/O：
 
-### 2.4 应用层 `src/app`
+```rust
+async fn connect(&mut self) -> Result<(), TransportError>;
+async fn read(&mut self, dst: &mut BytesMut) -> Result<usize, TransportError>;
+async fn write_all(&mut self, data: &[u8]) -> Result<(), TransportError>;
+async fn close(&mut self) -> Result<(), TransportError>;
+```
 
-- `DeviceManager`：会话编排（启动、调用、停止）
-- `CommandService`：统一命令入口
-- `AlarmService`：阈值告警状态机（触发/恢复）
+实现包括 `TcpTransport`、`ConnectedTcpTransport`、`SerialTransport`、`ConnectedSerialTransport` 和 TSMaster CAN 封装。业务字段、告警和 UI 展示不放在这一层。
 
-### 2.5 事件与状态层 `src/bus`
+### 3.2 protocol
 
-- `EventBus`：进程内发布订阅（`tokio::broadcast`）
-- `Store`：设备快照缓存（`RwLock<HashMap<...>>`）
-- 事件类型：
-  - `ConnStateChanged`
-  - `TelemetryUpdated`
-  - `TelemetrySample`
-  - `AlarmRaised/AlarmCleared`
-  - `CommandResult`
-  - `Log`
+协议层提供：
 
-### 2.6 表现层 `src/bin/ui_client.rs`
+- `SimpleFrameCodec`：TCP / legacy 串口二进制帧，支持粘包拆包、CRC、错位恢复和长度上限。
+- `SerialDemoCodec`：demo 串口数据流。
+- `SentFrameCodec`：10 字节 SENT 帧，校验 nibble CRC。
 
-- 从 `collector_service` 的 `19011` 拉取 JSON 行流。
-- 展示 10 个传感器窗口，支持拖动和 `Ctrl + 滚轮` 缩放。
-- 每路图仅保留最近 `30s` 数据。
-- 当采样间隔过大时断线绘制（避免“长时间空白自动连线”）。
+### 3.3 session
 
----
+`DeviceSession` 负责连接生命周期、请求响应匹配、心跳、重连、遥测解析和 ACK 回包。TCP ingress 接受被动连接后会为每个连接创建一个 session，并关闭 session 内部心跳和重连：
 
-## 3. 进程拓扑与端口
+```text
+enable_heartbeat = false
+reconnect_enabled = false
+```
 
-### 3.1 分离部署（推荐）
+断开后等待设备端重新连接。
 
-- `collector_service`
-  - 设备接入：`127.0.0.1:19010`
-  - UI 数据流：`127.0.0.1:19011`
-  - 健康检查：`127.0.0.1:19012`
-- `ui_client`
-  - 连接 `19011` 消费 UI 数据
-- `tcp_frame_sender/sender_1min`
-  - 连接 `19010`，按传感器分连接上报
+### 3.4 ingress
 
-### 3.2 一体化调试（兼容）
+接入层把外部输入统一转换为 `AppEvent`：
 
-- `acceptor_ui`：单进程接入 + UI，不依赖 `collector_service`。
+- TCP：监听 `ingress_addr`，每个连接进入 `DeviceSession`。
+- 串口：支持 `legacy`、`demo`、`sent`、`sent1`、`sent2`、`sent3`。
+- CAN：通过 TSMaster / TC1012 读取 CAN / CAN FD，解析普通三轴样本、SENT over CAN 和 SENT error。
 
----
+### 3.5 bus
 
-## 4. 帧格式与协议约定
+`EventBus` 基于 `tokio::broadcast`，是有界发布订阅通道。慢消费者会收到 `Lagged`，旧消息可能被跳过。
 
-### 4.1 二进制帧结构
+核心事件：
 
-- `magic: u16`（固定 `0xAA55`）
-- `body_len: u16`
-- `request_id: u64`
-- `kind: u8`
-- `payload: [u8; N]`
-- `crc16: u16`（对 `request_id + kind + payload` 计算）
+- `TelemetrySample`
+- `AlarmRaised`
+- `AlarmCleared`
+- `ConnStateChanged`
+- `CommandResult`
+- `Log`
+- `System`
 
-### 4.2 关键 `kind`
+`Store` 只保存每个设备的最新快照，不保存全量历史。
 
-- `0x34`：上报遥测（sender 使用）
-- `0x90`：ACK（collector/session 回包）
-- `0xF0`：心跳请求
-- `0xF1`：心跳响应
-- `0x81`：示例命令响应（测试中 mock 设备使用）
+### 3.6 app
 
-### 4.3 遥测 payload 约定
+`AlarmService` 负责两类告警：
 
-当前字符串格式：
+- 通用 sensor 阈值规则：通过 `set_rule(sensor_id, AlarmRule)` 注册，按 high/low 与 clear 阈值触发和恢复。
+- SENT 跳变告警：默认阈值在 `SentJumpAlarmConfig` 中，可通过 control 接口更新。
 
-`sid=<sensor_id>,value=<float>`
+告警输出为 `AlarmRaised` / `AlarmCleared`，下游 UI feed 和数据库写入器都消费同一类事件。
 
-示例：
+### 3.7 db
 
-`sid=3,value=47.381`
+PostgreSQL schema 定义在 `src/db/mod.rs`：
 
----
-
-## 5. 端到端数据流（Sender -> UI）
-
-1. `sender_1min` 启动 10 个线程，每个传感器一个 TCP 连接（错峰 0.5s 接入）。
-2. `collector_service` accept 新连接，为每个连接创建一个 `DeviceSession`。
-3. `DeviceSession` 从字节流解码 `Frame(kind=0x34)`，解析 `sid/value`。
-4. 会话层发布 `AppEvent::Device(TelemetrySample)` 到 `EventBus`，并发回 ACK。
-5. `run_alarm_forwarder` 订阅 `TelemetrySample`，调用 `AlarmService::evaluate_sample`，按状态跃迁发布告警事件。
-6. `run_persistence_forwarder` 订阅事件并写 PostgreSQL（若启用 DB）。
-7. `run_ui_forwarder` 将 `TelemetrySample` 序列化成 JSON 行，广播给 UI Feed 客户端。
-8. `ui_client` 接收后按 `sensor_id` 入队，绘制最近 30s 曲线。
-
----
-
-## 6. 会话模型细节
-
-### 6.1 状态机
-
-- `Disconnected -> Connecting -> Handshaking -> Ready`
-- 异常或超时后进入 `Degraded/Reconnecting`（取决于配置）
-
-### 6.2 当前 collector 场景配置
-
-`collector_service` 中会话使用：
-
-- `enable_heartbeat = false`
-- `reconnect_enabled = false`
-
-原因：
-- collector 处理的是“已 accept 的被动连接”，断开后等待设备端重连即可。
-
-### 6.3 快速失败策略
-
-- 写失败：当前命令立即失败并结束该会话循环。
-- 读到 EOF：认为连接关闭，结束会话。
-- pending 请求：超时后按 `idempotent + retry_policy` 决定重试或失败返回。
-
----
-
-## 7. 告警逻辑（`src/app/alarm_service.rs`）
-
-### 7.1 规则结构
-
-- `AlarmRule`：
-  - `high/high_clear`
-  - `low/low_clear`
-  - `level`
-  - `name`
-
-### 7.2 状态结构
-
-- `(device_id, sensor_id) -> SensorAlarmState { high_active, low_active }`
-
-### 7.3 判定机制
-
-- 高报触发：`value >= high`
-- 高报恢复：`value <= high_clear`
-- 低报触发：`value <= low`
-- 低报恢复：`value >= low_clear`
-
-使用“触发阈值/恢复阈值分离”的滞回机制，减少抖动反复告警。
-
----
-
-## 8. 数据存储与内存模型
-
-### 8.1 内存数据
-
-- `Store`：每设备最新快照（非全量历史）
-- `ui_client`：每传感器 `VecDeque<[t, value]>`，按 30s 滑窗裁剪
-- `EventBus`：有界广播通道，慢消费者会丢历史消息
-
-### 8.2 PostgreSQL 持久化
-
-由 `collector_service` 启动时自动建表：
-
-- `telemetry_samples`
+- `telemetry_samples`：按 `created_at` 日期范围分区。
 - `alarm_events`
 - `system_events`
 
-并创建时间与设备维度索引。
+写入器批量写入遥测，批大小为 256。写入前会确保当天分区存在。
 
-### 8.3 数据库位置说明
+### 3.8 ui_client
 
-- 若走 `docker compose`，数据库在容器中（默认 `postgres` 服务）。
-- 连接串由 `config.toml` 的 `collector.pg_dsn` 指定。
+`src/ui_client/` 承载 UI 逻辑：
 
----
+- `feed.rs`：连接 UI feed、重连、JSON 行解码。
+- `messages.rs`：UI feed 消息结构。
+- `events.rs`：处理 UI 队列消息。
+- `state.rs` / `view.rs`：主状态和 egui 绘制。
+- `alarm.rs`：UI 侧告警展示、CAN 阈值和 SENT 跳变相关交互。
+- `records.rs` / `replay.rs`：历史告警和 CAN/SENT 回放。
+- `runtime.rs`：启动内嵌 collector、feed 线程和 eframe 窗口。
 
-## 9. 并发与背压
+## 4. 数据流
 
-### 9.1 并发结构
+### 4.1 TCP sender 到 UI
 
-- 每个设备连接 -> 一个 `DeviceSession`（Tokio 任务）
-- UI Feed -> `broadcast::Sender<String>`
-- DB 写入 -> 独立 `mpsc` 写线程
-
-### 9.2 背压点
-
-- `EventBus` 有界；消费不及时会 `Lagged`
-- UI 本地通道 `sync_channel` 有界；满时丢样并计数
-- DB 通道有界；写入慢会堆积或丢弃（调用方可按需求增强处理）
-
----
-
-## 10. 配置与运行
-
-### 10.1 配置文件
-
-- `config.toml`（可从 `config.toml.example` 复制）
-- 关键项：`ingress_addr/ui_feed_addr/health_addr/pg_dsn`
-
-### 10.2 推荐启动顺序
-
-1. `collector_service`
-2. `ui_client`
-3. `sender_1min` 或 `sender_stress_report`
-
-### 10.3 常用命令（PowerShell）
-
-```powershell
-# 可选：启动 PostgreSQL
-docker compose up -d postgres
-
-# 启动采集服务
-cargo run --bin collector_service
-
-# 启动 UI
-cargo run --bin ui_client
-
-# 启动发送端（在 tcp_frame_sender 目录）
-cargo run --bin sender_1min
+```text
+sender_stress_report / sender_1min
+  -> TCP ingress 19010
+  -> run_tcp_ingress
+  -> DeviceSession
+  -> SimpleFrameCodec
+  -> AppEvent::Device(TelemetrySample)
+  -> raw_bus
+  -> run_filtered_event_forwarder
+  -> processed_bus
+  -> run_ui_forwarder
+  -> UI feed JSON line on 19011
+  -> ui_client feed thread
+  -> egui 曲线和状态
 ```
 
----
+### 4.2 CAN SENT 到 UI/DB
 
-## 11. 常见故障排查
+```text
+TSMaster callback
+  -> CanTransport
+  -> run_can_ingress
+  -> decode_sent_values
+  -> optional SentMovingAverage
+  -> TelemetrySample(source_kind=CanSent)
+  -> raw_bus
+  -> optional Butterworth filter
+  -> processed_bus
+  -> UI feed / AlarmService / PostgreSQL
+```
 
-### 11.1 `os error 10061`（连接被拒绝）
+### 4.3 告警到 UI/DB
 
-含义：目标端口没有监听或被防火墙拦截。
+```text
+processed_bus TelemetrySample
+  -> run_alarm_forwarder
+  -> AlarmService::evaluate_sample
+  -> AlarmRaised / AlarmCleared
+  -> processed_bus
+  -> UI feed / PostgreSQL
+```
 
-排查顺序：
-1. 确认 `collector_service` 是否已启动。
-2. 核对 sender 连接地址是否是 `19010`。
-3. 核对 UI 连接地址是否是 `19011`。
-4. 在本机检查端口监听状态（`netstat -ano | findstr 1901`）。
+### 4.4 持久化
 
-### 11.2 UI 无数据
+```text
+processed_bus
+  -> run_persistence_forwarder
+  -> DbCmd channel
+  -> PostgreSQL writer
+  -> telemetry_samples / alarm_events / system_events
+```
 
-1. 看 UI 顶部 `status` 是否显示 `connected feed: 127.0.0.1:19011`。
-2. 看 collector 的 `samples_rx` 是否增长。
-3. 检查 sender 是否打印连接成功和周期发送日志。
+## 5. 滤波位置
 
-### 11.3 数据库相关
+当前有两层可选处理：
 
-若 PostgreSQL 不可用，collector 会降级为“无持久化模式”继续运行（并输出 warning）。
+- CAN SENT 入口移动平均：`sent_filter_enabled` / `sent_filter_window`，发生在 `run_can_ingress` 发布事件之前。
+- Butterworth 低通滤波：`db_filter_enabled` 等配置，发生在 raw bus 到 processed bus 的转发阶段。
 
----
+启用 Butterworth 后，UI feed、告警和数据库看到的是 processed bus 中的滤波值。
 
-## 12. 扩展指南
+## 6. 背压与丢弃
 
-### 12.1 新增帧类型（不影响现有功能）
+- `EventBus` 是有界 broadcast channel，慢订阅者可能跳过旧消息。
+- UI feed 也是有界 broadcast channel，发送失败或 lag 会增加 `ui_drop`。
+- DB forwarder lag 会增加 `db_drop`，数据库写入失败会增加 `db_write_fail` 并记录 `last_db_error`。
 
-建议流程：
-1. 在协议层约定新 `kind` 与 payload 格式。
-2. 在 `session::connection_loop` 增加对应分支处理。
-3. 新增/复用 `DeviceEvent` 事件类型。
-4. 在 `collector_service` 的 forwarder 中选择性转发到 UI/DB。
-5. 为新路径补充单测与 e2e。
+这些指标可通过 `/health` 查看。
 
-这样可以做到“新增能力不破坏既有链路”。
+## 7. 推荐开发验证
 
-### 12.2 一帧多组传感器数据
+```powershell
+cargo check
+cargo test
+cargo run --bin collector_service
+Invoke-RestMethod http://127.0.0.1:19012/health
+cargo run --bin sender_stress_report
+```
 
-可选两种方案：
-- 方案 A：payload 内部承载数组（推荐，改动小）
-- 方案 B：定义新 kind，单帧多子包
+涉及数据库 schema 或写入路径时，再运行：
 
-落地时建议在会话层解析后拆成多条 `TelemetrySample` 事件，UI 与告警层无需大改。
-
----
-
-## 13. 测试体系
-
-- 单元测试：
-  - 协议层粘包拆包、CRC、异常恢复
-  - 告警阈值触发/恢复
-- 集成测试：
-  - `tests/session_sender_to_ui_e2e.rs`
-  - 覆盖会话、命令、遥测事件流
-  - 可设置 `SHOW_UI=1` 观察测试 UI
-
----
-
-## 14. 当前成熟度与上线建议
-
-当前代码适合：
-- 开发联调
-- 功能演示
-- 小规模 PoC
-
-要进入企业生产，建议补齐：
-1. 完整鉴权与链路加密（TLS/证书/密钥管理）。
-2. 更严格的资源隔离与限流（连接数、每设备速率、异常流量保护）。
-3. 持久化可靠性增强（批写、重试、死信/补偿）。
-4. 全链路可观测性（metrics、trace_id、报警看板）。
-5. 灰度发布与回滚流程。
-
----
-
-## 15. 总结
-
-当前 `demo2` 已从“围绕 socket 直接处理”演进为“围绕会话 + 事件 + 应用服务”的结构：
-
-- 传输层、协议层、会话层、应用层、UI 层职责清晰；
-- 会话层统一承载连接生命周期与命令匹配；
-- UI/告警/持久化通过 EventBus 解耦扩展；
-- 在不破坏主链路前提下，可以持续增加新帧类型与业务能力。
-
+```powershell
+cargo run --bin init_db
+cargo run --bin check_db_status
+cargo run --bin check_db_partition
+```
