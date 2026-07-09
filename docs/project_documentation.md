@@ -9,7 +9,7 @@
 当前主要运行形态有两种：
 
 1. 推荐联调形态：`collector_service` 作为采集服务运行，`ui_client` 作为 UI 客户端连接采集服务。
-2. 当前 UI 入口的实际行为：`ui_client` 内部也通过 `#[path = "collector_service.rs"]` 嵌入并启动了一份 collector runtime，同时再连接 `127.0.0.1:19011` 的 UI feed。单独启动 `collector_service` 后再启动 `ui_client` 时，需要注意端口占用问题。
+2. 单进程演示形态：设置 `DEMO2_UI_EMBED_COLLECTOR=1` 后，`ui_client` 会通过 `#[path = "collector_service.rs"]` 嵌入并启动一份 collector runtime，再连接 `127.0.0.1:19011` 的 UI feed。
 
 项目支持的接入方式：
 
@@ -99,7 +99,7 @@ UI 客户端的支撑模块目录。当前 `src/bin/ui_client.rs` 已收缩为�
 - `models.rs`：定义 UI 视图、告警、CAN 回放和报警记录相关状态结构。
 - `records.rs`：查询和绘制报警记录窗口。
 - `replay.rs`：加载、绘制和导出 CAN/SENT 历史回放数据。
-- `runtime.rs`：封装 `ui_client` 的启动流程：先启动内嵌 collector runtime，再启动 UI feed 线程和 eframe 窗口。
+- `runtime.rs`：封装 `ui_client` 的启动流程：启动 UI feed 线程和 eframe 窗口，并在 `DEMO2_UI_EMBED_COLLECTOR=1` 时启动内嵌 collector runtime。
 - `series.rs`：维护实时曲线的 `SensorSeries`，包含最近时间窗裁剪和最大点数限制。
 - `settings.rs`：集中 UI 客户端常量。
 - `state.rs`：承载 `UiClientApp` 的主 UI 状态；`UiClientApp` 自身保留通道、feed 统计、连接地址和本地告警 DB writer 等外壳资源。
@@ -448,7 +448,7 @@ Health:      127.0.0.1:19012
 
 职责：
 
-- 启动内嵌 collector runtime。
+- 连接外部 collector；在 `DEMO2_UI_EMBED_COLLECTOR=1` 时启动内嵌 collector runtime。
 - 连接 UI feed 地址。
 - 接收 JSON 行流。
 - 展示实时曲线。
@@ -470,14 +470,14 @@ Health:      127.0.0.1:19012
 - `src/ui_client/models.rs`：UI 状态模型。
 - `src/ui_client/records.rs`：报警记录查询与窗口。
 - `src/ui_client/replay.rs`：CAN/SENT 回放查询、导出与窗口。
-- `src/ui_client/runtime.rs`：先启动内嵌 collector，再启动 UI。
+- `src/ui_client/runtime.rs`：启动 UI，并按需启动内嵌 collector。
 - `src/ui_client/series.rs`：实时曲线滑窗数据。
 - `src/ui_client/settings.rs`：常量。
 - `src/ui_client/state.rs`：主 UI 状态。
 - `src/ui_client/time.rs`：时间解析和格式化。
 - `src/ui_client/view.rs`：主 UI 绘制和 eframe update。
 
-注意：`ui_client` 入口当前仍会内嵌 collector runtime，并按“collector -> UI”的顺序启动。若已经单独启动 `collector_service`，UI 内嵌 collector 可能因为端口占用退出，但 UI feed 线程仍会继续连接配置中的 `ui_feed_addr`。
+注意：`ui_client` 默认只连接配置中的 `ui_feed_addr`。如需单进程演示，设置 `DEMO2_UI_EMBED_COLLECTOR=1`。
 
 UI feed 地址来源优先级：
 
@@ -708,6 +708,7 @@ DEMO2_SENT_FILTER_WINDOW
 
 ```text
 DEMO2_UI_FEED_ADDR
+DEMO2_UI_EMBED_COLLECTOR
 DEMO2_COLLECTOR_CONTROL_ADDR
 DEMO2_PG_DSN
 ```
@@ -791,7 +792,12 @@ collector health listening on ...
 cargo run --bin ui_client
 ```
 
-注意：当前 `ui_client` 会内嵌启动 collector。如果已经有独立 `collector_service` 占用了同一组端口，UI 内嵌 collector 可能因为端口占用退出，但 UI feed 线程仍会尝试连接配置中的 `ui_feed_addr`。
+默认情况下，`ui_client` 只连接外部 collector。单进程演示时可先设置：
+
+```powershell
+$env:DEMO2_UI_EMBED_COLLECTOR = "1"
+cargo run --bin ui_client
+```
 
 ### 8.4 发送 TCP 测试数据
 
@@ -1190,7 +1196,7 @@ db_filter_enabled = false
 现象：
 
 - collector 启动失败。
-- UI 内嵌 collector 报错。
+- UI 无法连接外部 collector。
 - sender 出现 `os error 10061`。
 
 排查：
@@ -1203,7 +1209,7 @@ netstat -ano | findstr 19012
 
 处理：
 
-- 如果使用独立 collector + UI，考虑移除 UI 内嵌 collector 逻辑或让 UI 只连外部 feed。
+- 确认 `collector_service` 已启动，或在单进程演示时设置 `DEMO2_UI_EMBED_COLLECTOR=1`。
 - 或者调整 `config.toml` 中端口。
 
 ### 16.2 UI 没有数据
@@ -1316,14 +1322,14 @@ cargo check
 
 ### 18.4 拆分 UI 内嵌 collector
 
-当前 `ui_client` 同时内嵌 collector，这对单进程演示方便，但对部署和联调容易造成端口冲突。建议后续明确两种入口：
+当前 `ui_client` 已默认只连接外部 collector，并通过 `DEMO2_UI_EMBED_COLLECTOR=1` 支持单进程演示。后续仍可进一步拆成两个更明确的入口：
 
 - `ui_client`：只作为外部 collector 的客户端。
 - `ui_client_embedded`：单进程演示版。
 
 这样可以让生产/联调路径更清晰。
 
-当前进展：`ui_client` 已完成从单文件 UI 到 `src/ui_client/` 多模块结构的拆分；独立外部客户端入口 `ui_client` 与单进程演示入口 `ui_client_embedded` 的二进制拆分仍未完成。
+当前进展：`ui_client` 已完成从单文件 UI 到 `src/ui_client/` 多模块结构的拆分，并已增加内嵌 collector 开关；单独的 `ui_client_embedded` 二进制仍未拆分。
 
 ### 18.5 文档与配置保持同步
 

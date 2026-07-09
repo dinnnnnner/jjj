@@ -176,13 +176,14 @@ CAN SENT 原始值在 `src/ingress/can.rs` 的 `decode_sent_values` 中解析为
 - `DEMO2_COLLECTOR_CAN_BAUD_KBPS` / `DEMO2_COLLECTOR_CAN_DATA_BAUD_KBPS`：覆盖 CAN 仲裁/数据波特率。
 - `DEMO2_SENT_FILTER_ENABLED` / `DEMO2_SENT_FILTER_WINDOW`：覆盖 SENT 滤波配置。
 - `DEMO2_UI_FEED_ADDR`：覆盖 UI 客户端连接的 feed 地址。
+- `DEMO2_UI_EMBED_COLLECTOR=1`：让 `ui_client` 启动内嵌 collector，默认关闭。
 - `DEMO2_COLLECTOR_CONTROL_ADDR`：覆盖 UI 客户端连接的控制接口地址。
 - `DEMO2_PG_DSN`：覆盖 UI 查询历史数据使用的数据库连接串。
 
 ## 二进制入口
 
 - `collector_service`：核心采集服务，负责 TCP / 串口 / CAN 接入、事件转发、告警、持久化和健康检查。
-- `ui_client`：egui UI 客户端，连接采集服务的 JSON 行流；当前入口仍会内嵌启动一份 collector runtime，适合演示，和独立 `collector_service` 同时运行时需注意端口占用。
+- `ui_client`：egui UI 客户端，连接采集服务的 JSON 行流；默认只连接外部 collector，如需单进程演示可设置 `DEMO2_UI_EMBED_COLLECTOR=1`。
 - `serial_frame_sender`：串口测试发送端，支持 legacy 与 SENT 格式。
 - `serial_sender_ui`：串口发送 UI。
 - `sender_stress_report`：内置 TCP 压测发送端，逐档提升发送频率并输出 ACK / 丢包统计。
@@ -193,7 +194,7 @@ CAN SENT 原始值在 `src/ingress/can.rs` 的 `decode_sent_values` 中解析为
 
 ## UI 客户端代码结构
 
-`ui_client` 的二进制入口仍在 `src/bin/ui_client.rs`，当前入口只负责调用运行器；运行器会先启动内嵌 collector，再启动 egui UI：
+`ui_client` 的二进制入口仍在 `src/bin/ui_client.rs`，当前入口只负责调用运行器；运行器会启动 UI feed 线程和 egui UI，并在 `DEMO2_UI_EMBED_COLLECTOR=1` 时额外启动内嵌 collector：
 
 - `alarm.rs`：处理告警状态、CAN 阈值告警、SENT 跳变告警和样本落入曲线缓存。
 - `config.rs`：读取 UI feed 地址和 PostgreSQL DSN。

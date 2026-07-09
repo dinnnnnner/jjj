@@ -1,4 +1,5 @@
 use crate::{UI_QUEUE_CAPACITY, UiClientApp, UiMsg, embedded_collector_service};
+use demo2::config::env_flag;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
@@ -7,8 +8,12 @@ use super::config::{load_control_addr, load_feed_addr, load_pg_dsn};
 use super::feed::{FeedStats, resilient_feed_thread};
 use super::fonts::setup_chinese_fonts;
 
+const UI_EMBED_COLLECTOR_ENV: &str = "DEMO2_UI_EMBED_COLLECTOR";
+
 pub(crate) fn run_collector_then_ui() -> eframe::Result<()> {
-    start_embedded_collector();
+    if env_flag(UI_EMBED_COLLECTOR_ENV).unwrap_or(false) {
+        start_embedded_collector();
+    }
     run_ui()
 }
 

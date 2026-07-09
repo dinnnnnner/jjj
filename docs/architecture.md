@@ -11,7 +11,7 @@
 - `collector_service`：采集服务，负责 TCP / 串口 / CAN 接入、UI feed、control、health 和数据库写入。
 - `ui_client`：桌面 UI，连接 UI feed，并可通过 control 接口更新 SENT 跳变告警阈值。
 
-注意：当前 `ui_client` 入口仍会内嵌启动一份 collector runtime，适合演示。若已经单独启动 `collector_service`，需要注意端口占用。
+注意：当前 `ui_client` 默认只连接外部 collector。设置 `DEMO2_UI_EMBED_COLLECTOR=1` 后会额外启动一份内嵌 collector，适合单进程演示。
 
 ## 2. 进程与端口
 
@@ -123,7 +123,7 @@ PostgreSQL schema 定义在 `src/db/mod.rs`：
 - `state.rs` / `view.rs`：主状态和 egui 绘制。
 - `alarm.rs`：UI 侧告警展示、CAN 阈值和 SENT 跳变相关交互。
 - `records.rs` / `replay.rs`：历史告警和 CAN/SENT 回放。
-- `runtime.rs`：启动内嵌 collector、feed 线程和 eframe 窗口。
+- `runtime.rs`：启动 feed 线程和 eframe 窗口，并按需启动内嵌 collector。
 
 ## 4. 数据流
 

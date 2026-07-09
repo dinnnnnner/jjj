@@ -3,6 +3,7 @@ pub mod bus;
 pub mod config;
 pub mod db;
 pub mod domain;
+pub mod feed;
 pub mod ingress;
 pub mod protocol;
 pub mod session;
