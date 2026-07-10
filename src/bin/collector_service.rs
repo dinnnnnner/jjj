@@ -334,7 +334,12 @@ async fn run_ui_forwarder(
                 }
             }
             Ok(_) => {}
-            Err(_) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(skipped, "ui forwarder lagged, skipping stale messages");
+                stats.ui_drop.fetch_add(skipped as u64, Ordering::Relaxed);
+                continue;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
     }
 }
@@ -372,7 +377,11 @@ async fn run_alarm_forwarder(
                     .store(active_sessions.len() as u64, Ordering::Relaxed);
             }
             Ok(_) => {}
-            Err(_) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(skipped, "alarm forwarder lagged, skipping stale messages");
+                continue;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
     }
 }

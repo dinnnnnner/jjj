@@ -67,16 +67,26 @@ pub async fn flush_telemetry_batch(
     let mut values = Vec::with_capacity(batch.len());
     let mut request_ids = Vec::with_capacity(batch.len());
 
-    for item in batch.drain(..) {
+    for item in batch.iter() {
         let row_ts_ms = now_ms();
         ts_ms.push(row_ts_ms);
-        device_ids.push(item.device_id);
-        sensor_ids.push(item.sensor_id as i32);
-        axes.push(item.axis);
+        device_ids.push(item.device_id.clone());
+        sensor_ids.push(i32::try_from(item.sensor_id).map_err(|_| {
+            anyhow::anyhow!(
+                "sensor_id out of PostgreSQL INTEGER range: {}",
+                item.sensor_id
+            )
+        })?);
+        axes.push(item.axis.clone());
         alarm_bits.push(item.alarm_bit);
         t_secs.push(item.t_sec);
         values.push(item.value);
-        request_ids.push(item.request_id as i64);
+        request_ids.push(i64::try_from(item.request_id).map_err(|_| {
+            anyhow::anyhow!(
+                "request_id out of PostgreSQL BIGINT range: {}",
+                item.request_id
+            )
+        })?);
     }
 
     ensure_telemetry_partitions(client, &ts_ms).await?;
@@ -127,6 +137,7 @@ pub async fn flush_telemetry_batch(
         .await
         .map_err(|err| anyhow::anyhow!("telemetry batch insert failed: {err}"))?;
 
+    batch.clear();
     Ok(())
 }
 
