@@ -1,13 +1,13 @@
 # demo2 API 文档
 
-本文档描述当前源码实际暴露的进程间接口、帧协议、JSON 消息和数据库表结构。默认地址来自 `CollectorConfig::default()` 和 `config.toml.example`。
+本文档描述当前源码实际暴露的进程间接口、帧协议、消息格式和数据库表结构。默认地址来自 `CollectorConfig::default()` 和 `config.toml.example`。
 
 ## 1. 端口总览
 
 | 接口 | 默认地址 | 协议 | 说明 |
 | --- | --- | --- | --- |
 | TCP ingress | `127.0.0.1:19010` | 自定义二进制帧/TCP | 设备或测试 sender 上传遥测帧。 |
-| UI feed | `127.0.0.1:19011` | JSON Lines/TCP | collector 向 UI 推送遥测、告警和状态消息。 |
+| UI feed | `127.0.0.1:19011` | 长度前缀二进制帧/TCP | collector 向 UI 推送遥测、告警和状态消息。 |
 | Health | `127.0.0.1:19012` | HTTP/1.1 | 健康检查和 ready 检查。 |
 | Control | `127.0.0.1:19013` | JSON Lines/TCP | UI 或工具下发 collector 控制命令。 |
 
@@ -49,33 +49,43 @@ sid=3,value=47.381
 
 collector 收到合法遥测后会发布 `TelemetrySample`，并回发 `kind = 0x90` 的 ACK。
 
-## 3. UI Feed JSON Lines
+## 3. UI Feed 二进制协议
 
-UI feed 是 TCP 长连接，不是 HTTP。客户端连接 `ui_feed_addr` 后，collector 每行发送一个 JSON 消息，行尾为 `\n`。
+UI feed 是 TCP 长连接，不是 HTTP 或 JSON Lines。客户端连接 `ui_feed_addr` 后，collector 连续发送长度前缀帧：
 
-外层消息使用 serde tag：
+```text
+wire_len:         u32，大端，表示后续 frame 的字节数
+frame_magic:      [u8; 4] = "JJJF"
+protocol_version: u16，大端，当前为 1
+payload:          bincode(UiFeedMsg)，固定宽度整数编码
+```
 
-```json
-{"type":"telemetry","payload":{...}}
-{"type":"alarm","payload":{...}}
-{"type":"status","payload":"..."}
+`wire_len` 自身不计入 frame 长度。`frame_magic + protocol_version + payload` 最大为 1 MiB（1,048,576 字节），因此 bincode payload 最大为 1,048,570 字节。collector 和 UI 客户端共用 `src/feed.rs` 中的 `MAX_FEED_FRAME_LEN`、`encode_feed_msg` 和 `decode_feed_msg`。
+
+解码器会拒绝超过上限的帧、截断的协议头、错误魔数、未知版本、无效 payload 和尾随字节。协议没有保留旧 JSON Lines 的兼容路径；collector 与 UI 客户端应使用相同版本的共享类型。
+
+payload 的逻辑消息类型为：
+
+```rust
+enum UiFeedMsg {
+    Telemetry(TelemetryMsg),
+    Alarm(AlarmEvent),
+    Status(String),
+}
 ```
 
 ### 3.1 telemetry
 
-```json
-{
-  "type": "telemetry",
-  "payload": {
-    "device_id": "tcp://127.0.0.1:54321",
-    "sensor_id": 0,
-    "axis": "",
-    "alarm_bit": false,
-    "t_sec": 1.23,
-    "value": 47.381,
-    "request_id": 100,
-    "source_kind": "TcpFrame"
-  }
+```text
+TelemetryMsg {
+  device_id: "tcp://127.0.0.1:54321",
+  sensor_id: 0,
+  axis: "",
+  alarm_bit: false,
+  t_sec: 1.23,
+  value: 47.381,
+  request_id: 100,
+  source_kind: TcpFrame,
 }
 ```
 
@@ -117,26 +127,23 @@ FrameStream
 
 ### 3.2 alarm
 
-```json
-{
-  "type": "alarm",
-  "payload": {
-    "device_id": "can://TC1012",
-    "alarm_id": "sent_torque_jump_t1",
-    "level": "Critical",
-    "message": "T1 torque jump=0.350, warn=0.200, red=0.300, purple=0.400",
-    "raised_at": "...",
-    "cleared": false
-  }
+```text
+AlarmEvent {
+  device_id: "can://TC1012",
+  alarm_id: "sent_torque_jump_t1",
+  level: Critical,
+  message: "T1 torque jump=0.350, warn=0.200, red=0.300, purple=0.400",
+  raised_at: ...,
+  cleared: false,
 }
 ```
 
-`level` 来自 `AlarmLevel`，当前代码使用 `Info`、`Warning`、`Critical`、`Purple`。`raised_at` 是 Rust `SystemTime` 通过 serde 输出的时间字段；`cleared = true` 表示告警恢复事件。
+`level` 来自 `AlarmLevel`，当前代码使用 `Info`、`Warning`、`Critical`、`Purple`。`raised_at` 是 Rust `SystemTime` 通过 bincode 编码的时间字段；`cleared = true` 表示告警恢复事件。
 
 ### 3.3 status
 
-```json
-{"type":"status","payload":"collector serial legacy session started"}
+```text
+Status("collector serial legacy session started")
 ```
 
 `status` 用于运行状态提示和系统事件转发。

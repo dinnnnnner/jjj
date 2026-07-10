@@ -21,7 +21,7 @@
 
 项目支持的输出与观测方式：
 
-- UI JSON 行流：采集服务向 UI 客户端广播遥测、告警、状态消息。
+- UI 二进制 feed：采集服务向 UI 客户端广播带长度前缀和版本头的遥测、告警、状态消息。
 - PostgreSQL 持久化：写入遥测、告警和系统事件。
 - 健康检查端口：提供 `/health` 和 `/ready`。
 - eframe / egui 桌面 UI：实时曲线、告警状态、CAN 回放、告警记录查看。
@@ -34,7 +34,7 @@
 - serialport：串口访问。
 - tokio-postgres：PostgreSQL 持久化。
 - libloading + windows-sys：动态加载 TSMaster DLL 并调用 CAN API。
-- serde / serde_json / toml：配置和 UI feed 消息序列化。
+- serde / serde_json / bincode / toml：配置、控制接口和 UI feed 消息序列化。
 - biquad：数据库写入前的可选 Butterworth 低通滤波。
 - tracing：运行日志。
 
@@ -49,13 +49,14 @@ demo2/
   config.toml
   docker-compose.yml
   docs/
-    api.md                       进程间接口、帧协议、JSON 消息和数据库表结构
+    api.md                       进程间接口、帧协议、消息格式和数据库表结构
     architecture.md              架构与数据流说明
     project_documentation.md     本文档
   scripts/
     run_demo2.ps1                Windows 一键启动脚本
   src/
     lib.rs
+    feed.rs
     app/
     bus/
     db/
@@ -65,6 +66,7 @@ demo2/
     session/
     signal/
     transport/
+    ui_client/
     bin/
 ```
 
@@ -80,21 +82,26 @@ demo2/
 - `bus`
 - `db`
 - `domain`
+- `feed`
 - `ingress`
 - `protocol`
 - `session`
 - `signal`
 - `transport`
 
-### 4.1.1 `src/ui_client`
+### 4.1.1 `src/feed.rs`
+
+collector 和 UI 客户端共用的进程间消息协议。该模块定义 `TelemetryMsg` / `UiFeedMsg`、`JJJF` 魔数、协议版本和 1 MiB 帧上限，并提供严格的 bincode 编解码函数。
+
+### 4.1.2 `src/ui_client`
 
 UI 客户端的支撑模块目录。当前 `src/bin/ui_client.rs` 已收缩为约百行的薄入口和 `UiClientApp` 外壳，入口流程、状态、事件处理、业务逻辑和 UI 绘制已下沉到 `src/ui_client/`：
 
 - `alarm.rs`：处理告警状态、CAN 阈值告警、SENT 跳变告警和样本落入曲线缓存。
 - `config.rs`：读取 `DEMO2_UI_FEED_ADDR`、`DEMO2_PG_DSN` 和 `config.toml` 中的连接配置。
 - `events.rs`：处理 `UiMsg` 队列消息，包括状态更新、实时样本、告警、CAN 回放结果和报警记录查询结果。
-- `messages.rs`：定义 UI feed 使用的 `TelemetryMsg` 和 `FeedMsg`。
-- `feed.rs`：负责连接 collector UI feed、断线重连、JSON 行解码、向 UI 队列投递消息，并统计队列丢弃与解码错误。
+- `messages.rs`：重新导出共享的 `TelemetryMsg` 和 `UiFeedMsg`（在 UI 侧命名为 `FeedMsg`）。
+- `feed.rs`：负责连接 collector UI feed、断线重连、读取长度前缀、解码版本化二进制帧、向 UI 队列投递消息，并统计队列丢弃与解码错误。
 - `fonts.rs`：为 egui 配置 Windows 中文字体候选。
 - `models.rs`：定义 UI 视图、告警、CAN 回放和报警记录相关状态结构。
 - `records.rs`：查询和绘制报警记录窗口。
@@ -450,7 +457,7 @@ Health:      127.0.0.1:19012
 
 - 连接外部 collector；在 `DEMO2_UI_EMBED_COLLECTOR=1` 时启动内嵌 collector runtime。
 - 连接 UI feed 地址。
-- 接收 JSON 行流。
+- 接收带长度前缀的版本化 bincode 二进制帧。
 - 展示实时曲线。
 - 展示 demo / SENT / CAN / TCP 视图。
 - 展示告警面板和历史告警。
@@ -895,7 +902,7 @@ sender_stress_report / sender_1min
   -> run_filtered_event_forwarder
   -> processed_bus
   -> run_ui_forwarder
-  -> JSON line on 127.0.0.1:19011
+  -> length-prefixed binary frame on 127.0.0.1:19011
   -> ui_client feed_thread
   -> egui 曲线窗口
 ```
@@ -941,19 +948,19 @@ processed_bus
 
 ### 10.5 collector 序列化上传 UI 链路
 
-collector 到 UI 的实时上传不是 HTTP 接口，而是 TCP JSON 行流。完整代码路径如下：
+collector 到 UI 的实时上传不是 HTTP 或 JSON Lines，而是 TCP 长连接上的版本化二进制帧。完整代码路径如下：
 
 ```text
 AppEvent::Device(TelemetrySample)
   -> src/bin/collector_service.rs::run_ui_forwarder
   -> TelemetryMsg
   -> UiFeedMsg::Telemetry
-  -> serde_json::to_string(...)
-  -> broadcast::Sender<String>
+  -> encode_feed_msg(...)
+  -> broadcast::Sender<Vec<u8>>
   -> serve_ui_client
-  -> socket.write_all(line.as_bytes()) + "\n"
+  -> socket.write_all(u32::to_be_bytes(frame.len())) + frame
   -> src/ui_client/feed.rs::resilient_feed_thread
-  -> serde_json::from_str::<FeedMsg>(line)
+  -> read_feed_frame + decode_feed_msg
   -> UiMsg::Sample
   -> src/ui_client/events.rs::handle_sample
   -> signal_processor.ingest_raw(...)
@@ -962,18 +969,17 @@ AppEvent::Device(TelemetrySample)
 
 关键代码位置：
 
-- `src/bin/collector_service.rs`：定义 collector 侧 `TelemetryMsg` / `UiFeedMsg`，在 `run_ui_forwarder` 中将 `TelemetrySample` 转成 UI feed 消息，并用 `serde_json::to_string` 序列化。
-- `src/bin/collector_service.rs`：`serve_ui_client` 从 `broadcast::Receiver<String>` 读取已序列化的 JSON 字符串，写入 TCP socket，并追加换行符作为消息边界。
-- `src/ui_client/messages.rs`：定义 UI 侧反序列化结构 `TelemetryMsg` / `FeedMsg`。
-- `src/ui_client/feed.rs`：`resilient_feed_thread` 连接 `ui_feed_addr`，按行读取 JSON；`decode_and_send_line` 先按 `FeedMsg` 解析，兼容失败时再尝试旧版裸 `TelemetryMsg`。
+- `src/feed.rs`：定义 collector 与 UI 共用的 `TelemetryMsg` / `UiFeedMsg`、`JJJF` 魔数、协议版本、1 MiB 帧上限以及编解码函数。
+- `src/bin/collector_service.rs`：`run_ui_forwarder` 将 `TelemetrySample` 转成 UI feed 消息并调用 `encode_feed_msg`；`serve_ui_client` 写入 4 字节大端帧长和帧内容。
+- `src/ui_client/messages.rs`：直接重新导出共享的 `TelemetryMsg` / `UiFeedMsg`，避免两端类型漂移。
+- `src/ui_client/feed.rs`：`resilient_feed_thread` 连接 `ui_feed_addr`，读取长度前缀和完整帧，再通过 `decode_feed_msg` 校验并解码；不兼容旧 JSON Lines。
 - `src/bin/ui_client.rs`：定义内部 UI 队列消息 `UiMsg::Sample(TelemetryMsg)`。
 - `src/ui_client/events.rs`：`handle_sample` 根据 `source_kind` / `sensor_id` 切换视图，送入 `signal_processor`，更新 `total_samples` 和 `last_req`。
 
-collector 侧上传的外层消息使用 serde tag：
+collector 侧上传的逻辑消息枚举为：
 
 ```rust
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 enum UiFeedMsg {
     Telemetry(TelemetryMsg),
     Alarm(AlarmEvent),
@@ -981,34 +987,24 @@ enum UiFeedMsg {
 }
 ```
 
-因此 UI feed 上的实时遥测行形如：
-
-```json
-{"type":"telemetry","payload":{"device_id":"tcp://127.0.0.1:54321","sensor_id":0,"axis":"","alarm_bit":false,"t_sec":1.23,"value":47.381,"request_id":100,"source_kind":"TcpFrame"}}
-```
+线上 frame 结构为 `u32 大端长度 + "JJJF" + u16 大端版本 + bincode payload`。长度前缀不计入 frame，frame 最大为 1 MiB；当前协议版本为 1。
 
 ## 11. UI feed 消息格式
 
-采集服务向 UI feed 输出 JSON 行，每行一个消息。枚举使用 serde tag：
-
-```json
-{"type":"telemetry","payload":{...}}
-{"type":"alarm","payload":{...}}
-{"type":"status","payload":"..."}
-```
+采集服务向 UI feed 输出长度前缀二进制帧，每帧一个 `UiFeedMsg`。当前支持 `Telemetry`、`Alarm` 和 `Status` 三种枚举变体。解码会校验 1 MiB 上限、魔数、协议版本、payload 完整性和尾随字节。
 
 Telemetry payload：
 
-```json
-{
-  "device_id": "tcp://127.0.0.1:54321",
-  "sensor_id": 0,
-  "axis": "",
-  "alarm_bit": false,
-  "t_sec": 1.23,
-  "value": 47.381,
-  "request_id": 100,
-  "source_kind": "TcpFrame"
+```text
+TelemetryMsg {
+  device_id: "tcp://127.0.0.1:54321",
+  sensor_id: 0,
+  axis: "",
+  alarm_bit: false,
+  t_sec: 1.23,
+  value: 47.381,
+  request_id: 100,
+  source_kind: TcpFrame,
 }
 ```
 
@@ -1333,7 +1329,7 @@ cargo check
 
 ### 18.5 文档与配置保持同步
 
-建议在修改端口、JSON 消息、数据库 schema、环境变量或二进制参数时，同步更新：
+建议在修改端口、feed/control 消息、数据库 schema、环境变量或二进制参数时，同步更新：
 
 1. `docs/api.md`
 2. `README.md`
