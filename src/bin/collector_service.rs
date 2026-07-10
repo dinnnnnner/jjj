@@ -6,7 +6,7 @@ use demo2::db::writer::{
     DbCmd, TelemetryRow, flush_telemetry_batch, insert_alarm_event, insert_system_event,
 };
 use demo2::domain::telemetry::axis_name;
-use demo2::feed::{TelemetryMsg, UiFeedMsg};
+use demo2::feed::{TelemetryMsg, UiFeedMsg, encode_feed_msg};
 use demo2::ingress::can::{SentFilterConfig, run_can_ingress};
 use demo2::ingress::serial::{
     SerialIngressMode, parse_serial_mode, publish_status, run_serial_ingress,
@@ -48,16 +48,26 @@ struct CollectorStats {
     last_db_error: Mutex<Option<String>>,
 }
 
-fn telemetry_row_from_msg(msg: TelemetryMsg) -> TelemetryRow {
-    TelemetryRow {
+fn telemetry_row_from_msg(msg: TelemetryMsg) -> anyhow::Result<TelemetryRow> {
+    Ok(TelemetryRow {
         device_id: msg.device_id,
-        sensor_id: msg.sensor_id,
+        sensor_id: i32::try_from(msg.sensor_id).map_err(|_| {
+            anyhow::anyhow!(
+                "sensor_id out of PostgreSQL INTEGER range: {}",
+                msg.sensor_id
+            )
+        })?,
         axis: msg.axis,
         alarm_bit: msg.alarm_bit,
         t_sec: msg.t_sec,
         value: msg.value,
-        request_id: msg.request_id,
-    }
+        request_id: i64::try_from(msg.request_id).map_err(|_| {
+            anyhow::anyhow!(
+                "request_id out of PostgreSQL BIGINT range: {}",
+                msg.request_id
+            )
+        })?,
+    })
 }
 
 fn telemetry_msg_from_sample(
@@ -152,9 +162,13 @@ async fn flush_db_telemetry_batch(
     client: &tokio_postgres::Client,
     batch: &mut Vec<TelemetryRow>,
     stats: &CollectorStats,
-) {
-    if let Err(err) = flush_telemetry_batch(client, batch).await {
-        record_db_write_error(stats, "telemetry_batch", err);
+) -> bool {
+    match flush_telemetry_batch(client, batch).await {
+        Ok(()) => true,
+        Err(err) => {
+            record_db_write_error(stats, "telemetry_batch", err);
+            false
+        }
     }
 }
 
@@ -215,19 +229,25 @@ async fn start_pg_writer(
                     };
                     match cmd {
                         DbCmd::Telemetry(t) => {
+                            if telemetry_batch.len() >= TELEMETRY_BATCH_SIZE
+                                && !flush_db_telemetry_batch(&client, &mut telemetry_batch, &stats).await
+                            {
+                                stats.db_drop.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
                             telemetry_batch.push(t);
                             if telemetry_batch.len() >= TELEMETRY_BATCH_SIZE {
-                                flush_db_telemetry_batch(&client, &mut telemetry_batch, &stats).await;
+                                let _ = flush_db_telemetry_batch(&client, &mut telemetry_batch, &stats).await;
                             }
                         }
                         DbCmd::Alarm(a) => {
-                            flush_db_telemetry_batch(&client, &mut telemetry_batch, &stats).await;
+                            let _ = flush_db_telemetry_batch(&client, &mut telemetry_batch, &stats).await;
                             if let Err(err) = insert_alarm_event(&client, &a).await {
                                 record_db_write_error(&stats, "alarm", err);
                             }
                         }
                         DbCmd::System { level, message } => {
-                            flush_db_telemetry_batch(&client, &mut telemetry_batch, &stats).await;
+                            let _ = flush_db_telemetry_batch(&client, &mut telemetry_batch, &stats).await;
                             if let Err(err) = insert_system_event(&client, &level, &message).await {
                                 record_db_write_error(&stats, "system", err);
                             }
@@ -235,13 +255,13 @@ async fn start_pg_writer(
                     }
                 }
                 _ = flush_tick.tick() => {
-                    flush_db_telemetry_batch(&client, &mut telemetry_batch, &stats).await;
+                    let _ = flush_db_telemetry_batch(&client, &mut telemetry_batch, &stats).await;
                 }
                 else => break,
             }
         }
 
-        flush_db_telemetry_batch(&client, &mut telemetry_batch, &stats).await;
+        let _ = flush_db_telemetry_batch(&client, &mut telemetry_batch, &stats).await;
     });
 
     Ok(tx)
@@ -312,7 +332,7 @@ async fn run_ui_forwarder(
                         continue;
                     }
                 }
-                if let Ok(frame) = bincode::serialize(&UiFeedMsg::Telemetry(msg)) {
+                if let Ok(frame) = encode_feed_msg(&UiFeedMsg::Telemetry(msg)) {
                     if ui_tx.send(frame).is_err() {
                         stats.ui_drop.fetch_add(1, Ordering::Relaxed);
                     }
@@ -320,14 +340,14 @@ async fn run_ui_forwarder(
             }
             Ok(AppEvent::Device(DeviceEvent::AlarmRaised(alarm)))
             | Ok(AppEvent::Device(DeviceEvent::AlarmCleared(alarm))) => {
-                if let Ok(frame) = bincode::serialize(&UiFeedMsg::Alarm(alarm)) {
+                if let Ok(frame) = encode_feed_msg(&UiFeedMsg::Alarm(alarm)) {
                     if ui_tx.send(frame).is_err() {
                         stats.ui_drop.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
             Ok(AppEvent::System(msg)) => {
-                if let Ok(frame) = bincode::serialize(&UiFeedMsg::Status(msg)) {
+                if let Ok(frame) = encode_feed_msg(&UiFeedMsg::Status(msg)) {
                     if ui_tx.send(frame).is_err() {
                         stats.ui_drop.fetch_add(1, Ordering::Relaxed);
                     }
@@ -490,9 +510,15 @@ async fn run_persistence_forwarder(
                     alarm_bit,
                     source_kind,
                 );
-                let _ = db_tx
-                    .send(DbCmd::Telemetry(telemetry_row_from_msg(msg)))
-                    .await;
+                match telemetry_row_from_msg(msg) {
+                    Ok(row) => {
+                        let _ = db_tx.send(DbCmd::Telemetry(row)).await;
+                    }
+                    Err(err) => {
+                        stats.db_drop.fetch_add(1, Ordering::Relaxed);
+                        record_db_write_error(&stats, "telemetry_validation", err);
+                    }
+                }
             }
             Ok(AppEvent::Device(DeviceEvent::AlarmRaised(alarm))) => {
                 let _ = db_tx.send(DbCmd::Alarm(alarm)).await;

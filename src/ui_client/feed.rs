@@ -1,5 +1,6 @@
 use super::messages::FeedMsg;
 use crate::UiMsg;
+use demo2::feed::decode_feed_msg;
 use std::io::{self, BufReader, Read};
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -53,7 +54,7 @@ fn read_feed_frame(reader: &mut BufReader<TcpStream>) -> io::Result<Vec<u8>> {
 }
 
 fn decode_and_send_frame(frame: &[u8], tx: &SyncSender<UiMsg>, stats: &FeedStats) -> bool {
-    match bincode::deserialize::<FeedMsg>(frame) {
+    match decode_feed_msg(frame) {
         Ok(msg) => send_feed_msg(tx, stats, msg),
         Err(_) => {
             stats.decode_errors.fetch_add(1, Ordering::Relaxed);
