@@ -1,6 +1,6 @@
 use super::messages::FeedMsg;
 use crate::UiMsg;
-use demo2::feed::decode_feed_msg;
+use demo2::feed::{MAX_FEED_FRAME_LEN, decode_feed_msg};
 use std::io::{self, BufReader, Read};
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -14,8 +14,6 @@ pub struct FeedStats {
     pub dropped_messages: AtomicU64,
     pub decode_errors: AtomicU64,
 }
-
-const MAX_FEED_FRAME_LEN: usize = 1024 * 1024;
 
 fn send_feed_msg(tx: &SyncSender<UiMsg>, stats: &FeedStats, msg: FeedMsg) -> bool {
     let ui_msg = match msg {

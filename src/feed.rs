@@ -1,10 +1,13 @@
 use crate::bus::TelemetrySourceKind;
 use crate::domain::AlarmEvent;
+use bincode::Options;
 use serde::{Deserialize, Serialize};
 
 pub const FEED_MAGIC: [u8; 4] = *b"JJJF";
 pub const FEED_PROTOCOL_VERSION: u16 = 1;
+pub const MAX_FEED_FRAME_LEN: usize = 1024 * 1024;
 const FEED_HEADER_LEN: usize = FEED_MAGIC.len() + size_of::<u16>();
+const MAX_FEED_PAYLOAD_LEN: u64 = (MAX_FEED_FRAME_LEN - FEED_HEADER_LEN) as u64;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TelemetryMsg {
@@ -29,6 +32,8 @@ pub enum UiFeedMsg {
 pub enum FeedDecodeError {
     #[error("feed frame is shorter than the protocol header")]
     TruncatedHeader,
+    #[error("feed frame length {actual} exceeds the {max}-byte limit")]
+    FrameTooLarge { actual: usize, max: usize },
     #[error("invalid feed protocol magic")]
     InvalidMagic,
     #[error("unsupported feed protocol version {0}")]
@@ -37,8 +42,15 @@ pub enum FeedDecodeError {
     InvalidPayload(#[from] bincode::Error),
 }
 
+fn feed_options() -> impl Options {
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(MAX_FEED_PAYLOAD_LEN)
+        .reject_trailing_bytes()
+}
+
 pub fn encode_feed_msg(msg: &UiFeedMsg) -> bincode::Result<Vec<u8>> {
-    let payload = bincode::serialize(msg)?;
+    let payload = feed_options().serialize(msg)?;
     let mut frame = Vec::with_capacity(FEED_HEADER_LEN + payload.len());
     frame.extend_from_slice(&FEED_MAGIC);
     frame.extend_from_slice(&FEED_PROTOCOL_VERSION.to_be_bytes());
@@ -47,6 +59,12 @@ pub fn encode_feed_msg(msg: &UiFeedMsg) -> bincode::Result<Vec<u8>> {
 }
 
 pub fn decode_feed_msg(frame: &[u8]) -> Result<UiFeedMsg, FeedDecodeError> {
+    if frame.len() > MAX_FEED_FRAME_LEN {
+        return Err(FeedDecodeError::FrameTooLarge {
+            actual: frame.len(),
+            max: MAX_FEED_FRAME_LEN,
+        });
+    }
     if frame.len() < FEED_HEADER_LEN {
         return Err(FeedDecodeError::TruncatedHeader);
     }
@@ -59,7 +77,7 @@ pub fn decode_feed_msg(frame: &[u8]) -> Result<UiFeedMsg, FeedDecodeError> {
         return Err(FeedDecodeError::UnsupportedVersion(version));
     }
 
-    Ok(bincode::deserialize(&frame[FEED_HEADER_LEN..])?)
+    Ok(feed_options().deserialize(&frame[FEED_HEADER_LEN..])?)
 }
 
 #[cfg(test)]
@@ -104,6 +122,39 @@ mod tests {
         assert!(matches!(
             decode_feed_msg(&frame[..5]),
             Err(FeedDecodeError::TruncatedHeader)
+        ));
+    }
+
+    #[test]
+    fn feed_frame_enforces_the_shared_size_limit() {
+        let oversized = UiFeedMsg::Status("x".repeat(MAX_FEED_FRAME_LEN));
+
+        assert!(matches!(
+            encode_feed_msg(&oversized),
+            Err(err) if matches!(*err, bincode::ErrorKind::SizeLimit)
+        ));
+
+        let oversized_frame = vec![0; MAX_FEED_FRAME_LEN + 1];
+
+        let result = decode_feed_msg(&oversized_frame);
+        assert!(
+            matches!(
+                result,
+                Err(FeedDecodeError::FrameTooLarge { actual, max })
+                    if actual == MAX_FEED_FRAME_LEN + 1 && max == MAX_FEED_FRAME_LEN
+            ),
+            "unexpected decode result: {result:?}"
+        );
+    }
+
+    #[test]
+    fn feed_frame_rejects_trailing_bytes() {
+        let mut frame = encode_feed_msg(&UiFeedMsg::Status("ready".to_string())).unwrap();
+        frame.push(0);
+
+        assert!(matches!(
+            decode_feed_msg(&frame),
+            Err(FeedDecodeError::InvalidPayload(_))
         ));
     }
 }
