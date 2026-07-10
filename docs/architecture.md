@@ -18,7 +18,7 @@
 | 组件 | 默认地址 | 说明 |
 | --- | --- | --- |
 | TCP ingress | `127.0.0.1:19010` | 设备或 sender 上传二进制帧。 |
-| UI feed | `127.0.0.1:19011` | collector 向 UI 推送 JSON Lines。 |
+| UI feed | `127.0.0.1:19011` | collector 向 UI 推送版本化 bincode 二进制帧。 |
 | Health | `127.0.0.1:19012` | HTTP `/health` 和 `/ready`。 |
 | Control | `127.0.0.1:19013` | TCP JSON Lines 控制命令。 |
 
@@ -34,6 +34,7 @@ src/
   app/        AlarmService 和业务服务
   signal/     信号规格、派生信号和滤波
   db/         PostgreSQL schema 与写入器
+  feed.rs     collector 与 UI 共享的 feed 消息、版本头和编解码
   ui_client/  UI feed、状态、事件处理、回放、记录和视图
   bin/        可执行入口
 ```
@@ -58,6 +59,8 @@ async fn close(&mut self) -> Result<(), TransportError>;
 - `SimpleFrameCodec`：TCP / legacy 串口二进制帧，支持粘包拆包、CRC、错位恢复和长度上限。
 - `SerialDemoCodec`：demo 串口数据流。
 - `SentFrameCodec`：10 字节 SENT 帧，校验 nibble CRC。
+
+collector 与 UI 之间的进程间协议集中在 `src/feed.rs`：消息先编码为带 `JJJF` 魔数和版本号的 bincode frame，再由 TCP 层添加 4 字节大端长度前缀。两端共用 1 MiB 帧上限和严格解码规则。
 
 ### 3.3 session
 
@@ -117,8 +120,8 @@ PostgreSQL schema 定义在 `src/db/mod.rs`：
 
 `src/ui_client/` 承载 UI 逻辑：
 
-- `feed.rs`：连接 UI feed、重连、JSON 行解码。
-- `messages.rs`：UI feed 消息结构。
+- `feed.rs`：连接 UI feed、重连、读取长度前缀并解码版本化二进制帧。
+- `messages.rs`：重新导出 collector 与 UI 共用的 feed 消息结构。
 - `events.rs`：处理 UI 队列消息。
 - `state.rs` / `view.rs`：主状态和 egui 绘制。
 - `alarm.rs`：UI 侧告警展示、CAN 阈值和 SENT 跳变相关交互。
@@ -140,7 +143,7 @@ sender_stress_report / sender_1min
   -> run_filtered_event_forwarder
   -> processed_bus
   -> run_ui_forwarder
-  -> UI feed JSON line on 19011
+  -> UI feed length-prefixed binary frame on 19011
   -> ui_client feed thread
   -> egui 曲线和状态
 ```
@@ -194,6 +197,7 @@ processed_bus
 
 - `EventBus` 是有界 broadcast channel，慢订阅者可能跳过旧消息。
 - UI feed 也是有界 broadcast channel，发送失败或 lag 会增加 `ui_drop`。
+- UI feed 单帧最大为 1 MiB；编码和解码共用该上限，解码还会拒绝错误魔数、未知版本和尾随字节。
 - DB forwarder lag 会增加 `db_drop`，数据库写入失败会增加 `db_write_fail` 并记录 `last_db_error`。
 
 这些指标可通过 `/health` 查看。

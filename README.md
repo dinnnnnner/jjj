@@ -7,7 +7,7 @@
 - TCP 设备接入：监听 `127.0.0.1:19010`，处理二进制帧、粘包拆包、CRC 校验和 ACK 回包。
 - 串口接入：支持 legacy demo 帧，以及 `sent` / `sent1` / `sent2` / `sent3` 等 SENT 数据模式。
 - CAN 接入：可通过 TSMaster / TC1012 相关配置启用，支持 SENT 数据滤波。
-- UI 数据流：监听 `127.0.0.1:19011`，向 UI 客户端推送 JSON 行流。
+- UI 数据流：监听 `127.0.0.1:19011`，向 UI 客户端推送带版本头和长度前缀的 bincode 二进制帧。
 - 健康检查：监听 `127.0.0.1:19012`，提供 `/health` 和 `/ready`。
 - 控制接口：监听 `127.0.0.1:19013`，通过 TCP JSON 行命令更新 SENT 跳变阈值。
 - 告警服务：按传感器阈值触发和恢复告警事件。
@@ -193,7 +193,7 @@ CAN SENT 原始值在 `src/ingress/can.rs` 的 `decode_sent_values` 中解析为
 ## 二进制入口
 
 - `collector_service`：核心采集服务，负责 TCP / 串口 / CAN 接入、事件转发、告警、持久化和健康检查。
-- `ui_client`：egui UI 客户端，连接采集服务的 JSON 行流；默认只连接外部 collector，如需单进程演示可设置 `DEMO2_UI_EMBED_COLLECTOR=1`。
+- `ui_client`：egui UI 客户端，连接采集服务的版本化二进制 feed；默认只连接外部 collector，如需单进程演示可设置 `DEMO2_UI_EMBED_COLLECTOR=1`。
 - `serial_frame_sender`：串口测试发送端，支持 legacy 与 SENT 格式。
 - `serial_sender_ui`：串口发送 UI。
 - `sender_stress_report`：内置 TCP 压测发送端，逐档提升发送频率并输出 ACK / 丢包统计。
@@ -209,9 +209,9 @@ CAN SENT 原始值在 `src/ingress/can.rs` 的 `decode_sent_values` 中解析为
 - `alarm.rs`：处理告警状态、CAN 阈值告警、SENT 跳变告警和样本落入曲线缓存。
 - `config.rs`：读取 UI feed 地址和 PostgreSQL DSN。
 - `events.rs`：处理 UI 队列消息、实时样本、状态更新、CAN 回放结果和报警记录查询结果。
-- `feed.rs`：维护 TCP feed 连接、重连、JSON 行解码、队列投递和 feed 统计。
+- `feed.rs`：维护 TCP feed 连接、重连、长度前缀读取、版本化二进制帧解码、队列投递和 feed 统计。
 - `fonts.rs`：配置 egui 中文字体。
-- `messages.rs`：定义 UI feed 的 `TelemetryMsg` / `FeedMsg`。
+- `messages.rs`：重新导出 collector 与 UI 共用的 `TelemetryMsg` / `UiFeedMsg`。
 - `models.rs`：定义 UI 视图、告警、CAN 回放和报警记录相关状态结构。
 - `records.rs`：查询和绘制报警记录窗口。
 - `replay.rs`：加载、绘制和导出 CAN/SENT 历史回放数据。
