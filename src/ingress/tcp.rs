@@ -23,7 +23,10 @@ pub async fn run_tcp_ingress(
         let device_id = format!("tcp://{peer}");
         publish_status(&bus, format!("connected: {peer}"));
 
-        let handle = DeviceSession::spawn(
+        let cleanup_device_id = device_id.clone();
+        let cleanup_sessions = sessions.clone();
+        let cleanup_bus = bus.clone();
+        let (handle, session_task) = DeviceSession::spawn_with_join(
             device_id.clone(),
             Box::new(ConnectedTcpTransport::new(socket)),
             codec.clone(),
@@ -36,5 +39,11 @@ pub async fn run_tcp_ingress(
             },
         );
         sessions.write().await.insert(device_id, handle);
+
+        tokio::spawn(async move {
+            let _ = session_task.await;
+            cleanup_sessions.write().await.remove(&cleanup_device_id);
+            publish_status(&cleanup_bus, format!("disconnected: {peer}"));
+        });
     }
 }

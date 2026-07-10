@@ -236,6 +236,7 @@ impl UiClientApp {
                 let msg = TelemetryMsg {
                     device_id: sample.device_id,
                     sensor_id,
+                    axis: String::new(),
                     t_sec: sample.t_sec,
                     value: sample.value,
                     request_id: sample.req_id,
@@ -254,6 +255,7 @@ impl UiClientApp {
                 let msg = TelemetryMsg {
                     device_id: device_id.clone(),
                     sensor_id: 0,
+                    axis: String::new(),
                     t_sec: sample.t_sec,
                     value: sample.value,
                     request_id: sample.req_id,

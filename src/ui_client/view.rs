@@ -1032,8 +1032,8 @@ impl eframe::App for UiClientApp {
             ui.label(format!("状态: {}", self.status));
             ui.label(format!("总样本数: {}", self.total_samples));
             ui.label(format!(
-                "丢弃的样本(ui队列满): {}",
-                self.feed_stats.dropped_samples.load(Ordering::Relaxed)
+                "丢弃的消息(ui队列满): {}",
+                self.feed_stats.dropped_messages.load(Ordering::Relaxed)
             ));
             ui.label(format!(
                 "解码失败数: {}",

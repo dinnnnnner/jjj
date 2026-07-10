@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 #[derive(Debug, Error)]
@@ -251,6 +252,17 @@ impl DeviceSession {
         store: Store,
         config: SessionConfig,
     ) -> DeviceSessionHandle {
+        Self::spawn_with_join(device_id, transport, codec, bus, store, config).0
+    }
+
+    pub fn spawn_with_join(
+        device_id: DeviceId,
+        transport: Box<dyn Transport>,
+        codec: Arc<dyn FrameCodec>,
+        bus: EventBus,
+        store: Store,
+        config: SessionConfig,
+    ) -> (DeviceSessionHandle, JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(256);
         let mut session = Self {
             device_id: device_id.clone(),
@@ -263,11 +275,11 @@ impl DeviceSession {
             rx,
         };
 
-        tokio::spawn(async move {
+        let join = tokio::spawn(async move {
             session.run().await;
         });
 
-        DeviceSessionHandle { device_id, tx }
+        (DeviceSessionHandle { device_id, tx }, join)
     }
 
     async fn run(&mut self) {

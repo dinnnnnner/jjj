@@ -5,8 +5,8 @@ use demo2::db::SCHEMA_SQL;
 use demo2::db::writer::{
     DbCmd, TelemetryRow, flush_telemetry_batch, insert_alarm_event, insert_system_event,
 };
-use demo2::domain::AlarmEvent;
 use demo2::domain::telemetry::axis_name;
+use demo2::feed::{TelemetryMsg, UiFeedMsg};
 use demo2::ingress::can::{SentFilterConfig, run_can_ingress};
 use demo2::ingress::serial::{
     SerialIngressMode, parse_serial_mode, publish_status, run_serial_ingress,
@@ -23,6 +23,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
@@ -31,6 +32,7 @@ use tracing::{info, warn};
 
 const DB_CMD_CHANNEL_CAPACITY: usize = 50_000;
 const TELEMETRY_BATCH_SIZE: usize = 256;
+const TELEMETRY_FLUSH_INTERVAL: Duration = Duration::from_millis(25);
 const DEMO_UI_STRIDE: u64 = 8;
 
 #[derive(Default)]
@@ -46,38 +48,37 @@ struct CollectorStats {
     last_db_error: Mutex<Option<String>>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct TelemetryMsg {
-    pub device_id: String,
-    pub sensor_id: usize,
-    pub axis: String,
-    pub alarm_bit: bool,
-    pub t_sec: f64,
-    pub value: f64,
-    pub request_id: u64,
-    pub source_kind: TelemetrySourceKind,
-}
-
-impl From<TelemetryMsg> for TelemetryRow {
-    fn from(msg: TelemetryMsg) -> Self {
-        Self {
-            device_id: msg.device_id,
-            sensor_id: msg.sensor_id,
-            axis: msg.axis,
-            alarm_bit: msg.alarm_bit,
-            t_sec: msg.t_sec,
-            value: msg.value,
-            request_id: msg.request_id,
-        }
+fn telemetry_row_from_msg(msg: TelemetryMsg) -> TelemetryRow {
+    TelemetryRow {
+        device_id: msg.device_id,
+        sensor_id: msg.sensor_id,
+        axis: msg.axis,
+        alarm_bit: msg.alarm_bit,
+        t_sec: msg.t_sec,
+        value: msg.value,
+        request_id: msg.request_id,
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
-enum UiFeedMsg {
-    Telemetry(TelemetryMsg),
-    Alarm(AlarmEvent),
-    Status(String),
+fn telemetry_msg_from_sample(
+    device_id: String,
+    sensor_id: usize,
+    t_sec: f64,
+    value: f64,
+    req_id: u64,
+    alarm_bit: bool,
+    source_kind: TelemetrySourceKind,
+) -> TelemetryMsg {
+    TelemetryMsg {
+        device_id,
+        sensor_id,
+        axis: axis_name(source_kind, sensor_id).to_string(),
+        alarm_bit,
+        t_sec,
+        value,
+        request_id: req_id,
+        source_kind,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -203,51 +204,43 @@ async fn start_pg_writer(
     let (tx, mut rx) = mpsc::channel::<DbCmd>(DB_CMD_CHANNEL_CAPACITY);
     tokio::spawn(async move {
         let mut telemetry_batch = Vec::with_capacity(TELEMETRY_BATCH_SIZE);
-        while let Some(cmd) = rx.recv().await {
-            match cmd {
-                DbCmd::Telemetry(t) => {
-                    telemetry_batch.push(t);
-                    while telemetry_batch.len() < TELEMETRY_BATCH_SIZE {
-                        match rx.try_recv() {
-                            Ok(DbCmd::Telemetry(t)) => telemetry_batch.push(t),
-                            Ok(other) => {
-                                flush_db_telemetry_batch(&client, &mut telemetry_batch, &stats)
-                                    .await;
-                                let (res, op) = match other {
-                                    DbCmd::Alarm(a) => {
-                                        (insert_alarm_event(&client, &a).await, "alarm")
-                                    }
-                                    DbCmd::System { level, message } => (
-                                        insert_system_event(&client, &level, &message).await,
-                                        "system",
-                                    ),
-                                    DbCmd::Telemetry(_) => unreachable!(),
-                                };
-                                if let Err(err) = res {
-                                    record_db_write_error(&stats, op, err);
-                                }
-                                continue;
+        let mut flush_tick = tokio::time::interval(TELEMETRY_FLUSH_INTERVAL);
+        flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                cmd = rx.recv() => {
+                    let Some(cmd) = cmd else {
+                        break;
+                    };
+                    match cmd {
+                        DbCmd::Telemetry(t) => {
+                            telemetry_batch.push(t);
+                            if telemetry_batch.len() >= TELEMETRY_BATCH_SIZE {
+                                flush_db_telemetry_batch(&client, &mut telemetry_batch, &stats).await;
                             }
-                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                        }
+                        DbCmd::Alarm(a) => {
+                            flush_db_telemetry_batch(&client, &mut telemetry_batch, &stats).await;
+                            if let Err(err) = insert_alarm_event(&client, &a).await {
+                                record_db_write_error(&stats, "alarm", err);
+                            }
+                        }
+                        DbCmd::System { level, message } => {
+                            flush_db_telemetry_batch(&client, &mut telemetry_batch, &stats).await;
+                            if let Err(err) = insert_system_event(&client, &level, &message).await {
+                                record_db_write_error(&stats, "system", err);
+                            }
                         }
                     }
+                }
+                _ = flush_tick.tick() => {
                     flush_db_telemetry_batch(&client, &mut telemetry_batch, &stats).await;
                 }
-                DbCmd::Alarm(a) => {
-                    flush_db_telemetry_batch(&client, &mut telemetry_batch, &stats).await;
-                    if let Err(err) = insert_alarm_event(&client, &a).await {
-                        record_db_write_error(&stats, "alarm", err);
-                    }
-                }
-                DbCmd::System { level, message } => {
-                    flush_db_telemetry_batch(&client, &mut telemetry_batch, &stats).await;
-                    if let Err(err) = insert_system_event(&client, &level, &message).await {
-                        record_db_write_error(&stats, "system", err);
-                    }
-                }
+                else => break,
             }
         }
+
         flush_db_telemetry_batch(&client, &mut telemetry_batch, &stats).await;
     });
 
@@ -256,7 +249,7 @@ async fn start_pg_writer(
 
 async fn serve_ui_client(
     mut socket: TcpStream,
-    mut rx: broadcast::Receiver<String>,
+    mut rx: broadcast::Receiver<Vec<u8>>,
     stats: Arc<CollectorStats>,
 ) {
     stats.ui_clients.fetch_add(1, Ordering::Relaxed);
@@ -271,10 +264,14 @@ async fn serve_ui_client(
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         };
 
-        if socket.write_all(line.as_bytes()).await.is_err() {
+        let Ok(len) = u32::try_from(line.len()) else {
+            stats.ui_drop.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        if socket.write_all(&len.to_be_bytes()).await.is_err() {
             break;
         }
-        if socket.write_all(b"\n").await.is_err() {
+        if socket.write_all(&line).await.is_err() {
             break;
         }
     }
@@ -283,7 +280,7 @@ async fn serve_ui_client(
 
 async fn run_ui_forwarder(
     mut sub: tokio::sync::broadcast::Receiver<AppEvent>,
-    ui_tx: broadcast::Sender<String>,
+    ui_tx: broadcast::Sender<Vec<u8>>,
     stats: Arc<CollectorStats>,
 ) {
     let mut demo_emit_counters: HashMap<(String, usize), u64> = HashMap::new();
@@ -298,16 +295,15 @@ async fn run_ui_forwarder(
                 alarm_bit,
                 source_kind,
             })) => {
-                let msg = TelemetryMsg {
+                let msg = telemetry_msg_from_sample(
                     device_id,
                     sensor_id,
-                    axis: axis_name(source_kind, sensor_id).to_string(),
-                    alarm_bit,
                     t_sec,
                     value,
-                    request_id: req_id,
+                    req_id,
+                    alarm_bit,
                     source_kind,
-                };
+                );
                 if msg.source_kind == TelemetrySourceKind::SerialDemo {
                     let key = (msg.device_id.clone(), msg.sensor_id);
                     let counter = demo_emit_counters.entry(key).or_insert(0);
@@ -316,29 +312,34 @@ async fn run_ui_forwarder(
                         continue;
                     }
                 }
-                if let Ok(line) = serde_json::to_string(&UiFeedMsg::Telemetry(msg)) {
-                    if ui_tx.send(line).is_err() {
+                if let Ok(frame) = bincode::serialize(&UiFeedMsg::Telemetry(msg)) {
+                    if ui_tx.send(frame).is_err() {
                         stats.ui_drop.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
             Ok(AppEvent::Device(DeviceEvent::AlarmRaised(alarm)))
             | Ok(AppEvent::Device(DeviceEvent::AlarmCleared(alarm))) => {
-                if let Ok(line) = serde_json::to_string(&UiFeedMsg::Alarm(alarm)) {
-                    if ui_tx.send(line).is_err() {
+                if let Ok(frame) = bincode::serialize(&UiFeedMsg::Alarm(alarm)) {
+                    if ui_tx.send(frame).is_err() {
                         stats.ui_drop.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
             Ok(AppEvent::System(msg)) => {
-                if let Ok(line) = serde_json::to_string(&UiFeedMsg::Status(msg)) {
-                    if ui_tx.send(line).is_err() {
+                if let Ok(frame) = bincode::serialize(&UiFeedMsg::Status(msg)) {
+                    if ui_tx.send(frame).is_err() {
                         stats.ui_drop.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
             Ok(_) => {}
-            Err(_) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(skipped, "ui forwarder lagged, skipping stale messages");
+                stats.ui_drop.fetch_add(skipped as u64, Ordering::Relaxed);
+                continue;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
     }
 }
@@ -376,21 +377,16 @@ async fn run_alarm_forwarder(
                     .store(active_sessions.len() as u64, Ordering::Relaxed);
             }
             Ok(_) => {}
-            Err(_) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(skipped, "alarm forwarder lagged, skipping stale messages");
+                continue;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
     }
 }
 
-async fn run_control_server(addr: String, alarm_service: AlarmService, bus: EventBus) {
-    let listener = match TcpListener::bind(&addr).await {
-        Ok(listener) => listener,
-        Err(err) => {
-            warn!(error = %err, addr = %addr, "collector control bind failed");
-            return;
-        }
-    };
-    println!("collector control listening on {addr}");
-
+async fn run_control_server(listener: TcpListener, alarm_service: AlarmService, bus: EventBus) {
     loop {
         match listener.accept().await {
             Ok((socket, _)) => {
@@ -485,17 +481,18 @@ async fn run_persistence_forwarder(
                 alarm_bit,
                 source_kind,
             })) => {
-                let msg = TelemetryMsg {
+                let msg = telemetry_msg_from_sample(
                     device_id,
                     sensor_id,
-                    axis: axis_name(source_kind, sensor_id).to_string(),
-                    alarm_bit,
                     t_sec,
                     value,
-                    request_id: req_id,
+                    req_id,
+                    alarm_bit,
                     source_kind,
-                };
-                let _ = db_tx.send(DbCmd::Telemetry(msg.into())).await;
+                );
+                let _ = db_tx
+                    .send(DbCmd::Telemetry(telemetry_row_from_msg(msg)))
+                    .await;
             }
             Ok(AppEvent::Device(DeviceEvent::AlarmRaised(alarm))) => {
                 let _ = db_tx.send(DbCmd::Alarm(alarm)).await;
@@ -547,16 +544,15 @@ async fn run_filtered_event_forwarder(
                 alarm_bit,
                 source_kind,
             })) => {
-                let filtered = filter.apply(TelemetryMsg {
+                let filtered = filter.apply(telemetry_msg_from_sample(
                     device_id,
                     sensor_id,
-                    axis: axis_name(source_kind, sensor_id).to_string(),
-                    alarm_bit,
                     t_sec,
                     value,
-                    request_id: req_id,
+                    req_id,
+                    alarm_bit,
                     source_kind,
-                });
+                ));
                 processed_bus.publish(AppEvent::Device(DeviceEvent::TelemetrySample {
                     device_id: filtered.device_id,
                     sensor_id: filtered.sensor_id,
@@ -597,8 +593,7 @@ fn health_json(stats: &CollectorStats) -> String {
     .to_string()
 }
 
-async fn run_health_server(addr: String, stats: Arc<CollectorStats>) -> io::Result<()> {
-    let listener = TcpListener::bind(addr).await?;
+async fn run_health_server(listener: TcpListener, stats: Arc<CollectorStats>) -> io::Result<()> {
     loop {
         let (mut socket, _) = listener.accept().await?;
         let stats = stats.clone();
@@ -666,8 +661,10 @@ pub async fn run() -> anyhow::Result<()> {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
-    let (ui_tx, _) = broadcast::channel::<String>(cfg.ui_feed_capacity);
+    let (ui_tx, _) = broadcast::channel::<Vec<u8>>(cfg.ui_feed_capacity);
     let alarm_service = AlarmService::new(processed_bus.clone());
+    let control_listener = TcpListener::bind(&cfg.control_addr).await?;
+    let health_listener = TcpListener::bind(&cfg.health_addr).await?;
     tokio::spawn(run_ui_forwarder(
         processed_bus.subscribe(),
         ui_tx.clone(),
@@ -679,7 +676,7 @@ pub async fn run() -> anyhow::Result<()> {
         stats.clone(),
     ));
     tokio::spawn(run_control_server(
-        cfg.control_addr.clone(),
+        control_listener,
         alarm_service,
         processed_bus.clone(),
     ));
@@ -702,7 +699,7 @@ pub async fn run() -> anyhow::Result<()> {
         }
     }
 
-    tokio::spawn(run_health_server(cfg.health_addr.clone(), stats.clone()));
+    tokio::spawn(run_health_server(health_listener, stats.clone()));
 
     let can_enabled = env_flag("DEMO2_COLLECTOR_CAN_ENABLED").unwrap_or(cfg.can_enabled);
     if can_enabled {
@@ -788,6 +785,7 @@ pub async fn run() -> anyhow::Result<()> {
     println!("collector ingress listening on {}", cfg.ingress_addr);
     println!("collector ui feed listening on {}", cfg.ui_feed_addr);
     println!("collector health listening on {}", cfg.health_addr);
+    println!("collector control listening on {}", cfg.control_addr);
 
     run_tcp_ingress(
         &cfg.ingress_addr,
