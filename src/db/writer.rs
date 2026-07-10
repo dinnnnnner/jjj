@@ -4,12 +4,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Clone, Debug)]
 pub struct TelemetryRow {
     pub device_id: String,
-    pub sensor_id: usize,
+    pub sensor_id: i32,
     pub axis: String,
     pub alarm_bit: bool,
     pub t_sec: f64,
     pub value: f64,
-    pub request_id: u64,
+    pub request_id: i64,
 }
 
 pub enum DbCmd {
@@ -71,22 +71,12 @@ pub async fn flush_telemetry_batch(
         let row_ts_ms = now_ms();
         ts_ms.push(row_ts_ms);
         device_ids.push(item.device_id.clone());
-        sensor_ids.push(i32::try_from(item.sensor_id).map_err(|_| {
-            anyhow::anyhow!(
-                "sensor_id out of PostgreSQL INTEGER range: {}",
-                item.sensor_id
-            )
-        })?);
+        sensor_ids.push(item.sensor_id);
         axes.push(item.axis.clone());
         alarm_bits.push(item.alarm_bit);
         t_secs.push(item.t_sec);
         values.push(item.value);
-        request_ids.push(i64::try_from(item.request_id).map_err(|_| {
-            anyhow::anyhow!(
-                "request_id out of PostgreSQL BIGINT range: {}",
-                item.request_id
-            )
-        })?);
+        request_ids.push(item.request_id);
     }
 
     ensure_telemetry_partitions(client, &ts_ms).await?;

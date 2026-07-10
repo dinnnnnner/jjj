@@ -47,6 +47,16 @@ src/
 docker compose up -d postgres
 ```
 
+如果使用 Windows 本机安装的 PostgreSQL 18，而不是 Docker，请在管理员 PowerShell 中启动服务，并设置为开机自动启动：
+
+```powershell
+Start-Service -Name "postgresql-x64-18"
+Set-Service -Name "postgresql-x64-18" -StartupType Automatic
+Get-Service -Name "postgresql-x64-18"
+```
+
+不同 PostgreSQL 版本的服务名可能不同，可先运行 `Get-Service *postgres*` 查询实际名称。
+
 `docker-compose.yml` 默认创建：
 
 - 数据库：`demo2`
@@ -288,7 +298,7 @@ sid=3,value=47.381
 
 - `os error 10061`：目标端口没有服务在监听。先确认 `collector_service` 已启动，sender 连接 `19010`，UI 连接 `19011`。
 - UI 无数据：检查 `/health` 的 `samples_rx` 是否增长，再检查 sender 是否成功连接并收到 ACK。
-- 数据库无数据：确认 `pg_dsn` 密码为 `123456`，或设置 `DEMO2_DISABLE_DB=1` 明确关闭持久化。
+- 数据库无数据：先运行 `Get-Service *postgres*` 确认 Windows PostgreSQL 服务处于 `Running`；PostgreSQL 18 可在管理员 PowerShell 中运行 `Start-Service -Name "postgresql-x64-18"`，并用 `Set-Service -Name "postgresql-x64-18" -StartupType Automatic` 设置自动启动。然后确认 `pg_dsn` 密码为 `123456`；如不需要持久化，可设置 `DEMO2_DISABLE_DB=1`。
 - `config.toml` 不生效：确认文件位于项目根目录，并且 `[collector]` 表名正确。
 
 ## 测试
