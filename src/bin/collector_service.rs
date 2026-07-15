@@ -16,7 +16,7 @@ use demo2::protocol::SimpleFrameCodec;
 use demo2::session::{DeviceSession, DeviceSessionHandle, SessionConfig};
 use demo2::signal::{ButterworthConfig, KeyedButterworthFilter};
 use demo2::transport::SerialTransport;
-use demo2::transport::can::CanTransportConfig;
+use demo2::transport::can::{CanTransportConfig, HW_SUBTYPE_TC1012, HW_SUBTYPE_TC1016};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io;
@@ -741,6 +741,27 @@ pub async fn run() -> anyhow::Result<()> {
 
     let can_enabled = env_flag("DEMO2_COLLECTOR_CAN_ENABLED").unwrap_or(cfg.can_enabled);
     if can_enabled {
+        let env_hardware_name = std::env::var("DEMO2_COLLECTOR_CAN_HW_NAME").ok();
+        let hardware_name = env_hardware_name
+            .clone()
+            .unwrap_or_else(|| cfg.can_hardware_name.clone());
+        let hardware_subtype = std::env::var("DEMO2_COLLECTOR_CAN_HW_SUBTYPE")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .or_else(|| {
+                if env_hardware_name.is_some() {
+                    None
+                } else {
+                    cfg.can_hardware_subtype
+                }
+            })
+            .unwrap_or_else(
+                || match hardware_name.trim().to_ascii_uppercase().as_str() {
+                    "TC1012" => HW_SUBTYPE_TC1012,
+                    "TC1016" => HW_SUBTYPE_TC1016,
+                    _ => CanTransportConfig::default().hardware_subtype,
+                },
+            );
         let can_config = CanTransportConfig {
             tsmaster_bin: std::env::var("DEMO2_COLLECTOR_CAN_TSMASTER_BIN")
                 .ok()
@@ -748,8 +769,8 @@ pub async fn run() -> anyhow::Result<()> {
                 .map(Into::into),
             autostart_tsmaster: env_flag("DEMO2_COLLECTOR_CAN_AUTOSTART_TSMASTER")
                 .unwrap_or(cfg.can_autostart_tsmaster),
-            hardware_name: std::env::var("DEMO2_COLLECTOR_CAN_HW_NAME")
-                .unwrap_or_else(|_| cfg.can_hardware_name.clone()),
+            hardware_name,
+            hardware_subtype,
             channels: collector_can_channels(&cfg),
             ..CanTransportConfig::default()
         };

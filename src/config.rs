@@ -1,4 +1,4 @@
-use crate::transport::can::CanChannelConfig;
+use crate::transport::can::{CanChannelConfig, HW_SUBTYPE_TC1016};
 use serde::Deserialize;
 use std::fs;
 use tracing::warn;
@@ -63,6 +63,8 @@ pub struct CollectorConfig {
     #[serde(default = "default_can_autostart_tsmaster")]
     pub can_autostart_tsmaster: bool,
     pub can_hardware_name: String,
+    #[serde(default)]
+    pub can_hardware_subtype: Option<i32>,
     pub can_channel: u8,
     pub can_baud_kbps: u32,
     pub can_data_baud_kbps: u32,
@@ -101,7 +103,8 @@ impl Default for CollectorConfig {
             can_enabled: false,
             can_tsmaster_bin: None,
             can_autostart_tsmaster: true,
-            can_hardware_name: "TC1012".to_string(),
+            can_hardware_name: "TC1016".to_string(),
+            can_hardware_subtype: Some(HW_SUBTYPE_TC1016),
             can_channel: 0,
             can_baud_kbps: 500,
             can_data_baud_kbps: 2_000,

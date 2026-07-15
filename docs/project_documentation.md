@@ -17,7 +17,7 @@
 - 串口 legacy 帧接入。
 - 串口 demo 协议接入。
 - 串口 SENT 模式接入。
-- CAN / CAN FD 接入，当前实现针对 TSMaster / TC1012 运行环境。
+- CAN / CAN FD 接入，当前默认针对 TSMaster / TC1016 运行环境，硬件 subtype 可配置。
 
 项目支持的输出与观测方式：
 
@@ -360,7 +360,7 @@ serial://<port_name>
 
 CAN 入口会：
 
-- 尝试连接 TSMaster / TC1012。
+- 尝试连接 TSMaster / TC1016。
 - 支持按硬件名和通道做候选探测。
 - 读取 CAN / CAN FD 回调帧。
 - 解码普通三轴 CAN 样本。
@@ -654,11 +654,12 @@ serial_baud = 2000000
 serial_mode = "sent"
 
 can_enabled = false
-can_hardware_name = "TC1012"
+can_hardware_name = "TC1016"
+can_hardware_subtype = 14
 can_channel = 0
 can_baud_kbps = 500
 can_data_baud_kbps = 2000
-can_channels = [0, 1]
+can_channels = [0, 1, 2, 3]
 can_autostart_tsmaster = true
 
 db_filter_enabled = false
@@ -696,6 +697,7 @@ DEMO2_COLLECTOR_CAN_ENABLED
 DEMO2_COLLECTOR_CAN_CHANNEL
 DEMO2_COLLECTOR_CAN_CHANNELS
 DEMO2_COLLECTOR_CAN_HW_NAME
+DEMO2_COLLECTOR_CAN_HW_SUBTYPE
 DEMO2_COLLECTOR_CAN_TSMASTER_BIN
 DEMO2_COLLECTOR_CAN_AUTOSTART_TSMASTER
 DEMO2_COLLECTOR_CAN_BAUD_KBPS
@@ -843,7 +845,8 @@ cargo run --bin serial_frame_sender -- --port COM4 --baud 2000000 --format sent1
 ```toml
 [collector]
 can_enabled = true
-can_hardware_name = "TC1012"
+can_hardware_name = "TC1016"
+can_hardware_subtype = 14
 can_channel = 0
 can_baud_kbps = 500
 can_data_baud_kbps = 2000
@@ -1248,7 +1251,7 @@ cargo run --bin check_db_partition
 
 1. TSMaster 是否安装。
 2. `TSMaster.dll` 是否在 `D:\TSMaster\bin64` 或配置的路径下。
-3. 硬件名是否为 `TC1012`。
+3. TC1016 的硬件名是否为 `TC1016`、硬件 subtype 是否为 `14`。
 4. 通道号是否正确。
 5. 是否需要关闭自动启动：
 

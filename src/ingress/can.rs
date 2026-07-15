@@ -8,6 +8,7 @@ use crate::protocol::can_data::{
 use crate::signal::SentMovingAverage;
 use crate::transport::can::{
     CanChannelConfig, CanFrame, CanTransport, CanTransportConfig, CanTransportError, CanTxFrame,
+    HW_SUBTYPE_TC1012, HW_SUBTYPE_TC1016,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
@@ -251,6 +252,7 @@ async fn connect_can_transport(
         match transport.connect().await {
             Ok(()) => {
                 if candidate.hardware_name != config.hardware_name
+                    || candidate.hardware_subtype != config.hardware_subtype
                     || candidate.channels != config.channels
                 {
                     publish_status(bus, format!("collector can auto-detected {candidate_desc}"));
@@ -285,13 +287,14 @@ fn candidate_can_configs(config: &CanTransportConfig) -> Vec<CanTransportConfig>
     let requested_name = config.hardware_name.trim();
     let is_auto_name = requested_name.is_empty() || requested_name.eq_ignore_ascii_case("auto");
 
-    let mut names = Vec::new();
-    if !requested_name.is_empty() {
-        names.push(requested_name.to_string());
-    }
-    if is_auto_name || !requested_name.eq_ignore_ascii_case("TC1012") {
-        names.push("TC1012".to_string());
-    }
+    let hardware_candidates = if is_auto_name {
+        vec![
+            ("TC1016".to_string(), HW_SUBTYPE_TC1016),
+            ("TC1012".to_string(), HW_SUBTYPE_TC1012),
+        ]
+    } else {
+        vec![(requested_name.to_string(), config.hardware_subtype)]
+    };
 
     let configured_channels = normalized_can_channels(config);
     let channel_candidates = if configured_channels.len() == 1 {
@@ -311,13 +314,15 @@ fn candidate_can_configs(config: &CanTransportConfig) -> Vec<CanTransportConfig>
         vec![configured_channels]
     };
 
-    for hardware_name in names {
+    for (hardware_name, hardware_subtype) in hardware_candidates {
         for channels in &channel_candidates {
             let mut candidate = config.clone();
             candidate.hardware_name = hardware_name.clone();
+            candidate.hardware_subtype = hardware_subtype;
             candidate.channels = channels.clone();
             let key = (
                 candidate.hardware_name.clone(),
+                candidate.hardware_subtype,
                 format_can_channels(&candidate.channels),
             );
             if seen.insert(key) {
@@ -331,8 +336,9 @@ fn candidate_can_configs(config: &CanTransportConfig) -> Vec<CanTransportConfig>
 
 fn format_can_target(config: &CanTransportConfig) -> String {
     format!(
-        "hw={} channels={}",
+        "hw={} subtype={} channels={}",
         config.hardware_name,
+        config.hardware_subtype,
         format_can_channels(&config.channels)
     )
 }
@@ -549,5 +555,37 @@ mod tests {
         assert_eq!(axis_frame_count(&first_ch0), Some(1));
         assert_eq!(axis_frame_count(&first_ch1), Some(1));
         assert_eq!(axis_frame_count(&second_ch0), Some(2));
+    }
+
+    #[test]
+    fn explicit_tc1016_probes_its_four_physical_channels() {
+        let config = CanTransportConfig::default();
+        let candidates = candidate_can_configs(&config);
+
+        assert_eq!(candidates.len(), 4);
+        assert!(candidates.iter().all(|candidate| {
+            candidate.hardware_name == "TC1016" && candidate.hardware_subtype == HW_SUBTYPE_TC1016
+        }));
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.channels[0].index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn auto_hardware_name_pairs_models_with_their_subtypes() {
+        let mut config = CanTransportConfig::default();
+        config.hardware_name = "auto".to_string();
+        let candidates = candidate_can_configs(&config);
+
+        assert!(candidates.iter().any(|candidate| {
+            candidate.hardware_name == "TC1016" && candidate.hardware_subtype == HW_SUBTYPE_TC1016
+        }));
+        assert!(candidates.iter().any(|candidate| {
+            candidate.hardware_name == "TC1012" && candidate.hardware_subtype == HW_SUBTYPE_TC1012
+        }));
     }
 }
