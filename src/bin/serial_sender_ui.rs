@@ -829,14 +829,20 @@ impl SerialSenderUiApp {
         collector_table.insert("can_enabled".to_string(), toml::Value::Boolean(true));
         collector_table.insert(
             "can_hardware_name".to_string(),
-            toml::Value::String("TC1012".to_string()),
+            toml::Value::String("TC1016".to_string()),
         );
+        collector_table.insert("can_hardware_subtype".to_string(), toml::Value::Integer(14));
         collector_table.insert("can_channel".to_string(), toml::Value::Integer(0));
         collector_table.insert("can_baud_kbps".to_string(), toml::Value::Integer(500));
         collector_table.insert("can_data_baud_kbps".to_string(), toml::Value::Integer(2000));
         collector_table.insert(
             "can_channels".to_string(),
-            toml::Value::Array(vec![toml::Value::Integer(0), toml::Value::Integer(1)]),
+            toml::Value::Array(vec![
+                toml::Value::Integer(0),
+                toml::Value::Integer(1),
+                toml::Value::Integer(2),
+                toml::Value::Integer(3),
+            ]),
         );
 
         let rendered = toml::to_string_pretty(&root).context("serialize config.toml failed")?;
@@ -845,7 +851,7 @@ impl SerialSenderUiApp {
         if already_enabled {
             Ok("collector.can_enabled already true".to_string())
         } else {
-            Ok("enabled collector CAN ingress (TC1012 ch0/ch1, 500/2000 kbps)".to_string())
+            Ok("enabled collector CAN ingress (TC1016 ch0-ch3, 500/2000 kbps)".to_string())
         }
     }
 

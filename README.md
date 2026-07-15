@@ -6,7 +6,7 @@
 
 - TCP 设备接入：监听 `127.0.0.1:19010`，处理二进制帧、粘包拆包、CRC 校验和 ACK 回包。
 - 串口接入：支持 legacy demo 帧，以及 `sent` / `sent1` / `sent2` / `sent3` 等 SENT 数据模式。
-- CAN 接入：可通过 TSMaster / TC1012 相关配置启用，支持 SENT 数据滤波。
+- CAN 接入：可通过 TSMaster / TC1016 相关配置启用，支持 SENT 数据滤波。
 - UI 数据流：监听 `127.0.0.1:19011`，向 UI 客户端推送带版本头和长度前缀的 bincode 二进制帧。
 - 健康检查：监听 `127.0.0.1:19012`，提供 `/health` 和 `/ready`。
 - 控制接口：监听 `127.0.0.1:19013`，通过 TCP JSON 行命令更新 SENT 跳变阈值。
@@ -142,11 +142,12 @@ serial_baud = 2000000
 serial_mode = "sent"
 
 can_enabled = false
-can_hardware_name = "TC1012"
+can_hardware_name = "TC1016"
+can_hardware_subtype = 14
 can_channel = 0
 can_baud_kbps = 500
 can_data_baud_kbps = 2000
-can_channels = [0, 1]
+can_channels = [0, 1, 2, 3]
 
 db_filter_enabled = false
 db_filter_order = 10
@@ -181,7 +182,7 @@ CAN SENT 原始值在 `src/ingress/can.rs` 的 `decode_sent_values` 中解析为
 
 - `DEMO2_DISABLE_DB=1`：禁用 PostgreSQL 持久化。
 - `DEMO2_COLLECTOR_SERIAL_PORT` / `DEMO2_COLLECTOR_SERIAL_BAUD` / `DEMO2_COLLECTOR_SERIAL_MODE`：覆盖串口接入。
-- `DEMO2_COLLECTOR_CAN_ENABLED` / `DEMO2_COLLECTOR_CAN_CHANNEL` / `DEMO2_COLLECTOR_CAN_CHANNELS` / `DEMO2_COLLECTOR_CAN_HW_NAME`：覆盖 CAN 接入。
+- `DEMO2_COLLECTOR_CAN_ENABLED` / `DEMO2_COLLECTOR_CAN_CHANNEL` / `DEMO2_COLLECTOR_CAN_CHANNELS` / `DEMO2_COLLECTOR_CAN_HW_NAME` / `DEMO2_COLLECTOR_CAN_HW_SUBTYPE`：覆盖 CAN 接入。TC1016 的 subtype 为 `14`。
 - `DEMO2_COLLECTOR_CAN_TSMASTER_BIN` / `DEMO2_COLLECTOR_CAN_AUTOSTART_TSMASTER`：配置 TSMaster 启动。
 - `DEMO2_COLLECTOR_CAN_BAUD_KBPS` / `DEMO2_COLLECTOR_CAN_DATA_BAUD_KBPS`：覆盖 CAN 仲裁/数据波特率。
 - `DEMO2_SENT_FILTER_ENABLED` / `DEMO2_SENT_FILTER_WINDOW`：覆盖 SENT 滤波配置。

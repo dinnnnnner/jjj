@@ -13,7 +13,8 @@ use windows_sys::Win32::System::LibraryLoader::SetDllDirectoryW;
 
 const APP_NAME: &str = "demo2_can_ingress";
 const HW_TYPE_TS_USB_DEVICE: i32 = 3;
-const HW_SUBTYPE_TC1012: i32 = 12;
+pub const HW_SUBTYPE_TC1012: i32 = 12;
+pub const HW_SUBTYPE_TC1016: i32 = 14;
 const APP_CAN: i32 = 0;
 const CANFD_TYPE_ISO: i32 = 1;
 const CANFD_MODE_NORMAL: i32 = 0;
@@ -88,6 +89,7 @@ pub struct CanTransportConfig {
     pub tsmaster_bin: Option<PathBuf>,
     pub autostart_tsmaster: bool,
     pub hardware_name: String,
+    pub hardware_subtype: i32,
     pub channels: Vec<CanChannelConfig>,
     pub receive_timeout: Duration,
 }
@@ -160,7 +162,8 @@ impl Default for CanTransportConfig {
         Self {
             tsmaster_bin: None,
             autostart_tsmaster: true,
-            hardware_name: "TC1012".to_string(),
+            hardware_name: "TC1016".to_string(),
+            hardware_subtype: HW_SUBTYPE_TC1016,
             channels: vec![CanChannelConfig {
                 index: 0,
                 arbitration_baud_kbps: 500,
@@ -400,9 +403,9 @@ impl CanTransport {
                         i32::from(ch.index),
                         hw_name.as_ptr(),
                         HW_TYPE_TS_USB_DEVICE,
-                        HW_SUBTYPE_TC1012,
-                        i32::from(ch.index),
+                        self.config.hardware_subtype,
                         0,
+                        i32::from(ch.index),
                         1,
                     )
                 })?;

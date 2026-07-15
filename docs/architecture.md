@@ -79,7 +79,7 @@ reconnect_enabled = false
 
 - TCP：监听 `ingress_addr`，每个连接进入 `DeviceSession`。
 - 串口：支持 `legacy`、`demo`、`sent`、`sent1`、`sent2`、`sent3`。
-- CAN：通过 TSMaster / TC1012 读取 CAN / CAN FD，解析普通三轴样本、SENT over CAN 和 SENT error。
+- CAN：通过 TSMaster / TC1016 读取 CAN / CAN FD，解析普通三轴样本、SENT over CAN 和 SENT error。
 
 ### 3.5 bus
 
