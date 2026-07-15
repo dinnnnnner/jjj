@@ -162,7 +162,8 @@ control 接口是 TCP JSON 行协议。客户端连接 `control_addr`，发送�
   "torque_warn": 0.2,
   "torque_red": 0.3,
   "torque_purple": 0.4,
-  "angle_t_red": 0.2,
+  "angle_t1_red": 0.2,
+  "angle_t2_red": 0.2,
   "angle_s_red": 1.0
 }
 ```
@@ -179,7 +180,7 @@ control 接口是 TCP JSON 行协议。客户端连接 `control_addr`，发送�
 {"ok":false,"error":"SENT jump thresholds must be finite numbers"}
 ```
 
-阈值会被规范化：扭矩阈值取绝对值并保证 `warn <= red <= purple`，角度阈值取绝对值。更新成功后 collector 会发布一条 `status` 消息到 UI feed。
+阈值会被规范化：扭矩阈值取绝对值并保证 `warn <= red <= purple`，T1、T2 和 S 的角度阈值分别取绝对值。旧客户端仍可发送 `angle_t_red`，collector 会将它同时用于 T1 和 T2。更新成功后 collector 会发布一条 `status` 消息到 UI feed。
 
 ## 5. Health HTTP API
 

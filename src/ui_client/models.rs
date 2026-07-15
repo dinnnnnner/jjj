@@ -178,18 +178,22 @@ impl Default for SentTorqueJumpThresholds {
 
 #[derive(Clone, Debug)]
 pub(crate) struct SentAngleJumpThresholds {
-    pub(crate) t_red_input: String,
+    pub(crate) t1_red_input: String,
+    pub(crate) t2_red_input: String,
     pub(crate) s_red_input: String,
-    pub(crate) t_red_applied: String,
+    pub(crate) t1_red_applied: String,
+    pub(crate) t2_red_applied: String,
     pub(crate) s_red_applied: String,
 }
 
 impl Default for SentAngleJumpThresholds {
     fn default() -> Self {
         Self {
-            t_red_input: "0.2".to_string(),
+            t1_red_input: "0.2".to_string(),
+            t2_red_input: "0.2".to_string(),
             s_red_input: "1.0".to_string(),
-            t_red_applied: "0.2".to_string(),
+            t1_red_applied: "0.2".to_string(),
+            t2_red_applied: "0.2".to_string(),
             s_red_applied: "1.0".to_string(),
         }
     }

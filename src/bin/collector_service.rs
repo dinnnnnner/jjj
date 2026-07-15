@@ -98,7 +98,9 @@ enum ControlCmd {
         torque_warn: f64,
         torque_red: f64,
         torque_purple: f64,
-        angle_t_red: f64,
+        angle_t1_red: Option<f64>,
+        angle_t2_red: Option<f64>,
+        angle_t_red: Option<f64>,
         angle_s_red: f64,
     },
 }
@@ -459,25 +461,35 @@ async fn handle_control_client(
             torque_warn,
             torque_red,
             torque_purple,
+            angle_t1_red,
+            angle_t2_red,
             angle_t_red,
             angle_s_red,
         } => {
+            let angle_t1_red = angle_t1_red
+                .or(angle_t_red)
+                .ok_or_else(|| anyhow::anyhow!("missing angle_t1_red threshold"))?;
+            let angle_t2_red = angle_t2_red
+                .or(angle_t_red)
+                .ok_or_else(|| anyhow::anyhow!("missing angle_t2_red threshold"))?;
             alarm_service
                 .set_sent_jump_config(SentJumpAlarmConfig {
                     torque_warn,
                     torque_red,
                     torque_purple,
-                    angle_t_red,
+                    angle_t1_red,
+                    angle_t2_red,
                     angle_s_red,
                 })
                 .map_err(anyhow::Error::msg)?;
             let config = alarm_service.sent_jump_config();
             bus.publish(AppEvent::System(format!(
-                "SENT jump thresholds updated: torque warn={:.3}, red={:.3}, purple={:.3}; angle T={:.3}, S={:.3}",
+                "SENT jump thresholds updated: torque warn={:.3}, red={:.3}, purple={:.3}; angle T1={:.3}, T2={:.3}, S={:.3}",
                 config.torque_warn,
                 config.torque_red,
                 config.torque_purple,
-                config.angle_t_red,
+                config.angle_t1_red,
+                config.angle_t2_red,
                 config.angle_s_red
             )));
         }
