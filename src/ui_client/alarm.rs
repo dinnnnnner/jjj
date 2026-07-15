@@ -151,6 +151,7 @@ impl UiClientApp {
             red_value,
             purple_value,
             self.sent_angle_jump_threshold(0),
+            self.sent_angle_jump_threshold(2),
             self.sent_angle_jump_threshold(4),
         )?;
         self.sent_jump_thresholds.warn_applied = format!("{warn_value:.3}");
@@ -160,28 +161,36 @@ impl UiClientApp {
     }
 
     pub(crate) fn sent_angle_jump_threshold(&self, sensor_id: usize) -> f64 {
-        let applied = if sensor_id == 4 {
-            &self.sent_angle_jump_thresholds.s_red_applied
-        } else {
-            &self.sent_angle_jump_thresholds.t_red_applied
+        let applied = match sensor_id {
+            0 => &self.sent_angle_jump_thresholds.t1_red_applied,
+            2 => &self.sent_angle_jump_thresholds.t2_red_applied,
+            4 => &self.sent_angle_jump_thresholds.s_red_applied,
+            _ => &self.sent_angle_jump_thresholds.t1_red_applied,
         };
-        Self::parse_optional_threshold(applied).unwrap_or(1.0).abs()
+        let default = if sensor_id == 4 { 1.0 } else { 0.2 };
+        Self::parse_optional_threshold(applied)
+            .unwrap_or(default)
+            .abs()
     }
 
     pub(crate) fn apply_sent_angle_jump_threshold(&mut self) -> Result<(), String> {
-        let t_red = Self::validate_threshold_text(&self.sent_angle_jump_thresholds.t_red_input)?;
+        let t1_red = Self::validate_threshold_text(&self.sent_angle_jump_thresholds.t1_red_input)?;
+        let t2_red = Self::validate_threshold_text(&self.sent_angle_jump_thresholds.t2_red_input)?;
         let s_red = Self::validate_threshold_text(&self.sent_angle_jump_thresholds.s_red_input)?;
-        let t_red_value = Self::parse_optional_threshold(&t_red).unwrap_or(1.0).abs();
+        let t1_red_value = Self::parse_optional_threshold(&t1_red).unwrap_or(0.2).abs();
+        let t2_red_value = Self::parse_optional_threshold(&t2_red).unwrap_or(0.2).abs();
         let s_red_value = Self::parse_optional_threshold(&s_red).unwrap_or(1.0).abs();
         let (torque_warn, torque_red, torque_purple) = self.sent_jump_thresholds();
         self.push_sent_jump_thresholds_to_collector(
             torque_warn,
             torque_red,
             torque_purple,
-            t_red_value,
+            t1_red_value,
+            t2_red_value,
             s_red_value,
         )?;
-        self.sent_angle_jump_thresholds.t_red_applied = format!("{t_red_value:.3}");
+        self.sent_angle_jump_thresholds.t1_red_applied = format!("{t1_red_value:.3}");
+        self.sent_angle_jump_thresholds.t2_red_applied = format!("{t2_red_value:.3}");
         self.sent_angle_jump_thresholds.s_red_applied = format!("{s_red_value:.3}");
         Ok(())
     }
@@ -191,7 +200,8 @@ impl UiClientApp {
         torque_warn: f64,
         torque_red: f64,
         torque_purple: f64,
-        angle_t_red: f64,
+        angle_t1_red: f64,
+        angle_t2_red: f64,
         angle_s_red: f64,
     ) -> Result<(), String> {
         let payload = serde_json::json!({
@@ -199,7 +209,8 @@ impl UiClientApp {
             "torque_warn": torque_warn,
             "torque_red": torque_red,
             "torque_purple": torque_purple,
-            "angle_t_red": angle_t_red,
+            "angle_t1_red": angle_t1_red,
+            "angle_t2_red": angle_t2_red,
             "angle_s_red": angle_s_red,
         });
         let mut stream = TcpStream::connect(&self.control_addr)

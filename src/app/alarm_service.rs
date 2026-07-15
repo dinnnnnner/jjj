@@ -12,7 +12,8 @@ use std::time::SystemTime;
 const DEFAULT_SENT_TORQUE_WARN: f64 = 0.2;
 const DEFAULT_SENT_TORQUE_RED: f64 = 0.3;
 const DEFAULT_SENT_TORQUE_PURPLE: f64 = 0.4;
-const DEFAULT_SENT_T_ANGLE_RED: f64 = 0.2;
+const DEFAULT_SENT_T1_ANGLE_RED: f64 = 0.2;
+const DEFAULT_SENT_T2_ANGLE_RED: f64 = 0.2;
 const DEFAULT_SENT_S_ANGLE_RED: f64 = 1.0;
 
 #[derive(Clone, Copy, Debug)]
@@ -20,7 +21,8 @@ pub struct SentJumpAlarmConfig {
     pub torque_warn: f64,
     pub torque_red: f64,
     pub torque_purple: f64,
-    pub angle_t_red: f64,
+    pub angle_t1_red: f64,
+    pub angle_t2_red: f64,
     pub angle_s_red: f64,
 }
 
@@ -30,7 +32,8 @@ impl Default for SentJumpAlarmConfig {
             torque_warn: DEFAULT_SENT_TORQUE_WARN,
             torque_red: DEFAULT_SENT_TORQUE_RED,
             torque_purple: DEFAULT_SENT_TORQUE_PURPLE,
-            angle_t_red: DEFAULT_SENT_T_ANGLE_RED,
+            angle_t1_red: DEFAULT_SENT_T1_ANGLE_RED,
+            angle_t2_red: DEFAULT_SENT_T2_ANGLE_RED,
             angle_s_red: DEFAULT_SENT_S_ANGLE_RED,
         }
     }
@@ -41,7 +44,8 @@ impl SentJumpAlarmConfig {
         if !self.torque_warn.is_finite()
             || !self.torque_red.is_finite()
             || !self.torque_purple.is_finite()
-            || !self.angle_t_red.is_finite()
+            || !self.angle_t1_red.is_finite()
+            || !self.angle_t2_red.is_finite()
             || !self.angle_s_red.is_finite()
         {
             return Err("SENT jump thresholds must be finite numbers");
@@ -56,7 +60,8 @@ impl SentJumpAlarmConfig {
             torque_warn: thresholds.warn,
             torque_red: thresholds.red,
             torque_purple: thresholds.purple,
-            angle_t_red: self.angle_t_red.abs(),
+            angle_t1_red: self.angle_t1_red.abs(),
+            angle_t2_red: self.angle_t2_red.abs(),
             angle_s_red: self.angle_s_red.abs(),
         })
     }
@@ -273,10 +278,11 @@ impl AlarmService {
 }
 
 fn sent_angle_red_threshold(config: SentJumpAlarmConfig, sensor_id: usize) -> f64 {
-    if sensor_id == 4 {
-        config.angle_s_red
-    } else {
-        config.angle_t_red
+    match sensor_id {
+        0 => config.angle_t1_red,
+        2 => config.angle_t2_red,
+        4 => config.angle_s_red,
+        _ => config.angle_t1_red,
     }
 }
 
@@ -450,7 +456,8 @@ mod tests {
                 torque_warn: -0.4,
                 torque_red: 0.2,
                 torque_purple: 0.3,
-                angle_t_red: -0.5,
+                angle_t1_red: -0.5,
+                angle_t2_red: -0.7,
                 angle_s_red: 2.0,
             })
             .unwrap();
@@ -458,7 +465,8 @@ mod tests {
         assert_eq!(config.torque_warn, 0.4);
         assert_eq!(config.torque_red, 0.4);
         assert_eq!(config.torque_purple, 0.4);
-        assert_eq!(config.angle_t_red, 0.5);
+        assert_eq!(config.angle_t1_red, 0.5);
+        assert_eq!(config.angle_t2_red, 0.7);
         assert_eq!(config.angle_s_red, 2.0);
 
         assert!(
@@ -467,7 +475,8 @@ mod tests {
                     torque_warn: f64::NAN,
                     torque_red: 0.3,
                     torque_purple: 0.4,
-                    angle_t_red: 0.2,
+                    angle_t1_red: 0.2,
+                    angle_t2_red: 0.2,
                     angle_s_red: 1.0,
                 })
                 .is_err()
@@ -510,5 +519,33 @@ mod tests {
         assert!(matches!(raised.level, AlarmLevel::Critical));
         assert!(!raised.cleared);
         assert!(raised.message.contains("red=1.000"));
+    }
+
+    #[test]
+    fn sent_angle_jump_uses_separate_t1_and_t2_thresholds() {
+        let bus = EventBus::new(16);
+        let mut rx = bus.subscribe();
+        let service = AlarmService::new(bus);
+        service
+            .set_sent_jump_config(SentJumpAlarmConfig {
+                angle_t1_red: 0.3,
+                angle_t2_red: 0.8,
+                ..SentJumpAlarmConfig::default()
+            })
+            .unwrap();
+
+        for _ in 0..10 {
+            service.evaluate_sample("dev1", 0, 0.0, TelemetrySourceKind::CanSent);
+            service.evaluate_sample("dev1", 2, 0.0, TelemetrySourceKind::CanSent);
+        }
+        assert!(rx.try_recv().is_err());
+
+        service.evaluate_sample("dev1", 0, 0.5, TelemetrySourceKind::CanSent);
+        let raised = next_alarm(&mut rx);
+        assert_eq!(raised.alarm_id, "sent_angle_jump_t1");
+        assert!(raised.message.contains("red=0.300"));
+
+        service.evaluate_sample("dev1", 2, 0.5, TelemetrySourceKind::CanSent);
+        assert!(rx.try_recv().is_err());
     }
 }

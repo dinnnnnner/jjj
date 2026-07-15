@@ -473,15 +473,24 @@ impl UiClientApp {
             .resizable(false)
             .collapsible(false)
             .default_pos(egui::pos2(940.0, 352.0))
-            .fixed_size(egui::vec2(320.0, 148.0))
+            .fixed_size(egui::vec2(320.0, 176.0))
             .show(ctx, |ui| {
                 ui.heading("SENT angle jump threshold");
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    ui.label("T1/T2 red >=");
+                    ui.label("T1 red >=");
                     ui.add(
                         egui::TextEdit::singleline(
-                            &mut self.sent_angle_jump_thresholds.t_red_input,
+                            &mut self.sent_angle_jump_thresholds.t1_red_input,
+                        )
+                        .desired_width(96.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("T2 red >=");
+                    ui.add(
+                        egui::TextEdit::singleline(
+                            &mut self.sent_angle_jump_thresholds.t2_red_input,
                         )
                         .desired_width(96.0),
                     );
@@ -503,10 +512,11 @@ impl UiClientApp {
                         Err(err) => format!("SENT angle jump threshold error: {err}"),
                     };
                 }
-                let t_red = self.sent_angle_jump_threshold(0);
+                let t1_red = self.sent_angle_jump_threshold(0);
+                let t2_red = self.sent_angle_jump_threshold(2);
                 let s_red = self.sent_angle_jump_threshold(4);
                 ui.small(format!(
-                    "current: T1/T2 red >= {t_red:.3}, S red >= {s_red:.3}"
+                    "current: T1 >= {t1_red:.3}, T2 >= {t2_red:.3}, S >= {s_red:.3}"
                 ));
             });
     }
