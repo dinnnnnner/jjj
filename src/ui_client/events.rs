@@ -86,12 +86,15 @@ impl UiClientApp {
                         self.can_replay.status = if data.is_empty() {
                             self.can_replay.mode.empty_status().to_string()
                         } else {
-                            let point_count = data.x_points.len()
-                                + data.y_points.len()
-                                + data.z_points.len()
-                                + data.u_points.len()
-                                + data.v_points.len();
-                            format!("loaded {point_count} replay points")
+                            let displayed = data.displayed_point_count();
+                            if displayed < data.raw_point_count {
+                                format!(
+                                    "已加载 {} 个回放点，图表降采样显示 {} 个点",
+                                    data.raw_point_count, displayed
+                                )
+                            } else {
+                                format!("已加载 {} 个回放点", data.raw_point_count)
+                            }
                         };
                         self.can_replay.data = Some(data);
                     }

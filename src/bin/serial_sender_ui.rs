@@ -7,6 +7,7 @@ use eframe::egui;
 use serialport::FlowControl;
 use std::collections::VecDeque;
 use std::fs;
+use std::io::{BufRead, BufReader, Lines};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +25,8 @@ const DEFAULT_DURATION_SECS: &str = "60";
 const DEFAULT_KIND: u8 = 0x34;
 const DEFAULT_MAX_PAYLOAD: usize = 4096;
 const MAX_LOG_LINES: usize = 300;
+const MAX_WORKER_MESSAGES_PER_FRAME: usize = 512;
+const WORKER_MESSAGE_TIME_BUDGET: Duration = Duration::from_millis(4);
 const DEMO_GROUP_RATE_HZ: f64 = 6250.0;
 const DEFAULT_CAN_TX_ID: u32 = 0x123;
 const DEFAULT_CAN_TX_DLC: u8 = 8;
@@ -116,11 +119,51 @@ enum WorkerMsg {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct CanExportRow {
     ts_ms: i64,
     identifier: u32,
     value: i32,
+}
+
+struct CanExportRows {
+    lines: std::iter::Enumerate<Lines<BufReader<fs::File>>>,
+}
+
+impl CanExportRows {
+    fn open(path: &str) -> anyhow::Result<Self> {
+        let file =
+            fs::File::open(path).with_context(|| format!("open CAN export failed: {path}"))?;
+        Ok(Self {
+            lines: BufReader::new(file).lines().enumerate(),
+        })
+    }
+}
+
+impl Iterator for CanExportRows {
+    type Item = anyhow::Result<CanExportRow>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let (line_index, line_result) = self.lines.next()?;
+            let line_no = line_index + 1;
+            let line = match line_result {
+                Ok(line) => line,
+                Err(err) => {
+                    return Some(
+                        Err(err)
+                            .with_context(|| format!("read CAN export failed at line {line_no}")),
+                    );
+                }
+            };
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with("ts_ms\t") {
+                continue;
+            }
+
+            return Some(parse_can_export_row(line, line_no));
+        }
+    }
 }
 
 fn setup_chinese_fonts(ctx: &egui::Context) {
@@ -453,45 +496,41 @@ fn run_legacy_sender(
     Ok(())
 }
 
-fn parse_can_export_file(path: &str) -> anyhow::Result<Vec<CanExportRow>> {
-    let text =
-        fs::read_to_string(path).with_context(|| format!("read CAN export failed: {path}"))?;
-    let mut rows = Vec::new();
+fn parse_can_export_row(line: &str, line_no: usize) -> anyhow::Result<CanExportRow> {
+    let mut cols = line.split('\t');
+    let ts_ms = cols
+        .next()
+        .context("missing ts_ms")?
+        .parse::<i64>()
+        .with_context(|| format!("invalid ts_ms at line {line_no}"))?;
+    let _device_id = cols
+        .next()
+        .with_context(|| format!("missing device_id at line {line_no}"))?;
+    let identifier = match cols
+        .next()
+        .with_context(|| format!("missing axis at line {line_no}"))?
+        .trim()
+    {
+        "x" => CAN_AXIS_X_ID,
+        "y" => CAN_AXIS_Y_ID,
+        "z" => CAN_AXIS_Z_ID,
+        axis => bail!("invalid axis '{axis}' at line {line_no}"),
+    };
+    let value = cols
+        .next()
+        .with_context(|| format!("missing value at line {line_no}"))?
+        .parse::<f64>()
+        .with_context(|| format!("invalid value at line {line_no}"))?
+        .round() as i32;
+    let _request_id = cols
+        .next()
+        .with_context(|| format!("missing request_id at line {line_no}"))?;
 
-    for (line_no, raw_line) in text.lines().enumerate() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with("ts_ms\t") {
-            continue;
-        }
-
-        let cols = line.split('\t').collect::<Vec<_>>();
-        if cols.len() < 5 {
-            bail!("invalid CAN export row at line {}: {}", line_no + 1, line);
-        }
-
-        let ts_ms = cols[0]
-            .parse::<i64>()
-            .with_context(|| format!("invalid ts_ms at line {}", line_no + 1))?;
-        let identifier = match cols[2].trim() {
-            "x" => CAN_AXIS_X_ID,
-            "y" => CAN_AXIS_Y_ID,
-            "z" => CAN_AXIS_Z_ID,
-            axis => bail!("invalid axis '{axis}' at line {}", line_no + 1),
-        };
-        let value = cols[3]
-            .parse::<f64>()
-            .with_context(|| format!("invalid value at line {}", line_no + 1))?
-            .round() as i32;
-
-        rows.push(CanExportRow {
-            ts_ms,
-            identifier,
-            value,
-        });
-    }
-
-    rows.sort_by_key(|row| row.ts_ms);
-    Ok(rows)
+    Ok(CanExportRow {
+        ts_ms,
+        identifier,
+        value,
+    })
 }
 
 async fn run_demo_sender(
@@ -985,10 +1024,13 @@ impl SerialSenderUiApp {
 
         thread::spawn(move || {
             let result = (|| -> anyhow::Result<()> {
-                let rows = parse_can_export_file(&export_path)?;
-                if rows.is_empty() {
-                    bail!("CAN export file contains no replay rows");
-                }
+                let mut rows = CanExportRows::open(&export_path)?;
+                let first_row = rows
+                    .next()
+                    .transpose()?
+                    .context("CAN export file contains no replay rows")?;
+                let first_ts_ms = first_row.ts_ms;
+                let rows = std::iter::once(Ok(first_row)).chain(rows);
 
                 let rt = Builder::new_current_thread().enable_all().build()?;
                 rt.block_on(async move {
@@ -999,14 +1041,14 @@ impl SerialSenderUiApp {
                         .context("connect CAN transport failed")?;
 
                     let _ = tx_for_worker.send(WorkerMsg::Log(format!(
-                        "CAN export replay start: path={}, rows={}",
-                        export_path,
-                        rows.len()
+                        "CAN export replay start (streaming): path={}",
+                        export_path
                     )));
 
                     let mut sent_frames = 0_u64;
-                    let mut last_ts_ms = rows[0].ts_ms;
-                    for (idx, row) in rows.into_iter().enumerate() {
+                    let mut last_ts_ms = first_ts_ms;
+                    for (idx, row) in rows.enumerate() {
+                        let row = row?;
                         if stop_flag2.load(Ordering::Relaxed) {
                             let _ = tx_for_worker.send(WorkerMsg::Finished {
                                 ok: true,
@@ -1041,15 +1083,23 @@ impl SerialSenderUiApp {
                                 "CAN export sent row={} axis={} ts_ms={} value={} id=0x{:X}",
                                 sent_frames, axis, row.ts_ms, row.value, row.identifier
                             )));
+                            // Progress is informational; publishing it for every
+                            // replay row can overwhelm egui when many rows share
+                            // a timestamp. Coalesce it with the periodic log.
+                            let _ = tx_for_worker.send(WorkerMsg::Stats {
+                                sent_frames,
+                                ack_frames: 0,
+                                last_req: sent_frames,
+                            });
                         }
-                        let _ = tx_for_worker.send(WorkerMsg::Stats {
-                            sent_frames,
-                            ack_frames: 0,
-                            last_req: sent_frames,
-                        });
                     }
 
                     transport.close().await.ok();
+                    let _ = tx_for_worker.send(WorkerMsg::Stats {
+                        sent_frames,
+                        ack_frames: 0,
+                        last_req: sent_frames,
+                    });
                     let _ = tx_for_worker.send(WorkerMsg::Finished {
                         ok: true,
                         message: format!("CAN export replay done, sent_frames={sent_frames}"),
@@ -1075,9 +1125,13 @@ impl SerialSenderUiApp {
         }
     }
 
-    fn drain_worker_messages(&mut self) {
+    fn drain_worker_messages(&mut self) -> bool {
         let mut clear_worker = false;
-        loop {
+        let started_at = Instant::now();
+        let mut processed = 0;
+        while processed < MAX_WORKER_MESSAGES_PER_FRAME
+            && started_at.elapsed() < WORKER_MESSAGE_TIME_BUDGET
+        {
             let msg = match self.worker_rx.as_ref() {
                 Some(rx) => match rx.try_recv() {
                     Ok(msg) => msg,
@@ -1111,18 +1165,24 @@ impl SerialSenderUiApp {
                     clear_worker = true;
                 }
             }
+            processed += 1;
         }
 
         if clear_worker {
             self.worker_rx = None;
             self.stop_flag = None;
         }
+        !clear_worker
+            && (processed == MAX_WORKER_MESSAGES_PER_FRAME
+                || started_at.elapsed() >= WORKER_MESSAGE_TIME_BUDGET)
     }
 }
 
 impl eframe::App for SerialSenderUiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.drain_worker_messages();
+        if self.drain_worker_messages() {
+            ctx.request_repaint();
+        }
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.heading("Serial Sender UI");
