@@ -9,7 +9,7 @@
 当前主要运行形态有两种：
 
 1. 推荐联调形态：`collector_service` 作为采集服务运行，`ui_client` 作为 UI 客户端连接采集服务。
-2. 单进程演示形态：设置 `DEMO2_UI_EMBED_COLLECTOR=1` 后，`ui_client` 会通过 `#[path = "collector_service.rs"]` 嵌入并启动一份 collector runtime，再连接 `127.0.0.1:19011` 的 UI feed。
+2. 单进程演示形态：在 `config.toml` 中设置 `[ui].embed_collector = true` 后，`ui_client` 会通过 `#[path = "collector_service.rs"]` 嵌入并启动一份 collector runtime，再连接 `127.0.0.1:19011` 的 UI feed；环境变量 `DEMO2_UI_EMBED_COLLECTOR` 可覆盖该配置。
 
 项目支持的接入方式：
 
@@ -106,7 +106,7 @@ UI 客户端的支撑模块目录。当前 `src/bin/ui_client.rs` 已收缩为�
 - `models.rs`：定义 UI 视图、告警、CAN 回放和报警记录相关状态结构。
 - `records.rs`：查询和绘制报警记录窗口。
 - `replay.rs`：加载、绘制和导出 CAN/SENT 历史回放数据。
-- `runtime.rs`：封装 `ui_client` 的启动流程：启动 UI feed 线程和 eframe 窗口，并在 `DEMO2_UI_EMBED_COLLECTOR=1` 时启动内嵌 collector runtime。
+- `runtime.rs`：封装 `ui_client` 的启动流程：启动 UI feed 线程和 eframe 窗口，并根据 `[ui].embed_collector` 或环境变量启动内嵌 collector runtime。
 - `series.rs`：维护实时曲线的 `SensorSeries`，包含最近时间窗裁剪和最大点数限制。
 - `settings.rs`：集中 UI 客户端常量。
 - `state.rs`：承载 `UiClientApp` 的主 UI 状态；`UiClientApp` 自身保留通道、feed 统计、连接地址和本地告警 DB writer 等外壳资源。
@@ -455,7 +455,7 @@ Health:      127.0.0.1:19012
 
 职责：
 
-- 连接外部 collector；在 `DEMO2_UI_EMBED_COLLECTOR=1` 时启动内嵌 collector runtime。
+- 连接外部 collector；在 `[ui].embed_collector = true` 时启动内嵌 collector runtime，环境变量可覆盖该配置。
 - 连接 UI feed 地址。
 - 接收带长度前缀的版本化 bincode 二进制帧。
 - 展示实时曲线。
@@ -484,7 +484,7 @@ Health:      127.0.0.1:19012
 - `src/ui_client/time.rs`：时间解析和格式化。
 - `src/ui_client/view.rs`：主 UI 绘制和 eframe update。
 
-注意：`ui_client` 默认只连接配置中的 `ui_feed_addr`。如需单进程演示，设置 `DEMO2_UI_EMBED_COLLECTOR=1`。
+注意：`ui_client` 默认只连接配置中的 `ui_feed_addr`。如需单进程演示，在 `config.toml` 中设置 `[ui].embed_collector = true`，也可使用 `DEMO2_UI_EMBED_COLLECTOR=1` 临时覆盖。
 
 UI feed 地址来源优先级：
 
@@ -1208,7 +1208,7 @@ netstat -ano | findstr 19012
 
 处理：
 
-- 确认 `collector_service` 已启动，或在单进程演示时设置 `DEMO2_UI_EMBED_COLLECTOR=1`。
+- 确认 `collector_service` 已启动，或在单进程演示时设置 `[ui].embed_collector = true`（也可设置 `DEMO2_UI_EMBED_COLLECTOR=1`）。
 - 或者调整 `config.toml` 中端口。
 
 ### 16.2 UI 没有数据
@@ -1321,7 +1321,7 @@ cargo check
 
 ### 18.4 拆分 UI 内嵌 collector
 
-当前 `ui_client` 已默认只连接外部 collector，并通过 `DEMO2_UI_EMBED_COLLECTOR=1` 支持单进程演示。后续仍可进一步拆成两个更明确的入口：
+当前 `ui_client` 默认只连接外部 collector，并通过 `[ui].embed_collector = true` 或 `DEMO2_UI_EMBED_COLLECTOR=1` 支持单进程演示。后续仍可进一步拆成两个更明确的入口：
 
 - `ui_client`：只作为外部 collector 的客户端。
 - `ui_client_embedded`：单进程演示版。

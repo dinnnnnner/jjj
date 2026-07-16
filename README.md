@@ -187,14 +187,14 @@ CAN SENT 原始值在 `src/ingress/can.rs` 的 `decode_sent_values` 中解析为
 - `DEMO2_COLLECTOR_CAN_BAUD_KBPS` / `DEMO2_COLLECTOR_CAN_DATA_BAUD_KBPS`：覆盖 CAN 仲裁/数据波特率。
 - `DEMO2_SENT_FILTER_ENABLED` / `DEMO2_SENT_FILTER_WINDOW`：覆盖 SENT 滤波配置。
 - `DEMO2_UI_FEED_ADDR`：覆盖 UI 客户端连接的 feed 地址。
-- `DEMO2_UI_EMBED_COLLECTOR=1`：让 `ui_client` 启动内嵌 collector，默认关闭。
+- `DEMO2_UI_EMBED_COLLECTOR=1`：让 `ui_client` 启动内嵌 collector；优先级高于 `config.toml` 中的 `[ui].embed_collector`。
 - `DEMO2_COLLECTOR_CONTROL_ADDR`：覆盖 UI 客户端连接的控制接口地址。
 - `DEMO2_PG_DSN`：覆盖 UI 查询历史数据使用的数据库连接串。
 
 ## 二进制入口
 
 - `collector_service`：核心采集服务，负责 TCP / 串口 / CAN 接入、事件转发、告警、持久化和健康检查。
-- `ui_client`：egui UI 客户端，连接采集服务的版本化二进制 feed；默认只连接外部 collector，如需单进程演示可设置 `DEMO2_UI_EMBED_COLLECTOR=1`。
+- `ui_client`：egui UI 客户端，连接采集服务的版本化二进制 feed；如需单进程运行，可在 `config.toml` 的 `[ui]` 段设置 `embed_collector = true`，或设置 `DEMO2_UI_EMBED_COLLECTOR=1`。
 - `serial_frame_sender`：串口测试发送端，支持 legacy 与 SENT 格式。
 - `serial_sender_ui`：串口发送 UI。
 - `sender_stress_report`：内置 TCP 压测发送端，逐档提升发送频率并输出 ACK / 丢包统计。
