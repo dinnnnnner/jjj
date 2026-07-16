@@ -824,6 +824,8 @@ impl UiClientApp {
         let desired_size = egui::vec2(ui.available_width(), height.max(40.0));
         let (rect, _) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
         let painter = ui.painter_at(rect);
+        let max_chart_points = (rect.width() * CHART_POINTS_PER_PIXEL).max(4.0).round() as usize;
+        let chart_points = super::series::downsample_for_chart(points, max_chart_points);
 
         painter.rect_stroke(
             rect,
@@ -907,9 +909,9 @@ impl UiClientApp {
             _ => min_y,
         };
 
-        let mut segment: Vec<egui::Pos2> = Vec::with_capacity(points.len());
+        let mut segment: Vec<egui::Pos2> = Vec::with_capacity(chart_points.len());
         let mut prev_t: Option<f64> = None;
-        for p in points {
+        for p in &chart_points {
             if let Some(pt) = prev_t {
                 if p[0] - pt > LINE_BREAK_GAP_SECS {
                     if segment.len() >= 2 {
@@ -992,7 +994,7 @@ impl UiClientApp {
 
 impl eframe::App for UiClientApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.drain_messages();
+        let feed_backlog = self.drain_messages();
         self.apply_ctrl_wheel_zoom(ctx);
 
         egui::TopBottomPanel::top("self_test_result_top")
@@ -1148,6 +1150,10 @@ impl eframe::App for UiClientApp {
             self.dynamic_windows.remove(idx);
         }
 
-        ctx.request_repaint_after(Duration::from_millis(16));
+        if feed_backlog {
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
     }
 }
