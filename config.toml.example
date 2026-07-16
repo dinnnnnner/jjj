@@ -1,4 +1,7 @@
-﻿[collector]
+﻿[ui]
+embed_collector = true
+
+[collector]
 ingress_addr = "127.0.0.1:19010"
 ui_feed_addr = "127.0.0.1:19011"
 control_addr = "127.0.0.1:19013"

@@ -11,9 +11,27 @@ struct CollectorConfig {
     pg_dsn: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct UiConfig {
+    embed_collector: Option<bool>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ConfigFile {
     collector: Option<CollectorConfig>,
+    ui: Option<UiConfig>,
+}
+
+pub fn load_embed_collector() -> bool {
+    let Ok(text) = fs::read_to_string("config.toml") else {
+        return false;
+    };
+
+    toml::from_str::<ConfigFile>(&text)
+        .ok()
+        .and_then(|file| file.ui)
+        .and_then(|cfg| cfg.embed_collector)
+        .unwrap_or(false)
 }
 
 pub fn load_feed_addr() -> String {
@@ -76,5 +94,32 @@ pub fn load_pg_dsn() -> String {
             .filter(|dsn| !dsn.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_PG_DSN.to_string()),
         Err(_) => DEFAULT_PG_DSN.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConfigFile;
+
+    fn embed_collector_from(text: &str) -> bool {
+        toml::from_str::<ConfigFile>(text)
+            .ok()
+            .and_then(|file| file.ui)
+            .and_then(|cfg| cfg.embed_collector)
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn reads_embed_collector_from_ui_section() {
+        assert!(embed_collector_from("[ui]\nembed_collector = true\n"));
+        assert!(!embed_collector_from("[ui]\nembed_collector = false\n"));
+    }
+
+    #[test]
+    fn embed_collector_defaults_to_false() {
+        assert!(!embed_collector_from(
+            "[collector]\nui_feed_addr = '127.0.0.1:19011'\n"
+        ));
+        assert!(!embed_collector_from("not valid toml"));
     }
 }

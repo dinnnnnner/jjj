@@ -11,7 +11,7 @@
 - `collector_service`：采集服务，负责 TCP / 串口 / CAN 接入、UI feed、control、health 和数据库写入。
 - `ui_client`：桌面 UI，连接 UI feed，并可通过 control 接口更新 SENT 跳变告警阈值。
 
-注意：当前 `ui_client` 默认只连接外部 collector。设置 `DEMO2_UI_EMBED_COLLECTOR=1` 后会额外启动一份内嵌 collector，适合单进程演示。
+注意：当前 `ui_client` 默认只连接外部 collector。在 `config.toml` 中设置 `[ui].embed_collector = true` 后会额外启动一份内嵌 collector，适合单进程运行；环境变量 `DEMO2_UI_EMBED_COLLECTOR` 可覆盖该配置。
 
 ## 2. 进程与端口
 
