@@ -655,7 +655,7 @@ serial_mode = "sent"
 
 can_enabled = false
 can_hardware_name = "TC1016"
-can_hardware_subtype = 14
+can_hardware_subtype = 11
 can_channel = 0
 can_baud_kbps = 500
 can_data_baud_kbps = 2000
@@ -846,7 +846,7 @@ cargo run --bin serial_frame_sender -- --port COM4 --baud 2000000 --format sent1
 [collector]
 can_enabled = true
 can_hardware_name = "TC1016"
-can_hardware_subtype = 14
+can_hardware_subtype = 11
 can_channel = 0
 can_baud_kbps = 500
 can_data_baud_kbps = 2000
@@ -1251,7 +1251,7 @@ cargo run --bin check_db_partition
 
 1. TSMaster 是否安装。
 2. `TSMaster.dll` 是否在 `D:\TSMaster\bin64` 或配置的路径下。
-3. TC1016 的硬件名是否为 `TC1016`、硬件 subtype 是否为 `14`。
+3. TC1016 的硬件名是否为 `TC1016`、硬件 subtype 是否为 `11`。
 4. 通道号是否正确。
 5. 是否需要关闭自动启动：
 

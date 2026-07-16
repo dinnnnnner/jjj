@@ -45,7 +45,9 @@ pub fn parse_sensor_value(payload: &[u8]) -> Option<(usize, f64)> {
 }
 
 pub fn publish_status(bus: &EventBus, msg: impl Into<String>) {
-    bus.publish(AppEvent::System(msg.into()));
+    let msg = msg.into();
+    tracing::info!(status = %msg);
+    bus.publish(AppEvent::System(msg));
 }
 
 pub fn publish_telemetry_sample(

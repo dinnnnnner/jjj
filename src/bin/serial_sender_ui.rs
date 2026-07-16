@@ -2,7 +2,7 @@ use anyhow::{Context, bail};
 use bytes::BytesMut;
 use demo2::protocol::demo_serial::{CMD_STREAM, GROUP_COUNT, GROUP_SIZE, HEADER, STREAM_BODY_LEN};
 use demo2::protocol::{Frame, FrameCodec, SentFrameCodec, SimpleFrameCodec};
-use demo2::transport::can::{CanTransport, CanTransportConfig, CanTxFrame};
+use demo2::transport::can::{CanTransport, CanTransportConfig, CanTxFrame, HW_SUBTYPE_TC1016};
 use eframe::egui;
 use serialport::FlowControl;
 use std::collections::VecDeque;
@@ -831,7 +831,10 @@ impl SerialSenderUiApp {
             "can_hardware_name".to_string(),
             toml::Value::String("TC1016".to_string()),
         );
-        collector_table.insert("can_hardware_subtype".to_string(), toml::Value::Integer(14));
+        collector_table.insert(
+            "can_hardware_subtype".to_string(),
+            toml::Value::Integer(i64::from(HW_SUBTYPE_TC1016)),
+        );
         collector_table.insert("can_channel".to_string(), toml::Value::Integer(0));
         collector_table.insert("can_baud_kbps".to_string(), toml::Value::Integer(500));
         collector_table.insert("can_data_baud_kbps".to_string(), toml::Value::Integer(2000));

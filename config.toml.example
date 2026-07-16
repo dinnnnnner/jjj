@@ -5,11 +5,13 @@ control_addr = "127.0.0.1:19013"
 health_addr = "127.0.0.1:19012"
 can_enabled = false
 can_hardware_name = "TC1016"
-can_hardware_subtype = 14
+can_hardware_subtype = 11
 can_channel = 0
 can_baud_kbps = 500
 can_data_baud_kbps = 2000
 can_channels = [0, 1, 2, 3]
+serial_baud = 2000000
+serial_mode = "sent"
 pg_dsn = "host=127.0.0.1 port=5432 user=postgres password=123456 dbname=demo2"
 pg_connect_max_retries = 20
 pg_connect_retry_ms = 1000

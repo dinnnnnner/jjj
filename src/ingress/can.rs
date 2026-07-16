@@ -559,6 +559,8 @@ mod tests {
 
     #[test]
     fn explicit_tc1016_probes_its_four_physical_channels() {
+        assert_eq!(HW_SUBTYPE_TC1016, 11);
+
         let config = CanTransportConfig::default();
         let candidates = candidate_can_configs(&config);
 

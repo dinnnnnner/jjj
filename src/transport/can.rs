@@ -14,7 +14,7 @@ use windows_sys::Win32::System::LibraryLoader::SetDllDirectoryW;
 const APP_NAME: &str = "demo2_can_ingress";
 const HW_TYPE_TS_USB_DEVICE: i32 = 3;
 pub const HW_SUBTYPE_TC1012: i32 = 12;
-pub const HW_SUBTYPE_TC1016: i32 = 14;
+pub const HW_SUBTYPE_TC1016: i32 = 11;
 const APP_CAN: i32 = 0;
 const CANFD_TYPE_ISO: i32 = 1;
 const CANFD_MODE_NORMAL: i32 = 0;

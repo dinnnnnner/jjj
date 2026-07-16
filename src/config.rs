@@ -53,6 +53,7 @@ pub struct CollectorCanChannelDetail {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct CollectorConfig {
     pub ingress_addr: String,
     pub ui_feed_addr: String,
@@ -140,7 +141,8 @@ pub fn load_collector_config() -> CollectorConfig {
         return CollectorConfig::default();
     };
 
-    match toml::from_str::<ConfigFile>(&text) {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    match toml::from_str::<ConfigFile>(text) {
         Ok(file) => file.collector.unwrap_or_default(),
         Err(err) => {
             warn!(error = %err, "failed to parse config.toml, fallback to defaults");
@@ -248,5 +250,17 @@ mod tests {
         assert_eq!(parse_can_channel_list("0, 2, ,3"), Some(vec![0, 2, 3]));
         assert_eq!(parse_can_channel_list(" , "), None);
         assert_eq!(parse_can_channel_list("0,x"), None);
+    }
+
+    #[test]
+    fn collector_config_accepts_bom_and_missing_fields() {
+        let text = "\u{feff}[collector]\ncan_enabled = true\n";
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+        let file: ConfigFile = toml::from_str(text).unwrap();
+        let config = file.collector.unwrap();
+
+        assert!(config.can_enabled);
+        assert_eq!(config.can_hardware_subtype, Some(HW_SUBTYPE_TC1016));
+        assert_eq!(config.serial_baud, 2_000_000);
     }
 }
