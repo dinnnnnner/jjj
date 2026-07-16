@@ -21,5 +21,9 @@ pub(crate) const SELF_TEST_CAN_DLC: u8 = 8;
 pub(crate) const SELF_TEST_CAN_DATA: [u8; 8] = [0xA5, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
 pub(crate) const CAN_REPLAY_DEFAULT_WINDOW_MS: i64 = 5 * 60 * 1000;
 pub(crate) const CAN_REPLAY_MIN_SPAN_SEC: f64 = 1.0;
+// Replay queries can cover hours of high-rate telemetry. Keep the in-memory
+// chart representation bounded; the TXT exporter still streams every row.
+pub(crate) const CAN_REPLAY_MAX_POINTS_PER_SERIES: usize = 20_000;
+pub(crate) const CAN_REPLAY_MAX_ALARM_POINTS_PER_SERIES: usize = 5_000;
 
 pub(crate) const CAN_EXPORT_DIR: &str = "exports";

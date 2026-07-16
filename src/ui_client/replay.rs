@@ -1,10 +1,115 @@
 use crate::*;
-use egui_plot::{Line, Plot, PlotPoints, Points};
+use egui_plot::{Line, Plot, PlotPoint, PlotPoints, Points};
 use futures_util::{TryStreamExt, pin_mut};
 use std::fs;
 use std::io::Write;
 use std::thread;
 use tokio_postgres::NoTls;
+
+#[derive(Clone, Copy)]
+struct ReplayBucket {
+    min: PlotPoint,
+    max: PlotPoint,
+}
+
+/// One-pass time-bucket sampler. Memory stays constant even if PostgreSQL
+/// returns millions of rows, while the min/max envelope retains short spikes.
+struct ReplaySeriesSampler {
+    start_ts_ms: i64,
+    span_ms: i64,
+    max_points: usize,
+    exact_points: Option<Vec<PlotPoint>>,
+    buckets: Vec<Option<ReplayBucket>>,
+    first: Option<PlotPoint>,
+    last: Option<PlotPoint>,
+}
+
+impl ReplaySeriesSampler {
+    fn new(start_ts_ms: i64, end_ts_ms: i64, max_points: usize) -> Self {
+        let bucket_count = max_points.saturating_sub(2).div_euclid(2).max(1);
+        Self {
+            start_ts_ms,
+            span_ms: end_ts_ms.saturating_sub(start_ts_ms).max(1),
+            max_points,
+            exact_points: Some(Vec::with_capacity(max_points.saturating_add(1))),
+            buckets: vec![None; bucket_count],
+            first: None,
+            last: None,
+        }
+    }
+
+    fn push(&mut self, ts_ms: i64, value: f64) {
+        let point = PlotPoint::new(
+            ts_ms.saturating_sub(self.start_ts_ms) as f64 / 1000.0,
+            value,
+        );
+        if let Some(exact_points) = &mut self.exact_points {
+            exact_points.push(point);
+            if exact_points.len() <= self.max_points {
+                return;
+            }
+
+            let buffered = self.exact_points.take().unwrap_or_default();
+            for buffered_point in buffered {
+                self.push_sampled(buffered_point);
+            }
+            return;
+        }
+
+        self.push_sampled(point);
+    }
+
+    fn push_sampled(&mut self, point: PlotPoint) {
+        self.first.get_or_insert(point);
+        self.last = Some(point);
+
+        let offset_ms = (point.x * 1000.0).clamp(0.0, self.span_ms as f64);
+        let bucket_index = (((offset_ms as f64 / self.span_ms as f64) * self.buckets.len() as f64)
+            as usize)
+            .min(self.buckets.len() - 1);
+        match &mut self.buckets[bucket_index] {
+            Some(bucket) => {
+                if point.y < bucket.min.y {
+                    bucket.min = point;
+                }
+                if point.y > bucket.max.y {
+                    bucket.max = point;
+                }
+            }
+            slot @ None => {
+                *slot = Some(ReplayBucket {
+                    min: point,
+                    max: point,
+                });
+            }
+        }
+    }
+
+    fn finish(self) -> Vec<PlotPoint> {
+        if let Some(exact_points) = self.exact_points {
+            return exact_points;
+        }
+
+        let mut points = Vec::with_capacity(self.buckets.len() * 2 + 2);
+        if let Some(first) = self.first {
+            points.push(first);
+        }
+        for bucket in self.buckets.into_iter().flatten() {
+            if bucket.min.x <= bucket.max.x {
+                points.push(bucket.min);
+                points.push(bucket.max);
+            } else {
+                points.push(bucket.max);
+                points.push(bucket.min);
+            }
+        }
+        if let Some(last) = self.last {
+            points.push(last);
+        }
+        points.dedup_by(|a, b| a.x == b.x && a.y == b.y);
+        points
+    }
+}
 
 impl UiClientApp {
     pub(crate) fn open_can_replay(&mut self) {
@@ -68,7 +173,7 @@ impl UiClientApp {
 
                     let axes = mode.axis_filters();
                     let rows = client
-                        .query(
+                        .query_raw(
                             "SELECT ts_ms, axis, value
                              FROM telemetry_samples
                              WHERE device_id LIKE 'can://%'
@@ -76,8 +181,8 @@ impl UiClientApp {
                                AND ts_ms <= $2
                                AND axis IN ($3, $4, $5, $6, $7)
                              ORDER BY ts_ms ASC, axis ASC",
-                            &[
-                                &start_ts_ms,
+                            [
+                                &start_ts_ms as &(dyn tokio_postgres::types::ToSql + Sync),
                                 &end_ts_ms,
                                 &axes[0],
                                 &axes[1],
@@ -89,40 +194,67 @@ impl UiClientApp {
                         .await
                         .map_err(|err| err.to_string())?;
 
-                    let mut data = CanReplayData {
-                        min_ts_ms: start_ts_ms,
-                        max_ts_ms: end_ts_ms,
-                        ..CanReplayData::default()
-                    };
-                    for row in rows {
+                    pin_mut!(rows);
+
+                    let mut samplers = std::array::from_fn::<_, 5, _>(|_| {
+                        ReplaySeriesSampler::new(
+                            start_ts_ms,
+                            end_ts_ms,
+                            CAN_REPLAY_MAX_POINTS_PER_SERIES,
+                        )
+                    });
+                    let mut raw_point_count = 0usize;
+                    while let Some(row) = rows
+                        .try_next()
+                        .await
+                        .map_err(|err| format!("stream replay rows failed: {err}"))?
+                    {
                         let ts_ms: i64 = row.get(0);
                         let axis: String = row.get(1);
                         let value: f64 = row.get(2);
-                        let x_sec = (ts_ms - start_ts_ms) as f64 / 1000.0;
-                        match axis.as_str() {
-                            axis_name if axis_name == axes[0] => data.x_points.push([x_sec, value]),
-                            axis_name if axis_name == axes[1] => data.y_points.push([x_sec, value]),
-                            axis_name if axis_name == axes[2] => data.z_points.push([x_sec, value]),
-                            axis_name if axis_name == axes[3] => data.u_points.push([x_sec, value]),
-                            axis_name if axis_name == axes[4] => data.v_points.push([x_sec, value]),
-                            _ => {}
+                        if let Some(axis_index) =
+                            axes.iter().position(|candidate| axis == *candidate)
+                        {
+                            samplers[axis_index].push(ts_ms, value);
+                            raw_point_count = raw_point_count.saturating_add(1);
                         }
                     }
 
+                    let [x_sampler, y_sampler, z_sampler, u_sampler, v_sampler] = samplers;
+                    let mut data = CanReplayData {
+                        x_points: x_sampler.finish(),
+                        y_points: y_sampler.finish(),
+                        z_points: z_sampler.finish(),
+                        u_points: u_sampler.finish(),
+                        v_points: v_sampler.finish(),
+                        min_ts_ms: start_ts_ms,
+                        max_ts_ms: end_ts_ms,
+                        raw_point_count,
+                        ..CanReplayData::default()
+                    };
+
                     let alarm_rows = client
-                        .query(
+                        .query_raw(
                             "SELECT ts_ms, alarm_id, level, message, cleared
                              FROM alarm_events
                              WHERE ts_ms >= $1
                                AND ts_ms <= $2
                                AND (alarm_id LIKE 'can_%' OR alarm_id LIKE 'sent_%')
                              ORDER BY ts_ms ASC, id ASC",
-                            &[&start_ts_ms, &end_ts_ms],
+                            [
+                                &start_ts_ms as &(dyn tokio_postgres::types::ToSql + Sync),
+                                &end_ts_ms,
+                            ],
                         )
                         .await
                         .map_err(|err| err.to_string())?;
 
-                    for row in alarm_rows {
+                    pin_mut!(alarm_rows);
+                    while let Some(row) = alarm_rows
+                        .try_next()
+                        .await
+                        .map_err(|err| format!("stream replay alarms failed: {err}"))?
+                    {
                         let ts_ms: i64 = row.get(0);
                         let alarm_id: String = row.get(1);
                         let level: String = row.get(2);
@@ -140,14 +272,15 @@ impl UiClientApp {
                                 } else {
                                     None
                                 };
-                                if let Some((series, alarms)) = target {
-                                    if let Some(point) = nearest_plot_point(series, x_sec) {
-                                        alarms.push(AlarmPlotPoint {
-                                            point: [x_sec, point[1]],
-                                            level,
-                                            cleared,
-                                        });
-                                    }
+                                if let Some((series, alarms)) = target
+                                    && alarms.len() < CAN_REPLAY_MAX_ALARM_POINTS_PER_SERIES
+                                    && let Some(point) = nearest_plot_point(series, x_sec)
+                                {
+                                    alarms.push(AlarmPlotPoint {
+                                        point: [x_sec, point[1]],
+                                        level,
+                                        cleared,
+                                    });
                                 }
                             }
                             ReplayMode::Sent => {
@@ -169,14 +302,15 @@ impl UiClientApp {
                                 } else {
                                     None
                                 };
-                                if let Some((series, alarms)) = target {
-                                    if let Some(point) = nearest_plot_point(series, x_sec) {
-                                        alarms.push(AlarmPlotPoint {
-                                            point: [x_sec, point[1]],
-                                            level,
-                                            cleared,
-                                        });
-                                    }
+                                if let Some((series, alarms)) = target
+                                    && alarms.len() < CAN_REPLAY_MAX_ALARM_POINTS_PER_SERIES
+                                    && let Some(point) = nearest_plot_point(series, x_sec)
+                                {
+                                    alarms.push(AlarmPlotPoint {
+                                        point: [x_sec, point[1]],
+                                        level,
+                                        cleared,
+                                    });
                                 }
                             }
                         }
@@ -350,27 +484,40 @@ impl UiClientApp {
         label: &str,
         points: &[AlarmPlotPoint],
     ) {
-        for (idx, alarm) in points.iter().enumerate() {
+        let mut groups: Vec<(egui::Color32, bool, Vec<[f64; 2]>)> = Vec::new();
+        for alarm in points {
             let color = Self::alarm_record_level_color(&alarm.level);
-            let radius = if alarm.cleared { 4.0 } else { 6.0 };
+            if let Some((_, _, grouped_points)) =
+                groups.iter_mut().find(|(group_color, cleared, _)| {
+                    *group_color == color && *cleared == alarm.cleared
+                })
+            {
+                grouped_points.push(alarm.point);
+            } else {
+                groups.push((color, alarm.cleared, vec![alarm.point]));
+            }
+        }
+
+        for (index, (color, cleared, grouped_points)) in groups.into_iter().enumerate() {
+            let radius = if cleared { 4.0 } else { 6.0 };
             plot_ui.points(
                 Points::new(
-                    format!("{label} alarm {idx}"),
-                    PlotPoints::new(vec![alarm.point]),
+                    format!("{label} alarm group {index}"),
+                    PlotPoints::new(grouped_points),
                 )
                 .color(color)
                 .radius(radius)
-                .filled(!alarm.cleared),
+                .filled(!cleared),
             );
         }
     }
 
     pub(crate) fn draw_can_replay_chart(
-        &mut self,
+        &self,
         ui: &mut egui::Ui,
         data: &CanReplayData,
         height: f32,
-    ) -> Option<(i64, i64)> {
+    ) -> Option<((i64, i64), egui::Rect)> {
         let plot_response = Plot::new("can_replay_plot")
             .allow_zoom([true, true])
             .allow_scroll([true, true])
@@ -387,7 +534,7 @@ impl UiClientApp {
                 let labels = self.can_replay.mode.series_labels();
                 if self.can_replay.show_x {
                     plot_ui.line(
-                        Line::new(labels[0], PlotPoints::new(data.x_points.clone()))
+                        Line::new(labels[0], PlotPoints::from(data.x_points.as_slice()))
                             .color(egui::Color32::from_rgb(239, 83, 80)),
                     );
                     if self.can_replay.show_alarm_points {
@@ -396,7 +543,7 @@ impl UiClientApp {
                 }
                 if self.can_replay.show_y {
                     plot_ui.line(
-                        Line::new(labels[1], PlotPoints::new(data.y_points.clone()))
+                        Line::new(labels[1], PlotPoints::from(data.y_points.as_slice()))
                             .color(egui::Color32::from_rgb(66, 165, 245)),
                     );
                     if self.can_replay.show_alarm_points {
@@ -405,7 +552,7 @@ impl UiClientApp {
                 }
                 if self.can_replay.show_z {
                     plot_ui.line(
-                        Line::new(labels[2], PlotPoints::new(data.z_points.clone()))
+                        Line::new(labels[2], PlotPoints::from(data.z_points.as_slice()))
                             .color(egui::Color32::from_rgb(102, 187, 106)),
                     );
                     if self.can_replay.show_alarm_points {
@@ -414,7 +561,7 @@ impl UiClientApp {
                 }
                 if self.can_replay.mode == ReplayMode::Sent && self.can_replay.show_u {
                     plot_ui.line(
-                        Line::new(labels[3], PlotPoints::new(data.u_points.clone()))
+                        Line::new(labels[3], PlotPoints::from(data.u_points.as_slice()))
                             .color(egui::Color32::from_rgb(255, 167, 38)),
                     );
                     if self.can_replay.show_alarm_points {
@@ -423,7 +570,7 @@ impl UiClientApp {
                 }
                 if self.can_replay.mode == ReplayMode::Sent && self.can_replay.show_v {
                     plot_ui.line(
-                        Line::new(labels[4], PlotPoints::new(data.v_points.clone()))
+                        Line::new(labels[4], PlotPoints::from(data.v_points.as_slice()))
                             .color(egui::Color32::from_rgb(171, 71, 188)),
                     );
                     if self.can_replay.show_alarm_points {
@@ -433,12 +580,11 @@ impl UiClientApp {
                 plot_ui.plot_bounds()
             });
 
-        self.can_replay.plot_rect = Some(plot_response.response.rect);
         let bounds = plot_response.inner;
         let x_range = bounds.range_x();
         let start_ms = data.min_ts_ms + (*x_range.start() * 1000.0) as i64;
         let end_ms = data.min_ts_ms + (*x_range.end() * 1000.0) as i64;
-        Some((start_ms, end_ms))
+        Some(((start_ms, end_ms), plot_response.response.rect))
     }
 
     pub(crate) fn draw_can_replay_window(&mut self, ctx: &egui::Context) {
@@ -447,6 +593,7 @@ impl UiClientApp {
         }
 
         let mut open = self.can_replay.open;
+        let mut replay_plot_rect = None;
         egui::Window::new("CAN 回放")
             .open(&mut open)
             .default_size(egui::vec2(1080.0, 640.0))
@@ -522,21 +669,21 @@ impl UiClientApp {
                 ui.add_space(6.0);
 
                 let available_height = (ui.available_height() - 56.0).max(240.0);
-                if let Some(data) = self.can_replay.data.clone() {
-                    let visible_range = self.draw_can_replay_chart(ui, &data, available_height);
+                if let Some(data) = self.can_replay.data.as_ref() {
+                    let chart_result = self.draw_can_replay_chart(ui, data, available_height);
                     ui.horizontal(|ui| {
                         ui.label(format!("ts_ms: {}", data.min_ts_ms));
                         ui.add_space((ui.available_width() - 160.0).max(0.0));
                         ui.label(format!("ts_ms: {}", data.max_ts_ms));
                     });
-                    if let Some((visible_start_ms, visible_end_ms)) = visible_range {
+                    if let Some(((visible_start_ms, visible_end_ms), plot_rect)) = chart_result {
+                        replay_plot_rect = Some(plot_rect);
                         ui.label(format!(
                             "当前视图: {} -> {}",
                             visible_start_ms, visible_end_ms
                         ));
                     }
                 } else {
-                    self.can_replay.plot_rect = None;
                     ui.group(|ui| {
                         ui.set_min_height(available_height);
                         ui.vertical_centered(|ui| {
@@ -548,5 +695,49 @@ impl UiClientApp {
                 }
             });
         self.can_replay.open = open;
+        self.can_replay.plot_rect = replay_plot_rect;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_sampler_bounds_output_and_keeps_extrema() {
+        let max_points = 100;
+        let mut sampler = ReplaySeriesSampler::new(0, 10_000, max_points);
+        for ts_ms in 0..10_000 {
+            let value = match ts_ms {
+                3_211 => 500.0,
+                7_654 => -400.0,
+                _ => (ts_ms % 20) as f64,
+            };
+            sampler.push(ts_ms, value);
+        }
+
+        let points = sampler.finish();
+
+        assert!(points.len() <= max_points);
+        assert!(points.iter().any(|point| point.y == 500.0));
+        assert!(points.iter().any(|point| point.y == -400.0));
+        assert!(points.windows(2).all(|pair| pair[0].x <= pair[1].x));
+    }
+
+    #[test]
+    fn replay_sampler_leaves_small_series_unchanged() {
+        // Even if the selected replay window is much wider than the actual
+        // burst, a series below the cap must not be collapsed into one bucket.
+        let mut sampler = ReplaySeriesSampler::new(1_000, 1_000_000, 20);
+        sampler.push(1_000, 1.0);
+        sampler.push(1_001, 2.0);
+        sampler.push(1_002, 3.0);
+
+        let points = sampler.finish();
+
+        assert_eq!(points.len(), 3);
+        assert_eq!((points[0].x, points[0].y), (0.0, 1.0));
+        assert_eq!((points[1].x, points[1].y), (0.001, 2.0));
+        assert_eq!((points[2].x, points[2].y), (0.002, 3.0));
     }
 }

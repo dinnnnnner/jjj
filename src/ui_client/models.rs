@@ -206,25 +206,33 @@ pub(crate) struct AlarmPlotPoint {
     pub(crate) cleared: bool,
 }
 
-pub(crate) fn nearest_plot_point(points: &[[f64; 2]], x_sec: f64) -> Option<[f64; 2]> {
-    points
-        .iter()
-        .min_by(|a, b| {
-            (a[0] - x_sec)
-                .abs()
-                .partial_cmp(&(b[0] - x_sec).abs())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .copied()
+pub(crate) fn nearest_plot_point(points: &[egui_plot::PlotPoint], x_sec: f64) -> Option<[f64; 2]> {
+    let insertion = points.partition_point(|point| point.x < x_sec);
+    let nearest = match (insertion.checked_sub(1), points.get(insertion)) {
+        (Some(left), Some(right)) => {
+            let left = &points[left];
+            if (left.x - x_sec).abs() <= (right.x - x_sec).abs() {
+                left
+            } else {
+                right
+            }
+        }
+        (Some(left), None) => &points[left],
+        (None, Some(right)) => right,
+        (None, None) => return None,
+    };
+    Some([x_sec, nearest.y])
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct CanReplayData {
-    pub(crate) x_points: Vec<[f64; 2]>,
-    pub(crate) y_points: Vec<[f64; 2]>,
-    pub(crate) z_points: Vec<[f64; 2]>,
-    pub(crate) u_points: Vec<[f64; 2]>,
-    pub(crate) v_points: Vec<[f64; 2]>,
+    // PlotPoint lets egui_plot borrow these slices instead of rebuilding and
+    // copying every series on every frame.
+    pub(crate) x_points: Vec<egui_plot::PlotPoint>,
+    pub(crate) y_points: Vec<egui_plot::PlotPoint>,
+    pub(crate) z_points: Vec<egui_plot::PlotPoint>,
+    pub(crate) u_points: Vec<egui_plot::PlotPoint>,
+    pub(crate) v_points: Vec<egui_plot::PlotPoint>,
     pub(crate) x_alarm_points: Vec<AlarmPlotPoint>,
     pub(crate) y_alarm_points: Vec<AlarmPlotPoint>,
     pub(crate) z_alarm_points: Vec<AlarmPlotPoint>,
@@ -232,6 +240,7 @@ pub(crate) struct CanReplayData {
     pub(crate) v_alarm_points: Vec<AlarmPlotPoint>,
     pub(crate) min_ts_ms: i64,
     pub(crate) max_ts_ms: i64,
+    pub(crate) raw_point_count: usize,
 }
 
 impl CanReplayData {
@@ -245,6 +254,14 @@ impl CanReplayData {
 
     pub(crate) fn total_span_sec(&self) -> f64 {
         ((self.max_ts_ms - self.min_ts_ms).max(0) as f64) / 1000.0
+    }
+
+    pub(crate) fn displayed_point_count(&self) -> usize {
+        self.x_points.len()
+            + self.y_points.len()
+            + self.z_points.len()
+            + self.u_points.len()
+            + self.v_points.len()
     }
 }
 
