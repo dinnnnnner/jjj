@@ -74,16 +74,16 @@ impl SignalProcessor {
         let mut out = Vec::new();
 
         for spec in &self.specs {
-            if let SignalKind::SourceSensor { sensor_id } = spec.kind {
-                if sensor_id == raw.sensor_id {
-                    out.push(SignalSample {
-                        signal_id: spec.id.clone(),
-                        device_id: raw.device_id.clone(),
-                        t_sec: raw.t_sec,
-                        value: raw.value,
-                        req_id: raw.req_id,
-                    });
-                }
+            if let SignalKind::SourceSensor { sensor_id } = spec.kind
+                && sensor_id == raw.sensor_id
+            {
+                out.push(SignalSample {
+                    signal_id: spec.id.clone(),
+                    device_id: raw.device_id.clone(),
+                    t_sec: raw.t_sec,
+                    value: raw.value,
+                    req_id: raw.req_id,
+                });
             }
         }
 
@@ -95,10 +95,20 @@ impl SignalProcessor {
         }
 
         let mut derived = Vec::new();
-        for spec in &self.specs {
-            if let SignalKind::Derived { formula } = &spec.kind {
-                if let Some(sample) =
-                    self.compute_derived(formula, &spec.id, &raw.device_id, raw.t_sec, raw.req_id)
+        // Only recompute formulas whose input was updated by this raw sample.
+        // Recomputing every derived signal for every sensor duplicates stale
+        // values and multiplies UI series work at high frame rates.
+        for source in &out {
+            for spec in &self.specs {
+                if let SignalKind::Derived { formula } = &spec.kind
+                    && formula.input_signal_id() == source.signal_id
+                    && let Some(sample) = self.compute_derived(
+                        formula,
+                        &spec.id,
+                        &raw.device_id,
+                        raw.t_sec,
+                        raw.req_id,
+                    )
                 {
                     derived.push(sample);
                 }
@@ -157,6 +167,19 @@ impl SignalProcessor {
                     req_id,
                 })
             }
+        }
+    }
+}
+
+impl DerivedFormula {
+    fn input_signal_id(&self) -> &str {
+        match self {
+            Self::ScaleOffset {
+                input_signal_id, ..
+            }
+            | Self::OffsetScale {
+                input_signal_id, ..
+            } => input_signal_id,
         }
     }
 }
@@ -408,6 +431,42 @@ mod tests {
         }
 
         2.0 * (sin_acc.hypot(cos_acc)) / n
+    }
+
+    #[test]
+    fn derived_signal_is_only_emitted_when_its_source_changes() {
+        let mut processor = SignalProcessor::new(default_signal_specs(2));
+
+        let sensor_zero = processor.ingest_raw(RawSample {
+            device_id: "test".to_string(),
+            sensor_id: 0,
+            t_sec: 1.0,
+            value: 2048.0,
+            req_id: 1,
+        });
+        assert!(
+            sensor_zero
+                .iter()
+                .any(|sample| sample.signal_id == "sensor_0_angle")
+        );
+
+        let sensor_one = processor.ingest_raw(RawSample {
+            device_id: "test".to_string(),
+            sensor_id: 1,
+            t_sec: 2.0,
+            value: 2047.5,
+            req_id: 2,
+        });
+        assert!(
+            sensor_one
+                .iter()
+                .all(|sample| sample.signal_id != "sensor_0_angle")
+        );
+        assert!(
+            sensor_one
+                .iter()
+                .any(|sample| sample.signal_id == "sensor_1_angle")
+        );
     }
 
     #[test]

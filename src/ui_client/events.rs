@@ -1,6 +1,10 @@
-use crate::{CAN_REPLAY_MIN_SPAN_SEC, SENSOR_COUNT, TestSignalView, UiClientApp, UiMsg};
+use crate::{
+    CAN_REPLAY_MIN_SPAN_SEC, MAX_UI_MESSAGES_PER_UPDATE, SENSOR_COUNT, TestSignalView,
+    UI_MESSAGE_TIME_BUDGET_MS, UiClientApp, UiMsg,
+};
 use demo2::bus::TelemetrySourceKind;
 use demo2::signal::RawSample;
+use std::time::{Duration, Instant};
 
 use super::messages::TelemetryMsg;
 
@@ -37,10 +41,31 @@ impl UiClientApp {
         self.reset_layout();
     }
 
-    pub(crate) fn drain_messages(&mut self) {
-        while let Ok(msg) = self.rx.try_recv() {
+    /// Process a bounded slice of queued work so input and painting remain
+    /// responsive even when the feed arrives in a large burst.
+    ///
+    /// Returns `true` when the per-update limit was reached and another repaint
+    /// should be scheduled immediately.
+    pub(crate) fn drain_messages(&mut self) -> bool {
+        let started_at = Instant::now();
+        let budget = Duration::from_millis(UI_MESSAGE_TIME_BUDGET_MS);
+        let mut processed = 0;
+
+        while processed < MAX_UI_MESSAGES_PER_UPDATE {
+            let Ok(msg) = self.rx.try_recv() else {
+                return false;
+            };
             self.handle_ui_msg(msg);
+            processed += 1;
+
+            // Avoid a clock read for every signal while still enforcing a
+            // tight enough budget for a smooth UI frame.
+            if processed % 64 == 0 && started_at.elapsed() >= budget {
+                return true;
+            }
         }
+
+        true
     }
 
     fn handle_ui_msg(&mut self, msg: UiMsg) {
