@@ -7,7 +7,9 @@ use demo2::db::writer::{
 };
 use demo2::domain::telemetry::axis_name;
 use demo2::feed::{TelemetryMsg, UiFeedMsg, encode_feed_msg};
-use demo2::ingress::can::{SentFilterConfig, run_can_ingress};
+use demo2::ingress::can::{
+    CanSignalWatchdogConfig, CanSignalWatchdogTarget, SentFilterConfig, run_can_ingress,
+};
 use demo2::ingress::serial::{
     SerialIngressMode, parse_serial_mode, publish_status, run_serial_ingress,
 };
@@ -782,9 +784,34 @@ pub async fn run() -> anyhow::Result<()> {
                 .unwrap_or(cfg.sent_filter_window)
                 .max(1),
         };
+        let watchdog_config = CanSignalWatchdogConfig {
+            enabled: env_flag("DEMO2_CAN_SIGNAL_WATCHDOG_ENABLED")
+                .unwrap_or(cfg.can_signal_watchdog_enabled),
+            timeout: Duration::from_millis(
+                std::env::var("DEMO2_CAN_SIGNAL_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(cfg.can_signal_timeout_ms)
+                    .max(1),
+            ),
+            targets: cfg
+                .can_signal_watchdogs
+                .iter()
+                .map(|target| CanSignalWatchdogTarget {
+                    channel: target.channel,
+                    identifier: target.can_id,
+                    label: target.label.clone().unwrap_or_else(|| {
+                        target
+                            .can_id
+                            .map(|identifier| format!("CAN 0x{identifier:X}"))
+                            .unwrap_or_else(|| format!("Channel {} signal", target.channel))
+                    }),
+                })
+                .collect(),
+        };
         let bus_for_can = raw_bus.clone();
         tokio::spawn(async move {
-            run_can_ingress(can_config, sent_filter_config, bus_for_can).await;
+            run_can_ingress(can_config, sent_filter_config, watchdog_config, bus_for_can).await;
         });
     }
 

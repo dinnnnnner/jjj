@@ -13,6 +13,14 @@ can_channel = 0
 can_baud_kbps = 500
 can_data_baud_kbps = 2000
 can_channels = [0, 1, 2, 3]
+can_signal_watchdog_enabled = true
+can_signal_timeout_ms = 2000
+# 留空时自动按每个启用的 Channel 监控任意成功解析的信号帧。
+# 需要监控具体周期帧时，按下面格式配置；同一 Channel 可配置多个 CAN ID。
+can_signal_watchdogs = [
+  { channel = 0, can_id = 1, label = "SENT T2/S" },
+  { channel = 1, can_id = 2, label = "SENT T1" },
+]
 serial_baud = 2000000
 serial_mode = "sent"
 pg_dsn = "host=127.0.0.1 port=5432 user=postgres password=123456 dbname=demo2"
