@@ -782,6 +782,15 @@ impl UiClientApp {
     }
 
     pub(crate) fn push_dynamic_window(&mut self, title: String, binding: Option<SignalBinding>) {
+        self.push_dynamic_window_for_device(title, binding, None);
+    }
+
+    fn push_dynamic_window_for_device(
+        &mut self,
+        title: String,
+        binding: Option<SignalBinding>,
+        device_id: Option<String>,
+    ) {
         let position = egui::pos2(
             120.0 + self.dynamic_windows.len() as f32 * 28.0,
             120.0 + self.dynamic_windows.len() as f32 * 24.0,
@@ -789,10 +798,44 @@ impl UiClientApp {
         self.dynamic_windows.push(DynamicSignalWindow {
             title,
             binding,
+            device_id,
             position,
             scale: 1.0,
             rect: None,
         });
+    }
+
+    pub(crate) fn ensure_can_sent_window(&mut self, device_id: &str, sensor_id: usize) {
+        if self.selected_view != TestSignalView::Sent {
+            self.selected_view = TestSignalView::Sent;
+            self.dynamic_windows.clear();
+        }
+        let binding = match sensor_id {
+            0 => SignalBinding::Sent1V1,
+            1 => SignalBinding::Sent1P1,
+            2 => SignalBinding::Sent2V2,
+            3 => SignalBinding::Sent2P2,
+            4 => SignalBinding::Sent3Angle,
+            _ => return,
+        };
+        if self.dynamic_windows.iter().any(|window| {
+            window.device_id.as_deref() == Some(device_id) && window.binding == Some(binding)
+        }) {
+            return;
+        }
+
+        let channel_label = Self::can_channel_from_device_id(device_id)
+            .map(|channel| format!("ch{channel}"))
+            .unwrap_or_else(|| device_id.to_string());
+        self.can_sent_sensors
+            .entry((device_id.to_string(), binding.sensor_id()))
+            .or_insert_with(SensorSeries::new);
+        self.push_dynamic_window_for_device(
+            format!("{}_{}", channel_label, binding.title(1)),
+            Some(binding),
+            Some(device_id.to_string()),
+        );
+        self.reset_layout();
     }
 
     pub(crate) fn add_dynamic_window(&mut self) {
@@ -1156,6 +1199,7 @@ impl eframe::App for UiClientApp {
         for idx in 0..self.dynamic_windows.len() {
             let title = self.dynamic_windows[idx].title.clone();
             let binding = self.dynamic_windows[idx].binding;
+            let window_device_id = self.dynamic_windows[idx].device_id.clone();
             let start_pos = self.dynamic_windows[idx].position;
             let scale = self.dynamic_windows[idx].scale;
             let id = egui::Id::new(format!("dynamic_signal_window_{idx}"));
@@ -1180,7 +1224,11 @@ impl eframe::App for UiClientApp {
                             return;
                         }
                         let raw_signal_id = format!("sensor_{sensor_id}_raw");
-                        let series = if binding.uses_tcp_series() {
+                        let series = if let Some(device_id) = window_device_id.as_ref() {
+                            self.can_sent_sensors
+                                .get(&(device_id.clone(), sensor_id))
+                                .unwrap_or(&self.sensors[sensor_id])
+                        } else if binding.uses_tcp_series() {
                             &self.tcp_sensors[sensor_id]
                         } else {
                             &self.sensors[sensor_id]

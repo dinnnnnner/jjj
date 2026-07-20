@@ -11,7 +11,7 @@ pub(crate) enum TestSignalView {
     TcpFrame,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SignalBinding {
     DemoAxisX,
     DemoAxisY,
@@ -108,6 +108,7 @@ impl SignalBinding {
 pub(crate) struct DynamicSignalWindow {
     pub(crate) title: String,
     pub(crate) binding: Option<SignalBinding>,
+    pub(crate) device_id: Option<String>,
     pub(crate) position: egui::Pos2,
     pub(crate) scale: f32,
     pub(crate) rect: Option<egui::Rect>,

@@ -11,6 +11,7 @@ use super::series::SensorSeries;
 pub(crate) struct UiClientState {
     pub(crate) status: String,
     pub(crate) sensors: Vec<SensorSeries>,
+    pub(crate) can_sent_sensors: HashMap<(String, usize), SensorSeries>,
     pub(crate) tcp_sensors: Vec<SensorSeries>,
     pub(crate) total_samples: u64,
     pub(crate) last_req: u64,
@@ -42,6 +43,7 @@ impl UiClientState {
         Self {
             status: "starting...".to_string(),
             sensors: (0..SENSOR_COUNT).map(|_| SensorSeries::new()).collect(),
+            can_sent_sensors: HashMap::new(),
             tcp_sensors: (0..SENSOR_COUNT).map(|_| SensorSeries::new()).collect(),
             total_samples: 0,
             last_req: 0,
