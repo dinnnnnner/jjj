@@ -139,7 +139,6 @@ impl CanIngressCore {
         config: &CanTransportConfig,
         frame: CanFrame,
         now: SystemTime,
-        observed_at: Instant,
     ) -> Vec<CanIngressEvent> {
         let device_id = can_device_id(config, frame.channel);
         let state = self
@@ -157,7 +156,6 @@ impl CanIngressCore {
         let is_tx = frame.is_tx();
         let identifier = frame.identifier;
         let data = frame.data_bytes();
-        let mut signal_received = false;
 
         if let Some((x_ok, y_ok, z_ok)) = decode_self_test_response(is_tx, identifier, data) {
             events.push(CanIngressEvent::Status(format!(
@@ -179,7 +177,6 @@ impl CanIngressCore {
         }
 
         if let Some(values) = decode_sent_values(is_tx, identifier, data) {
-            signal_received = true;
             let output_values = if self.sent_filter_config.enabled {
                 state.sent_filter.apply(values)
             } else {
@@ -188,15 +185,12 @@ impl CanIngressCore {
             push_can_sent_value_events(&mut events, &device_id, frame_count, output_values);
         }
         if let Some(values) = decode_sent_1(is_tx, identifier, data) {
-            signal_received = true;
             push_can_sent_value_events(&mut events, &device_id, frame_count, values);
         }
         if let Some(values) = decode_sent_2(is_tx, identifier, data) {
-            signal_received = true;
             push_can_sent_value_events(&mut events, &device_id, frame_count, values);
         }
         if let Some((sensor_id, value)) = decode_axis_sample(identifier, data) {
-            signal_received = true;
             events.push(CanIngressEvent::Telemetry {
                 device_id: device_id.clone(),
                 sensor_id,
@@ -214,27 +208,16 @@ impl CanIngressCore {
             );
             events.push(CanIngressEvent::Status(msg.clone()));
             events.push(CanIngressEvent::Log {
-                device_id: device_id.clone(),
+                device_id,
                 level: "info",
                 msg,
             });
         }
 
-        self.mark_signal_received(
-            &device_id,
-            frame.channel,
-            identifier,
-            is_tx,
-            signal_received,
-            observed_at,
-            now,
-            &mut events,
-        );
-
         events
     }
 
-    fn mark_signal_received(
+    fn observe_signal_frame(
         &mut self,
         device_id: &str,
         channel: u8,
@@ -243,10 +226,10 @@ impl CanIngressCore {
         decoded_signal: bool,
         observed_at: Instant,
         now: SystemTime,
-        events: &mut Vec<CanIngressEvent>,
-    ) {
+    ) -> Vec<CanIngressEvent> {
+        let mut events = Vec::new();
         if is_tx {
-            return;
+            return events;
         }
         for (key, watchdog) in &mut self.signal_watchdogs {
             if key.channel != channel {
@@ -271,6 +254,7 @@ impl CanIngressCore {
                 )));
             }
         }
+        events
     }
 
     fn poll_signal_timeouts(
@@ -332,9 +316,27 @@ pub async fn run_can_ingress(
         match transport.recv().await {
             Ok(Some(frame)) => {
                 let observed_at = Instant::now();
-                for event in
-                    core.handle_frame(&active_config, frame, SystemTime::now(), observed_at)
-                {
+                let wall_time = SystemTime::now();
+                let channel = frame.channel;
+                let identifier = frame.identifier;
+                let is_tx = frame.is_tx();
+                let events = core.handle_frame(&active_config, frame, wall_time);
+                let decoded_signal = events
+                    .iter()
+                    .any(|event| matches!(event, CanIngressEvent::Telemetry { .. }));
+                for event in events {
+                    publish_can_ingress_event(&bus, &start, event);
+                }
+                let device_id = can_device_id(&active_config, channel);
+                for event in core.observe_signal_frame(
+                    &device_id,
+                    channel,
+                    identifier,
+                    is_tx,
+                    decoded_signal,
+                    observed_at,
+                    wall_time,
+                ) {
                     publish_can_ingress_event(&bus, &start, event);
                 }
             }
@@ -765,6 +767,20 @@ mod tests {
         }
     }
 
+    fn sent_t1_frame(channel: u8) -> CanFrame {
+        let mut data = [0u8; 64];
+        data[6..8].copy_from_slice(&2100_i16.to_le_bytes());
+        data[8..10].copy_from_slice(&2200_i16.to_le_bytes());
+        CanFrame {
+            channel,
+            properties: 0,
+            dlc: 9,
+            identifier: 2,
+            timestamp_us: 0,
+            data,
+        }
+    }
+
     fn alarm_ids(events: &[CanIngressEvent]) -> HashSet<String> {
         events
             .iter()
@@ -800,9 +816,9 @@ mod tests {
         );
         let now = SystemTime::UNIX_EPOCH;
 
-        let first_ch0 = core.handle_frame(&config, axis_frame(0, 10), now, observed_at);
-        let first_ch1 = core.handle_frame(&config, axis_frame(1, 20), now, observed_at);
-        let second_ch0 = core.handle_frame(&config, axis_frame(0, 30), now, observed_at);
+        let first_ch0 = core.handle_frame(&config, axis_frame(0, 10), now);
+        let first_ch1 = core.handle_frame(&config, axis_frame(1, 20), now);
+        let second_ch0 = core.handle_frame(&config, axis_frame(0, 30), now);
 
         assert_eq!(axis_frame_count(&first_ch0), Some(1));
         assert_eq!(axis_frame_count(&first_ch1), Some(1));
@@ -849,11 +865,17 @@ mod tests {
             ])
         );
 
-        let restored = core.handle_frame(
-            &config,
-            axis_frame(0, 10),
-            SystemTime::UNIX_EPOCH,
+        let decoded = core.handle_frame(&config, axis_frame(0, 10), SystemTime::UNIX_EPOCH);
+        let restored = core.observe_signal_frame(
+            "can://TC1016:ch0",
+            0,
+            0x100,
+            false,
+            decoded
+                .iter()
+                .any(|event| matches!(event, CanIngressEvent::Telemetry { .. })),
             started_at + Duration::from_secs(3),
+            SystemTime::UNIX_EPOCH,
         );
         assert_eq!(
             alarm_ids(&restored),
@@ -891,6 +913,62 @@ mod tests {
     }
 
     #[test]
+    fn timed_out_channel_does_not_block_other_channel_sent_telemetry() {
+        let config = two_channel_config();
+        let started_at = Instant::now();
+        let watchdog_config = CanSignalWatchdogConfig {
+            enabled: true,
+            timeout: Duration::from_secs(2),
+            targets: vec![CanSignalWatchdogTarget {
+                channel: 0,
+                identifier: Some(1),
+                label: "T2/S".to_string(),
+            }],
+        };
+        let mut core = CanIngressCore::new(
+            SentFilterConfig::default(),
+            &watchdog_config,
+            &config.channels,
+            started_at,
+        );
+        let alarms = core.poll_signal_timeouts(
+            &config,
+            started_at + Duration::from_secs(2),
+            SystemTime::UNIX_EPOCH,
+        );
+        assert!(alarms.iter().any(|event| matches!(
+            event,
+            CanIngressEvent::AlarmRaised(alarm)
+                if alarm.alarm_id == "can_signal_timeout_ch0_id001"
+        )));
+
+        let events = core.handle_frame(&config, sent_t1_frame(1), SystemTime::UNIX_EPOCH);
+        let telemetry = events
+            .iter()
+            .filter_map(|event| match event {
+                CanIngressEvent::Telemetry {
+                    device_id,
+                    sensor_id,
+                    source_kind,
+                    ..
+                } => Some((device_id.as_str(), *sensor_id, *source_kind)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(telemetry.iter().any(|(device_id, sensor_id, source_kind)| {
+            *device_id == "can://TC1016:ch1"
+                && *sensor_id == 0
+                && *source_kind == TelemetrySourceKind::CanSent
+        }));
+        assert!(telemetry.iter().any(|(device_id, sensor_id, source_kind)| {
+            *device_id == "can://TC1016:ch1"
+                && *sensor_id == 1
+                && *source_kind == TelemetrySourceKind::CanSent
+        }));
+    }
+
+    #[test]
     fn exact_can_id_watchdog_accepts_an_rx_frame_without_a_business_decoder() {
         let config = CanTransportConfig::default();
         let started_at = Instant::now();
@@ -923,11 +1001,17 @@ mod tests {
             data: [0; 64],
         };
 
-        let restored = core.handle_frame(
-            &config,
-            frame,
-            SystemTime::UNIX_EPOCH,
+        let decoded = core.handle_frame(&config, frame, SystemTime::UNIX_EPOCH);
+        let restored = core.observe_signal_frame(
+            "can://TC1016:ch0",
+            0,
+            0x555,
+            false,
+            decoded
+                .iter()
+                .any(|event| matches!(event, CanIngressEvent::Telemetry { .. })),
             started_at + Duration::from_secs(3),
+            SystemTime::UNIX_EPOCH,
         );
 
         assert!(restored.iter().any(|event| matches!(
