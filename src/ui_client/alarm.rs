@@ -15,18 +15,23 @@ impl UiClientApp {
     pub(crate) fn apply_alarm(&mut self, alarm: AlarmEvent) {
         let key = Self::alarm_key(&alarm);
         let received_at = Instant::now();
-        self.total_alarm_count = self.total_alarm_count.saturating_add(1);
 
         if alarm.cleared {
             self.active_alarms.remove(&key);
+            self.acknowledged_alarms.remove(&key);
         } else {
+            let is_new = !self.active_alarms.contains_key(&key);
             self.active_alarms.insert(
-                key,
+                key.clone(),
                 AlarmViewItem {
                     event: alarm.clone(),
                     received_at,
                 },
             );
+            if is_new {
+                self.total_alarm_count = self.total_alarm_count.saturating_add(1);
+                self.acknowledged_alarms.remove(&key);
+            }
         }
 
         self.alarm_history.push_front(AlarmViewItem {
@@ -36,6 +41,34 @@ impl UiClientApp {
         while self.alarm_history.len() > Self::MAX_ALARM_HISTORY {
             self.alarm_history.pop_back();
         }
+    }
+
+    pub(crate) fn can_channel_from_device_id(device_id: &str) -> Option<u8> {
+        let (_, channel) = device_id.rsplit_once(":ch")?;
+        channel.parse().ok()
+    }
+
+    pub(crate) fn is_can_signal_timeout(event: &AlarmEvent) -> bool {
+        event.alarm_id.starts_with("can_signal_timeout_")
+            && Self::can_channel_from_device_id(&event.device_id).is_some()
+    }
+
+    pub(crate) fn acknowledge_channel_alarms(&mut self, channel: u8) {
+        let keys = self
+            .active_alarms
+            .iter()
+            .filter(|(_, item)| {
+                Self::is_can_signal_timeout(&item.event)
+                    && Self::can_channel_from_device_id(&item.event.device_id) == Some(channel)
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        self.acknowledged_alarms.extend(keys);
+    }
+
+    pub(crate) fn acknowledge_all_alarms(&mut self) {
+        let keys = self.active_alarms.keys().cloned().collect::<Vec<_>>();
+        self.acknowledged_alarms.extend(keys);
     }
 
     pub(crate) fn parse_optional_threshold(text: &str) -> Option<f64> {

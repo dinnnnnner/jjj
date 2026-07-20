@@ -591,10 +591,80 @@ impl UiClientApp {
     }
 
     pub(crate) fn clear_alarm_panel_stats(&mut self) {
-        self.active_alarms.clear();
         self.alarm_history.clear();
         self.total_alarm_count = 0;
-        self.status = "报警面板和报警统计已清除".to_string();
+        self.status = "报警历史和报警统计已清除；活跃报警保持显示".to_string();
+    }
+
+    fn can_signal_alarm_channels(&self) -> Vec<u8> {
+        let mut channels = std::collections::BTreeSet::new();
+        channels.extend(self.can_channel_last_seen.keys().copied());
+        for item in self.active_alarms.values().chain(self.alarm_history.iter()) {
+            if Self::is_can_signal_timeout(&item.event)
+                && let Some(channel) = Self::can_channel_from_device_id(&item.event.device_id)
+            {
+                channels.insert(channel);
+            }
+        }
+        channels.into_iter().collect()
+    }
+
+    fn draw_can_signal_alarm_cards(&mut self, ui: &mut egui::Ui) {
+        let channels = self.can_signal_alarm_channels();
+        if channels.is_empty() {
+            return;
+        }
+
+        ui.separator();
+        ui.label(egui::RichText::new("CAN Channel 信号状态").strong());
+        ui.horizontal_wrapped(|ui| {
+            for channel in channels {
+                let active = self
+                    .active_alarms
+                    .iter()
+                    .filter(|(_, item)| {
+                        Self::is_can_signal_timeout(&item.event)
+                            && Self::can_channel_from_device_id(&item.event.device_id)
+                                == Some(channel)
+                    })
+                    .map(|(key, item)| (key.clone(), item.event.clone()))
+                    .collect::<Vec<_>>();
+                let has_unacknowledged = active
+                    .iter()
+                    .any(|(key, _)| !self.acknowledged_alarms.contains(key));
+                let (state, color) = if active.is_empty() {
+                    ("正常", egui::Color32::from_rgb(64, 170, 92))
+                } else if has_unacknowledged {
+                    ("信号中断（未确认）", egui::Color32::from_rgb(235, 64, 52))
+                } else {
+                    ("信号中断（已确认）", egui::Color32::from_rgb(255, 180, 0))
+                };
+                let last_seen = self
+                    .can_channel_last_seen
+                    .get(&channel)
+                    .map(|seen| format!("最近 UI 样本：{:.1} 秒前", seen.elapsed().as_secs_f32()))
+                    .unwrap_or_else(|| "最近 UI 样本：尚未收到".to_string());
+
+                ui.group(|ui| {
+                    ui.set_min_width(250.0);
+                    ui.horizontal(|ui| {
+                        ui.heading(format!("Channel {channel}"));
+                        ui.colored_label(color, egui::RichText::new(state).strong());
+                    });
+                    ui.small(last_seen);
+                    if active.is_empty() {
+                        ui.colored_label(color, "目标信号工作正常");
+                    } else {
+                        for (_, event) in &active {
+                            ui.colored_label(color, &event.message);
+                        }
+                        if has_unacknowledged && ui.button("确认本 Channel 报警").clicked() {
+                            self.acknowledge_channel_alarms(channel);
+                        }
+                    }
+                });
+            }
+        });
     }
 
     pub(crate) fn draw_alarm_panel(&mut self, ctx: &egui::Context) {
@@ -606,7 +676,11 @@ impl UiClientApp {
                 ui.horizontal(|ui| {
                     ui.label(format!("报警次数: {}", self.total_alarm_count));
                     ui.separator();
-                    if ui.button("清除报警").clicked() {
+                    if ui.button("确认全部活跃报警").clicked() {
+                        self.acknowledge_all_alarms();
+                    }
+                    ui.separator();
+                    if ui.button("清空报警历史").clicked() {
                         self.clear_alarm_panel_stats();
                     }
                     ui.separator();
@@ -619,6 +693,8 @@ impl UiClientApp {
                     ui.label(format!("最近记录: {}", self.alarm_history.len()));
                 });
 
+                ui.add_space(6.0);
+                self.draw_can_signal_alarm_cards(ui);
                 ui.add_space(6.0);
                 ui.columns(2, |columns| {
                     columns[0].group(|ui| {
@@ -647,6 +723,16 @@ impl UiClientApp {
                                                     .monospace()
                                                     .color(level_color),
                                             );
+                                            if Self::is_can_signal_timeout(&item.event) {
+                                                let key = Self::alarm_key(&item.event);
+                                                ui.label(
+                                                    if self.acknowledged_alarms.contains(&key) {
+                                                        "已确认"
+                                                    } else {
+                                                        "未确认"
+                                                    },
+                                                );
+                                            }
                                         });
                                         ui.colored_label(level_color, &item.event.message);
                                         ui.separator();

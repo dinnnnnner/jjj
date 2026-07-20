@@ -3,7 +3,8 @@ use crate::{
     SENSOR_COUNT, SentAngleJumpThresholds, SentTorqueJumpThresholds, TestSignalView,
 };
 use demo2::signal::{SignalProcessor, default_signal_specs};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Instant;
 
 use super::series::SensorSeries;
 
@@ -24,8 +25,10 @@ pub(crate) struct UiClientState {
     pub(crate) can_group_index: u32,
     pub(crate) tcp_group_index: u32,
     pub(crate) active_alarms: HashMap<String, AlarmViewItem>,
+    pub(crate) acknowledged_alarms: HashSet<String>,
     pub(crate) alarm_history: VecDeque<AlarmViewItem>,
     pub(crate) total_alarm_count: u64,
+    pub(crate) can_channel_last_seen: HashMap<u8, Instant>,
     pub(crate) can_alarm_thresholds: CanAlarmThresholds,
     pub(crate) sent_jump_thresholds: SentTorqueJumpThresholds,
     pub(crate) sent_angle_jump_thresholds: SentAngleJumpThresholds,
@@ -53,8 +56,10 @@ impl UiClientState {
             can_group_index: 1,
             tcp_group_index: 1,
             active_alarms: HashMap::new(),
+            acknowledged_alarms: HashSet::new(),
             alarm_history: VecDeque::with_capacity(max_alarm_history),
             total_alarm_count: 0,
+            can_channel_last_seen: HashMap::new(),
             can_alarm_thresholds: CanAlarmThresholds::default(),
             sent_jump_thresholds: SentTorqueJumpThresholds::default(),
             sent_angle_jump_thresholds: SentAngleJumpThresholds::default(),

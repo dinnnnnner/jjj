@@ -214,22 +214,22 @@ impl CanIngressCore {
             );
             events.push(CanIngressEvent::Status(msg.clone()));
             events.push(CanIngressEvent::Log {
-                device_id,
+                device_id: device_id.clone(),
                 level: "info",
                 msg,
             });
         }
 
-        if signal_received {
-            self.mark_signal_received(
-                &device_id,
-                frame.channel,
-                identifier,
-                observed_at,
-                now,
-                &mut events,
-            );
-        }
+        self.mark_signal_received(
+            &device_id,
+            frame.channel,
+            identifier,
+            is_tx,
+            signal_received,
+            observed_at,
+            now,
+            &mut events,
+        );
 
         events
     }
@@ -239,17 +239,23 @@ impl CanIngressCore {
         device_id: &str,
         channel: u8,
         identifier: u32,
+        is_tx: bool,
+        decoded_signal: bool,
         observed_at: Instant,
         now: SystemTime,
         events: &mut Vec<CanIngressEvent>,
     ) {
+        if is_tx {
+            return;
+        }
         for (key, watchdog) in &mut self.signal_watchdogs {
-            if key.channel != channel
-                || key
-                    .identifier
-                    .is_some_and(|expected| expected != identifier)
-            {
+            if key.channel != channel {
                 continue;
+            }
+            match key.identifier {
+                Some(expected) if expected != identifier => continue,
+                None if !decoded_signal => continue,
+                _ => {}
             }
 
             watchdog.last_seen = observed_at;
@@ -354,9 +360,7 @@ pub async fn run_can_ingress(
                 break;
             }
         }
-        for event in
-            core.poll_signal_timeouts(&active_config, Instant::now(), SystemTime::now())
-        {
+        for event in core.poll_signal_timeouts(&active_config, Instant::now(), SystemTime::now()) {
             publish_can_ingress_event(&bus, &start, event);
         }
     }
@@ -743,6 +747,36 @@ mod tests {
         }
     }
 
+    fn two_channel_config() -> CanTransportConfig {
+        CanTransportConfig {
+            channels: vec![
+                CanChannelConfig {
+                    index: 0,
+                    arbitration_baud_kbps: 500,
+                    data_baud_kbps: 2_000,
+                },
+                CanChannelConfig {
+                    index: 1,
+                    arbitration_baud_kbps: 500,
+                    data_baud_kbps: 2_000,
+                },
+            ],
+            ..CanTransportConfig::default()
+        }
+    }
+
+    fn alarm_ids(events: &[CanIngressEvent]) -> HashSet<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                CanIngressEvent::AlarmRaised(alarm) | CanIngressEvent::AlarmCleared(alarm) => {
+                    Some(alarm.alarm_id.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     fn axis_frame_count(events: &[CanIngressEvent]) -> Option<u64> {
         events.iter().find_map(|event| match event {
             CanIngressEvent::Telemetry {
@@ -773,6 +807,134 @@ mod tests {
         assert_eq!(axis_frame_count(&first_ch0), Some(1));
         assert_eq!(axis_frame_count(&first_ch1), Some(1));
         assert_eq!(axis_frame_count(&second_ch0), Some(2));
+    }
+
+    #[test]
+    fn watchdogs_raise_and_clear_independently_per_channel() {
+        let config = two_channel_config();
+        let started_at = Instant::now();
+        let watchdog_config = CanSignalWatchdogConfig {
+            enabled: true,
+            timeout: Duration::from_secs(2),
+            targets: vec![
+                CanSignalWatchdogTarget {
+                    channel: 0,
+                    identifier: Some(0x100),
+                    label: "channel zero axis".to_string(),
+                },
+                CanSignalWatchdogTarget {
+                    channel: 1,
+                    identifier: Some(0x100),
+                    label: "channel one axis".to_string(),
+                },
+            ],
+        };
+        let mut core = CanIngressCore::new(
+            SentFilterConfig::default(),
+            &watchdog_config,
+            &config.channels,
+            started_at,
+        );
+
+        let raised = core.poll_signal_timeouts(
+            &config,
+            started_at + Duration::from_secs(2),
+            SystemTime::UNIX_EPOCH,
+        );
+        assert_eq!(
+            alarm_ids(&raised),
+            HashSet::from([
+                "can_signal_timeout_ch0_id100".to_string(),
+                "can_signal_timeout_ch1_id100".to_string(),
+            ])
+        );
+
+        let restored = core.handle_frame(
+            &config,
+            axis_frame(0, 10),
+            SystemTime::UNIX_EPOCH,
+            started_at + Duration::from_secs(3),
+        );
+        assert_eq!(
+            alarm_ids(&restored),
+            HashSet::from(["can_signal_timeout_ch0_id100".to_string()])
+        );
+        assert!(restored.iter().any(|event| matches!(
+            event,
+            CanIngressEvent::AlarmCleared(alarm) if alarm.device_id == "can://TC1016:ch0"
+        )));
+
+        let no_duplicate = core.poll_signal_timeouts(
+            &config,
+            started_at + Duration::from_secs(3),
+            SystemTime::UNIX_EPOCH,
+        );
+        assert!(no_duplicate.is_empty());
+    }
+
+    #[test]
+    fn empty_watchdog_targets_monitor_every_configured_channel() {
+        let config = two_channel_config();
+        let core = CanIngressCore::new(
+            SentFilterConfig::default(),
+            &CanSignalWatchdogConfig::default(),
+            &config.channels,
+            Instant::now(),
+        );
+
+        assert_eq!(core.signal_watchdogs.len(), 2);
+        assert!(
+            core.signal_watchdogs
+                .keys()
+                .all(|key| key.identifier.is_none())
+        );
+    }
+
+    #[test]
+    fn exact_can_id_watchdog_accepts_an_rx_frame_without_a_business_decoder() {
+        let config = CanTransportConfig::default();
+        let started_at = Instant::now();
+        let watchdog_config = CanSignalWatchdogConfig {
+            enabled: true,
+            timeout: Duration::from_secs(2),
+            targets: vec![CanSignalWatchdogTarget {
+                channel: 0,
+                identifier: Some(0x555),
+                label: "custom signal".to_string(),
+            }],
+        };
+        let mut core = CanIngressCore::new(
+            SentFilterConfig::default(),
+            &watchdog_config,
+            &config.channels,
+            started_at,
+        );
+        core.poll_signal_timeouts(
+            &config,
+            started_at + Duration::from_secs(2),
+            SystemTime::UNIX_EPOCH,
+        );
+        let frame = CanFrame {
+            channel: 0,
+            properties: 0,
+            dlc: 1,
+            identifier: 0x555,
+            timestamp_us: 0,
+            data: [0; 64],
+        };
+
+        let restored = core.handle_frame(
+            &config,
+            frame,
+            SystemTime::UNIX_EPOCH,
+            started_at + Duration::from_secs(3),
+        );
+
+        assert!(restored.iter().any(|event| matches!(
+            event,
+            CanIngressEvent::AlarmCleared(alarm)
+                if alarm.alarm_id == "can_signal_timeout_ch0_id555"
+        )));
     }
 
     #[test]

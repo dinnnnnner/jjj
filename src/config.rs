@@ -37,6 +37,10 @@ fn default_can_autostart_tsmaster() -> bool {
     true
 }
 
+fn default_can_hardware_subtype() -> Option<i32> {
+    Some(HW_SUBTYPE_TC1016)
+}
+
 fn default_can_signal_watchdog_enabled() -> bool {
     true
 }
@@ -82,7 +86,7 @@ pub struct CollectorConfig {
     #[serde(default = "default_can_autostart_tsmaster")]
     pub can_autostart_tsmaster: bool,
     pub can_hardware_name: String,
-    #[serde(default)]
+    #[serde(default = "default_can_hardware_subtype")]
     pub can_hardware_subtype: Option<i32>,
     pub can_channel: u8,
     pub can_baud_kbps: u32,

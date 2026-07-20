@@ -155,6 +155,9 @@ impl UiClientApp {
     }
 
     fn handle_sample(&mut self, sample: TelemetryMsg) {
+        if let Some(channel) = Self::can_channel_from_device_id(&sample.device_id) {
+            self.can_channel_last_seen.insert(channel, Instant::now());
+        }
         if sample.source_kind == TelemetrySourceKind::SerialDemo {
             self.demo_alarm_bit_state = Some(sample.alarm_bit);
         }
