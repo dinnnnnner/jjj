@@ -606,7 +606,10 @@ impl UiClientApp {
                 channels.insert(channel);
             }
         }
-        channels.into_iter().collect()
+        channels
+            .into_iter()
+            .filter(|channel| !self.dismissed_can_channels.contains(channel))
+            .collect()
     }
 
     fn draw_can_signal_alarm_cards(&mut self, ui: &mut egui::Ui) {
@@ -617,7 +620,7 @@ impl UiClientApp {
 
         ui.separator();
         ui.label(egui::RichText::new("CAN Channel 信号状态").strong());
-        ui.horizontal_wrapped(|ui| {
+        ui.vertical(|ui| {
             for channel in channels {
                 let active = self
                     .active_alarms
@@ -659,7 +662,7 @@ impl UiClientApp {
                             ui.colored_label(color, &event.message);
                         }
                         if has_unacknowledged && ui.button("确认本 Channel 报警").clicked() {
-                            self.acknowledge_channel_alarms(channel);
+                            self.dismiss_channel_alarms(channel);
                         }
                     }
                 });
@@ -1136,6 +1139,9 @@ impl eframe::App for UiClientApp {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.heading("UI Client");
             ui.label(format!("collector feed: {}", self.feed_addr));
+            if let Some(error) = &self.config_error {
+                ui.colored_label(egui::Color32::RED, error);
+            }
             ui.label("serial data path: serial -> collector_service -> ui_client");
             ui.horizontal(|ui| {
                 if ui.button("重排窗口并重置缩放").clicked() {

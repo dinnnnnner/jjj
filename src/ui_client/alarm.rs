@@ -53,7 +53,8 @@ impl UiClientApp {
             && Self::can_channel_from_device_id(&event.device_id).is_some()
     }
 
-    pub(crate) fn acknowledge_channel_alarms(&mut self, channel: u8) {
+    pub(crate) fn dismiss_channel_alarms(&mut self, channel: u8) {
+        self.dismissed_can_channels.insert(channel);
         let keys = self
             .active_alarms
             .iter()
@@ -63,7 +64,10 @@ impl UiClientApp {
             })
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
-        self.acknowledged_alarms.extend(keys);
+        for key in keys {
+            self.active_alarms.remove(&key);
+            self.acknowledged_alarms.remove(&key);
+        }
     }
 
     pub(crate) fn acknowledge_all_alarms(&mut self) {

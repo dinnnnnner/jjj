@@ -6,22 +6,12 @@ ingress_addr = "127.0.0.1:19010"
 ui_feed_addr = "127.0.0.1:19011"
 control_addr = "127.0.0.1:19013"
 health_addr = "127.0.0.1:19012"
-can_enabled = false
+can_enabled = true
 can_hardware_name = "TC1016"
 can_hardware_subtype = 11
 can_channel = 0
 can_baud_kbps = 500
 can_data_baud_kbps = 2000
-can_channels = [0, 1, 2, 3]
-can_signal_watchdog_enabled = true
-can_signal_timeout_ms = 2000
-# 留空时自动按每个启用的 Channel 监控任意成功解析的信号帧。
-# 需要监控具体周期帧时，按下面格式配置；同一 Channel 可配置多个 CAN ID。
-can_signal_watchdogs = [
-  { channel = 0, can_id = 1, label = "SENT T2/S" },
-  { channel = 1, can_id = 2, label = "SENT T1" },
-]
-serial_baud = 2000000
 serial_mode = "sent"
 pg_dsn = "host=127.0.0.1 port=5432 user=postgres password=123456 dbname=demo2"
 pg_connect_max_retries = 20
@@ -30,7 +20,7 @@ db_filter_cutoff_hz = 4000.0
 db_filter_enabled = false
 db_filter_order = 10
 db_filter_sample_rate_hz = 48000.0
-sent_filter_enabled = true
+sent_filter_enabled = false
 sent_filter_window = 10
 max_payload = 4096
 bus_capacity = 10000

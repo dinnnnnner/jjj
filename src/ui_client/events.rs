@@ -156,6 +156,7 @@ impl UiClientApp {
 
     fn handle_sample(&mut self, sample: TelemetryMsg) {
         if let Some(channel) = Self::can_channel_from_device_id(&sample.device_id) {
+            self.dismissed_can_channels.remove(&channel);
             self.can_channel_last_seen.insert(channel, Instant::now());
         }
         if sample.source_kind == TelemetrySourceKind::CanSent {
@@ -200,7 +201,9 @@ impl UiClientApp {
 mod tests {
     use super::*;
     use crate::FeedStats;
+    use demo2::domain::{AlarmEvent, AlarmLevel};
     use std::sync::{Arc, mpsc};
+    use std::time::SystemTime;
 
     fn test_app() -> UiClientApp {
         let (tx, rx) = mpsc::sync_channel(16);
@@ -211,6 +214,7 @@ mod tests {
             "127.0.0.1:19011".to_string(),
             "127.0.0.1:19013".to_string(),
             "host=127.0.0.1 dbname=demo2".to_string(),
+            None,
         )
     }
 
@@ -225,6 +229,33 @@ mod tests {
             request_id: 1,
             source_kind: TelemetrySourceKind::CanSent,
         }
+    }
+
+    #[test]
+    fn confirming_channel_alarm_hides_card_until_new_data_arrives() {
+        let mut app = test_app();
+        let alarm = AlarmEvent {
+            device_id: "can://TC1016:ch1".to_string(),
+            alarm_id: "can_signal_timeout_ch1_id002".to_string(),
+            level: AlarmLevel::Critical,
+            message: "timeout".to_string(),
+            raised_at: SystemTime::now(),
+            cleared: false,
+        };
+        let key = UiClientApp::alarm_key(&alarm);
+
+        app.apply_alarm(alarm);
+        app.dismiss_channel_alarms(1);
+
+        assert!(!app.active_alarms.contains_key(&key));
+        assert!(!app.acknowledged_alarms.contains(&key));
+        assert!(app.dismissed_can_channels.contains(&1));
+        assert_eq!(app.alarm_history.len(), 1);
+
+        app.handle_sample(can_sent_sample("can://TC1016:ch1", 0, 1.0));
+
+        assert!(!app.dismissed_can_channels.contains(&1));
+        assert!(app.can_channel_last_seen.contains_key(&1));
     }
 
     #[test]
