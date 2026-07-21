@@ -25,5 +25,6 @@ pub(crate) const CAN_REPLAY_MIN_SPAN_SEC: f64 = 1.0;
 // chart representation bounded; the TXT exporter still streams every row.
 pub(crate) const CAN_REPLAY_MAX_POINTS_PER_SERIES: usize = 20_000;
 pub(crate) const CAN_REPLAY_MAX_ALARM_POINTS_PER_SERIES: usize = 5_000;
+pub(crate) const CAN_REPLAY_PROGRESS_REPORT_INTERVAL: u64 = 2_048;
 
 pub(crate) const CAN_EXPORT_DIR: &str = "exports";

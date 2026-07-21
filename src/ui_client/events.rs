@@ -72,6 +72,12 @@ impl UiClientApp {
         match msg {
             UiMsg::Status(status) => self.handle_status(status),
             UiMsg::Alarm(alarm) => self.apply_alarm(alarm),
+            UiMsg::CanReplayProgress(mode, current, total) => {
+                if self.can_replay.loading && mode == self.can_replay.mode {
+                    self.can_replay.load_progress_current = current.min(total);
+                    self.can_replay.load_progress_total = Some(total);
+                }
+            }
             UiMsg::CanReplayLoaded(mode, result) => {
                 self.can_replay.loading = false;
                 if mode != self.can_replay.mode {

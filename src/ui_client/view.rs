@@ -1012,12 +1012,18 @@ impl UiClientApp {
         height: f32,
         label: &str,
         thresholds: Option<(Option<f64>, Option<f64>)>,
+        downsampling_enabled: bool,
     ) {
         let desired_size = egui::vec2(ui.available_width(), height.max(40.0));
         let (rect, _) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
         let painter = ui.painter_at(rect);
-        let max_chart_points = (rect.width() * CHART_POINTS_PER_PIXEL).max(4.0).round() as usize;
-        let chart_points = super::series::downsample_for_chart(points, max_chart_points);
+        let chart_points = if downsampling_enabled {
+            let max_chart_points =
+                (rect.width() * CHART_POINTS_PER_PIXEL).max(4.0).round() as usize;
+            super::series::downsample_for_chart(points, max_chart_points)
+        } else {
+            points.iter().copied().collect()
+        };
 
         painter.rect_stroke(
             rect,
@@ -1225,6 +1231,8 @@ impl eframe::App for UiClientApp {
                 if ui.button("报警记录").clicked() {
                     self.open_alarm_records();
                 }
+                ui.separator();
+                ui.checkbox(&mut self.realtime_downsampling_enabled, "实时曲线降采样");
             });
             ui.horizontal(|ui| {
                 ui.label("Test signal");
@@ -1329,6 +1337,7 @@ impl eframe::App for UiClientApp {
                             chart_h,
                             &format!("{chart_label} (last {:.0}s)", WINDOW_SECS),
                             chart_thresholds,
+                            self.realtime_downsampling_enabled,
                         );
                     } else {
                         ui.label("No signal mapping for this mode yet.");

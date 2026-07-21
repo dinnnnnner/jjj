@@ -12,12 +12,14 @@ struct ReplayBucket {
     max: PlotPoint,
 }
 
-/// One-pass time-bucket sampler. Memory stays constant even if PostgreSQL
-/// returns millions of rows, while the min/max envelope retains short spikes.
+/// One-pass time-bucket sampler. When downsampling is enabled, memory stays
+/// bounded even if PostgreSQL returns millions of rows, while the min/max
+/// envelope retains short spikes. When disabled, every point is retained.
 struct ReplaySeriesSampler {
     start_ts_ms: i64,
     span_ms: i64,
     max_points: usize,
+    downsampling_enabled: bool,
     exact_points: Option<Vec<PlotPoint>>,
     buckets: Vec<Option<ReplayBucket>>,
     first: Option<PlotPoint>,
@@ -25,13 +27,23 @@ struct ReplaySeriesSampler {
 }
 
 impl ReplaySeriesSampler {
-    fn new(start_ts_ms: i64, end_ts_ms: i64, max_points: usize) -> Self {
+    fn new(
+        start_ts_ms: i64,
+        end_ts_ms: i64,
+        max_points: usize,
+        downsampling_enabled: bool,
+    ) -> Self {
         let bucket_count = max_points.saturating_sub(2).div_euclid(2).max(1);
         Self {
             start_ts_ms,
             span_ms: end_ts_ms.saturating_sub(start_ts_ms).max(1),
             max_points,
-            exact_points: Some(Vec::with_capacity(max_points.saturating_add(1))),
+            downsampling_enabled,
+            exact_points: Some(Vec::with_capacity(if downsampling_enabled {
+                max_points.saturating_add(1)
+            } else {
+                4096
+            })),
             buckets: vec![None; bucket_count],
             first: None,
             last: None,
@@ -45,7 +57,7 @@ impl ReplaySeriesSampler {
         );
         if let Some(exact_points) = &mut self.exact_points {
             exact_points.push(point);
-            if exact_points.len() <= self.max_points {
+            if !self.downsampling_enabled || exact_points.len() <= self.max_points {
                 return;
             }
 
@@ -153,11 +165,15 @@ impl UiClientApp {
         }
 
         self.can_replay.loading = true;
+        self.can_replay.load_progress_current = 0;
+        self.can_replay.load_progress_total = None;
         let dsn = self.can_replay.pg_dsn.clone();
         let mode = self.can_replay.mode;
+        let downsampling_enabled = self.can_replay.downsampling_enabled;
         self.can_replay.status = self.can_replay.mode.load_status().to_string();
         let tx = self.ui_tx.clone();
         thread::spawn(move || {
+            let progress_tx = tx.clone();
             let result = (|| -> Result<CanReplayData, String> {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -172,6 +188,39 @@ impl UiClientApp {
                     });
 
                     let axes = mode.axis_filters();
+                    let count_row = client
+                        .query_one(
+                            "SELECT
+                               (SELECT COUNT(*)
+                                  FROM telemetry_samples
+                                 WHERE device_id LIKE 'can://%'
+                                   AND ts_ms >= $1
+                                   AND ts_ms <= $2
+                                   AND axis IN ($3, $4, $5, $6, $7)),
+                               (SELECT COUNT(*)
+                                  FROM alarm_events
+                                 WHERE ts_ms >= $1
+                                   AND ts_ms <= $2
+                                   AND (alarm_id LIKE 'can_%' OR alarm_id LIKE 'sent_%'))",
+                            &[
+                                &start_ts_ms as &(dyn tokio_postgres::types::ToSql + Sync),
+                                &end_ts_ms,
+                                &axes[0],
+                                &axes[1],
+                                &axes[2],
+                                &axes[3],
+                                &axes[4],
+                            ],
+                        )
+                        .await
+                        .map_err(|err| format!("count replay rows failed: {err}"))?;
+                    let telemetry_count: i64 = count_row.get(0);
+                    let alarm_count: i64 = count_row.get(1);
+                    let total_rows = u64::try_from(telemetry_count.max(0))
+                        .unwrap_or(0)
+                        .saturating_add(u64::try_from(alarm_count.max(0)).unwrap_or(0));
+                    let _ = progress_tx.try_send(UiMsg::CanReplayProgress(mode, 0, total_rows));
+
                     let rows = client
                         .query_raw(
                             "SELECT ts_ms, axis, value
@@ -201,9 +250,11 @@ impl UiClientApp {
                             start_ts_ms,
                             end_ts_ms,
                             CAN_REPLAY_MAX_POINTS_PER_SERIES,
+                            downsampling_enabled,
                         )
                     });
                     let mut raw_point_count = 0usize;
+                    let mut processed_rows = 0u64;
                     while let Some(row) = rows
                         .try_next()
                         .await
@@ -217,6 +268,14 @@ impl UiClientApp {
                         {
                             samplers[axis_index].push(ts_ms, value);
                             raw_point_count = raw_point_count.saturating_add(1);
+                        }
+                        processed_rows = processed_rows.saturating_add(1);
+                        if processed_rows % CAN_REPLAY_PROGRESS_REPORT_INTERVAL == 0 {
+                            let _ = progress_tx.try_send(UiMsg::CanReplayProgress(
+                                mode,
+                                processed_rows,
+                                total_rows,
+                            ));
                         }
                     }
 
@@ -314,7 +373,18 @@ impl UiClientApp {
                                 }
                             }
                         }
+                        processed_rows = processed_rows.saturating_add(1);
+                        if processed_rows % CAN_REPLAY_PROGRESS_REPORT_INTERVAL == 0 {
+                            let _ = progress_tx.try_send(UiMsg::CanReplayProgress(
+                                mode,
+                                processed_rows,
+                                total_rows,
+                            ));
+                        }
                     }
+
+                    let _ = progress_tx
+                        .try_send(UiMsg::CanReplayProgress(mode, total_rows, total_rows));
 
                     Ok(data)
                 })
@@ -662,7 +732,60 @@ impl UiClientApp {
                     }
                     ui.separator();
                     ui.toggle_value(&mut self.can_replay.show_alarm_points, "报警点");
+                    ui.separator();
+                    let changed = ui
+                        .add_enabled_ui(!self.can_replay.loading, |ui| {
+                            ui.checkbox(
+                                &mut self.can_replay.downsampling_enabled,
+                                format!(
+                                    "回放降采样（每路最多 {} 点）",
+                                    CAN_REPLAY_MAX_POINTS_PER_SERIES
+                                ),
+                            )
+                        })
+                        .inner
+                        .changed();
+                    if changed {
+                        self.can_replay.data = None;
+                        self.can_replay.plot_rect = None;
+                        self.can_replay.status = "降采样设置已更改，请重新加载回放".to_string();
+                    }
                 });
+
+                if !self.can_replay.downsampling_enabled {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "回放降采样已关闭：将加载全部原始点，较大时间范围可能占用大量内存",
+                    );
+                }
+
+                if self.can_replay.loading {
+                    match self.can_replay.load_progress_total {
+                        Some(total) if total > 0 => {
+                            let current = self.can_replay.load_progress_current.min(total);
+                            let progress = current as f32 / total as f32;
+                            ui.add(
+                                egui::ProgressBar::new(progress)
+                                    .show_percentage()
+                                    .text(format!("已处理 {current} / {total} 条记录")),
+                            );
+                        }
+                        Some(_) => {
+                            ui.add(
+                                egui::ProgressBar::new(1.0)
+                                    .show_percentage()
+                                    .text("没有匹配的回放记录"),
+                            );
+                        }
+                        None => {
+                            ui.add(
+                                egui::ProgressBar::new(0.0)
+                                    .animate(true)
+                                    .text("正在统计回放记录..."),
+                            );
+                        }
+                    }
+                }
 
                 ui.label(&self.can_replay.status);
                 ui.small("支持 ts_ms，或 YYYY-MM-DD HH:MM:SS");
@@ -706,7 +829,7 @@ mod tests {
     #[test]
     fn replay_sampler_bounds_output_and_keeps_extrema() {
         let max_points = 100;
-        let mut sampler = ReplaySeriesSampler::new(0, 10_000, max_points);
+        let mut sampler = ReplaySeriesSampler::new(0, 10_000, max_points, true);
         for ts_ms in 0..10_000 {
             let value = match ts_ms {
                 3_211 => 500.0,
@@ -728,7 +851,7 @@ mod tests {
     fn replay_sampler_leaves_small_series_unchanged() {
         // Even if the selected replay window is much wider than the actual
         // burst, a series below the cap must not be collapsed into one bucket.
-        let mut sampler = ReplaySeriesSampler::new(1_000, 1_000_000, 20);
+        let mut sampler = ReplaySeriesSampler::new(1_000, 1_000_000, 20, true);
         sampler.push(1_000, 1.0);
         sampler.push(1_001, 2.0);
         sampler.push(1_002, 3.0);
@@ -739,5 +862,18 @@ mod tests {
         assert_eq!((points[0].x, points[0].y), (0.0, 1.0));
         assert_eq!((points[1].x, points[1].y), (0.001, 2.0));
         assert_eq!((points[2].x, points[2].y), (0.002, 3.0));
+    }
+
+    #[test]
+    fn replay_sampler_keeps_all_points_when_disabled() {
+        let mut sampler = ReplaySeriesSampler::new(0, 10_000, 20, false);
+        for ts_ms in 0..1_000 {
+            sampler.push(ts_ms, ts_ms as f64);
+        }
+
+        let points = sampler.finish();
+
+        assert_eq!(points.len(), 1_000);
+        assert_eq!((points[321].x, points[321].y), (0.321, 321.0));
     }
 }
