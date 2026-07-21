@@ -148,6 +148,12 @@ can_channel = 0
 can_baud_kbps = 500
 can_data_baud_kbps = 2000
 can_channels = [0, 1, 2, 3]
+can_signal_watchdog_enabled = true
+can_signal_timeout_ms = 2000
+can_signal_watchdogs = [
+  { channel = 0, can_id = 1, label = "SENT T2/S" },
+  { channel = 1, can_id = 2, label = "SENT T1" },
+]
 
 db_filter_enabled = false
 db_filter_order = 10
@@ -185,6 +191,7 @@ CAN SENT 原始值在 `src/ingress/can.rs` 的 `decode_sent_values` 中解析为
 - `DEMO2_COLLECTOR_CAN_ENABLED` / `DEMO2_COLLECTOR_CAN_CHANNEL` / `DEMO2_COLLECTOR_CAN_CHANNELS` / `DEMO2_COLLECTOR_CAN_HW_NAME` / `DEMO2_COLLECTOR_CAN_HW_SUBTYPE`：覆盖 CAN 接入。TC1016 的 subtype 为 `11`。
 - `DEMO2_COLLECTOR_CAN_TSMASTER_BIN` / `DEMO2_COLLECTOR_CAN_AUTOSTART_TSMASTER`：配置 TSMaster 启动。
 - `DEMO2_COLLECTOR_CAN_BAUD_KBPS` / `DEMO2_COLLECTOR_CAN_DATA_BAUD_KBPS`：覆盖 CAN 仲裁/数据波特率。
+- `DEMO2_CAN_SIGNAL_WATCHDOG_ENABLED` / `DEMO2_CAN_SIGNAL_TIMEOUT_MS`：启用 CAN 信号中断看门狗并覆盖超时时间。`can_signal_watchdogs` 留空时按每个启用 Channel 监控任意成功解析的信号帧；配置目标后按 `Channel + CAN ID` 独立监控。
 - `DEMO2_SENT_FILTER_ENABLED` / `DEMO2_SENT_FILTER_WINDOW`：覆盖 SENT 滤波配置。
 - `DEMO2_UI_FEED_ADDR`：覆盖 UI 客户端连接的 feed 地址。
 - `DEMO2_UI_EMBED_COLLECTOR=1`：让 `ui_client` 启动内嵌 collector；优先级高于 `config.toml` 中的 `[ui].embed_collector`。

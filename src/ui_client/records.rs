@@ -100,6 +100,7 @@ impl UiClientApp {
         let has_selected_group = self.alarm_records.show_can_x
             || self.alarm_records.show_can_y
             || self.alarm_records.show_can_z
+            || self.alarm_records.show_can_timeout
             || self.alarm_records.show_sent_t1
             || self.alarm_records.show_sent_t2
             || self.alarm_records.show_sent_s;
@@ -119,6 +120,7 @@ impl UiClientApp {
         let show_can_x = self.alarm_records.show_can_x;
         let show_can_y = self.alarm_records.show_can_y;
         let show_can_z = self.alarm_records.show_can_z;
+        let show_can_timeout = self.alarm_records.show_can_timeout;
         let show_sent_t1 = self.alarm_records.show_sent_t1;
         let show_sent_t2 = self.alarm_records.show_sent_t2;
         let show_sent_s = self.alarm_records.show_sent_s;
@@ -145,15 +147,17 @@ impl UiClientApp {
                                AND (($3 AND alarm_id IN ('can_x_h', 'can_x_l'))
                                  OR ($4 AND alarm_id IN ('can_y_h', 'can_y_l'))
                                  OR ($5 AND alarm_id IN ('can_z_h', 'can_z_l'))
-                                 OR ($6 AND (alarm_id IN ('sent_torque_jump_t1', 'sent_angle_jump_t1') OR message LIKE '%t1=1%'))
-                                 OR ($7 AND (alarm_id IN ('sent_torque_jump_t2', 'sent_angle_jump_t2') OR message LIKE '%t2=1%'))
-                                 OR ($8 AND (alarm_id = 'sent_angle_jump_s' OR message LIKE '%s=1%')))",
+                                 OR ($6 AND alarm_id LIKE 'can_signal_timeout_%')
+                                 OR ($7 AND (alarm_id IN ('sent_torque_jump_t1', 'sent_angle_jump_t1') OR message LIKE '%t1=1%'))
+                                 OR ($8 AND (alarm_id IN ('sent_torque_jump_t2', 'sent_angle_jump_t2') OR message LIKE '%t2=1%'))
+                                 OR ($9 AND (alarm_id = 'sent_angle_jump_s' OR message LIKE '%s=1%')))",
                             &[
                                 &start_ts_ms,
                                 &end_ts_ms,
                                 &show_can_x,
                                 &show_can_y,
                                 &show_can_z,
+                                &show_can_timeout,
                                 &show_sent_t1,
                                 &show_sent_t2,
                                 &show_sent_s,
@@ -172,17 +176,19 @@ impl UiClientApp {
                                AND (($3 AND alarm_id IN ('can_x_h', 'can_x_l'))
                                  OR ($4 AND alarm_id IN ('can_y_h', 'can_y_l'))
                                  OR ($5 AND alarm_id IN ('can_z_h', 'can_z_l'))
-                                 OR ($6 AND (alarm_id IN ('sent_torque_jump_t1', 'sent_angle_jump_t1') OR message LIKE '%t1=1%'))
-                                 OR ($7 AND (alarm_id IN ('sent_torque_jump_t2', 'sent_angle_jump_t2') OR message LIKE '%t2=1%'))
-                                 OR ($8 AND (alarm_id = 'sent_angle_jump_s' OR message LIKE '%s=1%')))
+                                 OR ($6 AND alarm_id LIKE 'can_signal_timeout_%')
+                                 OR ($7 AND (alarm_id IN ('sent_torque_jump_t1', 'sent_angle_jump_t1') OR message LIKE '%t1=1%'))
+                                 OR ($8 AND (alarm_id IN ('sent_torque_jump_t2', 'sent_angle_jump_t2') OR message LIKE '%t2=1%'))
+                                 OR ($9 AND (alarm_id = 'sent_angle_jump_s' OR message LIKE '%s=1%')))
                              ORDER BY ts_ms ASC, id ASC
-                             LIMIT $9 OFFSET $10",
+                             LIMIT $10 OFFSET $11",
                             &[
                                 &start_ts_ms,
                                 &end_ts_ms,
                                 &show_can_x,
                                 &show_can_y,
                                 &show_can_z,
+                                &show_can_timeout,
                                 &show_sent_t1,
                                 &show_sent_t2,
                                 &show_sent_s,
@@ -224,6 +230,10 @@ impl UiClientApp {
         row.alarm_id.starts_with(&format!("can_{axis}_"))
     }
 
+    pub(crate) fn alarm_record_matches_can_timeout(row: &AlarmRecordRow) -> bool {
+        row.alarm_id.starts_with("can_signal_timeout_")
+    }
+
     pub(crate) fn alarm_record_matches_sent_part(row: &AlarmRecordRow, part: &str) -> bool {
         match part {
             "t1" => row.alarm_id.ends_with("_t1") || row.message.contains("t1=1"),
@@ -243,6 +253,9 @@ impl UiClientApp {
         }
         if Self::alarm_record_matches_can_axis(row, "z") {
             groups.push("CAN Z");
+        }
+        if Self::alarm_record_matches_can_timeout(row) {
+            groups.push("CAN Timeout");
         }
         if Self::alarm_record_matches_sent_part(row, "t1") {
             groups.push("SENT T1");
@@ -320,6 +333,7 @@ impl UiClientApp {
                     ui.toggle_value(&mut self.alarm_records.show_can_x, "CAN X");
                     ui.toggle_value(&mut self.alarm_records.show_can_y, "CAN Y");
                     ui.toggle_value(&mut self.alarm_records.show_can_z, "CAN Z");
+                    ui.toggle_value(&mut self.alarm_records.show_can_timeout, "CAN Timeout");
                     ui.separator();
                     ui.toggle_value(&mut self.alarm_records.show_sent_t1, "SENT T1");
                     ui.toggle_value(&mut self.alarm_records.show_sent_t2, "SENT T2");

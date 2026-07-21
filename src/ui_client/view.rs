@@ -521,6 +521,66 @@ impl UiClientApp {
             });
     }
 
+    pub(crate) fn draw_sent_frame_gap_threshold_panel(&mut self, ctx: &egui::Context) {
+        if self.selected_view != TestSignalView::Sent {
+            return;
+        }
+
+        egui::Window::new("SENT Frame Gap Threshold")
+            .title_bar(true)
+            .resizable(false)
+            .collapsible(false)
+            .default_pos(egui::pos2(940.0, 542.0))
+            .fixed_size(egui::vec2(320.0, 176.0))
+            .show(ctx, |ui| {
+                ui.heading("SENT frame gap threshold (us)");
+                ui.add_space(6.0);
+                egui::Grid::new("sent_frame_gap_threshold_grid")
+                    .num_columns(2)
+                    .spacing(egui::vec2(8.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.label("T1 >");
+                        ui.add(
+                            egui::TextEdit::singleline(
+                                &mut self.sent_frame_gap_thresholds.t1_us_input,
+                            )
+                            .desired_width(96.0),
+                        );
+                        ui.end_row();
+
+                        ui.label("T2 >");
+                        ui.add(
+                            egui::TextEdit::singleline(
+                                &mut self.sent_frame_gap_thresholds.t2_us_input,
+                            )
+                            .desired_width(96.0),
+                        );
+                        ui.end_row();
+
+                        ui.label("S >");
+                        ui.add(
+                            egui::TextEdit::singleline(
+                                &mut self.sent_frame_gap_thresholds.s_us_input,
+                            )
+                            .desired_width(96.0),
+                        );
+                        ui.end_row();
+                    });
+
+                ui.add_space(8.0);
+                if ui.button("Apply").clicked() {
+                    self.status = match self.apply_sent_frame_gap_thresholds() {
+                        Ok(()) => "SENT frame gap thresholds applied".to_string(),
+                        Err(err) => format!("SENT frame gap threshold error: {err}"),
+                    };
+                }
+                let (t1_us, t2_us, s_us) = self.sent_frame_gap_thresholds();
+                ui.small(format!(
+                    "current: T1 > {t1_us} us, T2 > {t2_us} us, S > {s_us} us"
+                ));
+            });
+    }
+
     pub(crate) fn draw_can_threshold_panel(&mut self, ctx: &egui::Context) {
         if self.selected_view != TestSignalView::CanFrame {
             return;
@@ -591,10 +651,83 @@ impl UiClientApp {
     }
 
     pub(crate) fn clear_alarm_panel_stats(&mut self) {
-        self.active_alarms.clear();
         self.alarm_history.clear();
         self.total_alarm_count = 0;
-        self.status = "报警面板和报警统计已清除".to_string();
+        self.status = "报警历史和报警统计已清除；活跃报警保持显示".to_string();
+    }
+
+    fn can_signal_alarm_channels(&self) -> Vec<u8> {
+        let mut channels = std::collections::BTreeSet::new();
+        channels.extend(self.can_channel_last_seen.keys().copied());
+        for item in self.active_alarms.values().chain(self.alarm_history.iter()) {
+            if Self::is_can_signal_timeout(&item.event)
+                && let Some(channel) = Self::can_channel_from_device_id(&item.event.device_id)
+            {
+                channels.insert(channel);
+            }
+        }
+        channels
+            .into_iter()
+            .filter(|channel| !self.dismissed_can_channels.contains(channel))
+            .collect()
+    }
+
+    fn draw_can_signal_alarm_cards(&mut self, ui: &mut egui::Ui) {
+        let channels = self.can_signal_alarm_channels();
+        if channels.is_empty() {
+            return;
+        }
+
+        ui.separator();
+        ui.label(egui::RichText::new("CAN Channel 信号状态").strong());
+        ui.vertical(|ui| {
+            for channel in channels {
+                let active = self
+                    .active_alarms
+                    .iter()
+                    .filter(|(_, item)| {
+                        Self::is_can_signal_timeout(&item.event)
+                            && Self::can_channel_from_device_id(&item.event.device_id)
+                                == Some(channel)
+                    })
+                    .map(|(key, item)| (key.clone(), item.event.clone()))
+                    .collect::<Vec<_>>();
+                let has_unacknowledged = active
+                    .iter()
+                    .any(|(key, _)| !self.acknowledged_alarms.contains(key));
+                let (state, color) = if active.is_empty() {
+                    ("正常", egui::Color32::from_rgb(64, 170, 92))
+                } else if has_unacknowledged {
+                    ("信号中断（未确认）", egui::Color32::from_rgb(235, 64, 52))
+                } else {
+                    ("信号中断（已确认）", egui::Color32::from_rgb(255, 180, 0))
+                };
+                let last_seen = self
+                    .can_channel_last_seen
+                    .get(&channel)
+                    .map(|seen| format!("最近 UI 样本：{:.1} 秒前", seen.elapsed().as_secs_f32()))
+                    .unwrap_or_else(|| "最近 UI 样本：尚未收到".to_string());
+
+                ui.group(|ui| {
+                    ui.set_min_width(250.0);
+                    ui.horizontal(|ui| {
+                        ui.heading(format!("Channel {channel}"));
+                        ui.colored_label(color, egui::RichText::new(state).strong());
+                    });
+                    ui.small(last_seen);
+                    if active.is_empty() {
+                        ui.colored_label(color, "目标信号工作正常");
+                    } else {
+                        for (_, event) in &active {
+                            ui.colored_label(color, &event.message);
+                        }
+                        if has_unacknowledged && ui.button("确认本 Channel 报警").clicked() {
+                            self.dismiss_channel_alarms(channel);
+                        }
+                    }
+                });
+            }
+        });
     }
 
     pub(crate) fn draw_alarm_panel(&mut self, ctx: &egui::Context) {
@@ -606,7 +739,11 @@ impl UiClientApp {
                 ui.horizontal(|ui| {
                     ui.label(format!("报警次数: {}", self.total_alarm_count));
                     ui.separator();
-                    if ui.button("清除报警").clicked() {
+                    if ui.button("确认全部活跃报警").clicked() {
+                        self.acknowledge_all_alarms();
+                    }
+                    ui.separator();
+                    if ui.button("清空报警历史").clicked() {
                         self.clear_alarm_panel_stats();
                     }
                     ui.separator();
@@ -619,6 +756,8 @@ impl UiClientApp {
                     ui.label(format!("最近记录: {}", self.alarm_history.len()));
                 });
 
+                ui.add_space(6.0);
+                self.draw_can_signal_alarm_cards(ui);
                 ui.add_space(6.0);
                 ui.columns(2, |columns| {
                     columns[0].group(|ui| {
@@ -647,6 +786,16 @@ impl UiClientApp {
                                                     .monospace()
                                                     .color(level_color),
                                             );
+                                            if Self::is_can_signal_timeout(&item.event) {
+                                                let key = Self::alarm_key(&item.event);
+                                                ui.label(
+                                                    if self.acknowledged_alarms.contains(&key) {
+                                                        "已确认"
+                                                    } else {
+                                                        "未确认"
+                                                    },
+                                                );
+                                            }
                                         });
                                         ui.colored_label(level_color, &item.event.message);
                                         ui.separator();
@@ -696,6 +845,15 @@ impl UiClientApp {
     }
 
     pub(crate) fn push_dynamic_window(&mut self, title: String, binding: Option<SignalBinding>) {
+        self.push_dynamic_window_for_device(title, binding, None);
+    }
+
+    fn push_dynamic_window_for_device(
+        &mut self,
+        title: String,
+        binding: Option<SignalBinding>,
+        device_id: Option<String>,
+    ) {
         let position = egui::pos2(
             120.0 + self.dynamic_windows.len() as f32 * 28.0,
             120.0 + self.dynamic_windows.len() as f32 * 24.0,
@@ -703,10 +861,44 @@ impl UiClientApp {
         self.dynamic_windows.push(DynamicSignalWindow {
             title,
             binding,
+            device_id,
             position,
             scale: 1.0,
             rect: None,
         });
+    }
+
+    pub(crate) fn ensure_can_sent_window(&mut self, device_id: &str, sensor_id: usize) {
+        if self.selected_view != TestSignalView::Sent {
+            self.selected_view = TestSignalView::Sent;
+            self.dynamic_windows.clear();
+        }
+        let binding = match sensor_id {
+            0 => SignalBinding::Sent1V1,
+            1 => SignalBinding::Sent1P1,
+            2 => SignalBinding::Sent2V2,
+            3 => SignalBinding::Sent2P2,
+            4 => SignalBinding::Sent3Angle,
+            _ => return,
+        };
+        if self.dynamic_windows.iter().any(|window| {
+            window.device_id.as_deref() == Some(device_id) && window.binding == Some(binding)
+        }) {
+            return;
+        }
+
+        let channel_label = Self::can_channel_from_device_id(device_id)
+            .map(|channel| format!("ch{channel}"))
+            .unwrap_or_else(|| device_id.to_string());
+        self.can_sent_sensors
+            .entry((device_id.to_string(), binding.sensor_id()))
+            .or_insert_with(SensorSeries::new);
+        self.push_dynamic_window_for_device(
+            format!("{}_{}", channel_label, binding.title(1)),
+            Some(binding),
+            Some(device_id.to_string()),
+        );
+        self.reset_layout();
     }
 
     pub(crate) fn add_dynamic_window(&mut self) {
@@ -1007,6 +1199,9 @@ impl eframe::App for UiClientApp {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.heading("UI Client");
             ui.label(format!("collector feed: {}", self.feed_addr));
+            if let Some(error) = &self.config_error {
+                ui.colored_label(egui::Color32::RED, error);
+            }
             ui.label("serial data path: serial -> collector_service -> ui_client");
             ui.horizontal(|ui| {
                 if ui.button("重排窗口并重置缩放").clicked() {
@@ -1061,6 +1256,7 @@ impl eframe::App for UiClientApp {
         self.draw_sent_jump_threshold_panel(ctx);
         self.draw_sent_angle_jump_indicator(ctx);
         self.draw_sent_angle_jump_threshold_panel(ctx);
+        self.draw_sent_frame_gap_threshold_panel(ctx);
         self.draw_can_alarm_indicator(ctx);
         self.draw_can_threshold_panel(ctx);
         self.draw_can_replay_window(ctx);
@@ -1070,6 +1266,7 @@ impl eframe::App for UiClientApp {
         for idx in 0..self.dynamic_windows.len() {
             let title = self.dynamic_windows[idx].title.clone();
             let binding = self.dynamic_windows[idx].binding;
+            let window_device_id = self.dynamic_windows[idx].device_id.clone();
             let start_pos = self.dynamic_windows[idx].position;
             let scale = self.dynamic_windows[idx].scale;
             let id = egui::Id::new(format!("dynamic_signal_window_{idx}"));
@@ -1094,7 +1291,11 @@ impl eframe::App for UiClientApp {
                             return;
                         }
                         let raw_signal_id = format!("sensor_{sensor_id}_raw");
-                        let series = if binding.uses_tcp_series() {
+                        let series = if let Some(device_id) = window_device_id.as_ref() {
+                            self.can_sent_sensors
+                                .get(&(device_id.clone(), sensor_id))
+                                .unwrap_or(&self.sensors[sensor_id])
+                        } else if binding.uses_tcp_series() {
                             &self.tcp_sensors[sensor_id]
                         } else {
                             &self.sensors[sensor_id]

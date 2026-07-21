@@ -11,7 +11,7 @@ pub(crate) enum TestSignalView {
     TcpFrame,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SignalBinding {
     DemoAxisX,
     DemoAxisY,
@@ -108,6 +108,7 @@ impl SignalBinding {
 pub(crate) struct DynamicSignalWindow {
     pub(crate) title: String,
     pub(crate) binding: Option<SignalBinding>,
+    pub(crate) device_id: Option<String>,
     pub(crate) position: egui::Pos2,
     pub(crate) scale: f32,
     pub(crate) rect: Option<egui::Rect>,
@@ -195,6 +196,29 @@ impl Default for SentAngleJumpThresholds {
             t1_red_applied: "0.2".to_string(),
             t2_red_applied: "0.2".to_string(),
             s_red_applied: "1.0".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SentFrameGapThresholds {
+    pub(crate) t1_us_input: String,
+    pub(crate) t2_us_input: String,
+    pub(crate) s_us_input: String,
+    pub(crate) t1_us_applied: String,
+    pub(crate) t2_us_applied: String,
+    pub(crate) s_us_applied: String,
+}
+
+impl Default for SentFrameGapThresholds {
+    fn default() -> Self {
+        Self {
+            t1_us_input: "1500".to_string(),
+            t2_us_input: "3000".to_string(),
+            s_us_input: "1500".to_string(),
+            t1_us_applied: "1500".to_string(),
+            t2_us_applied: "3000".to_string(),
+            s_us_applied: "1500".to_string(),
         }
     }
 }
@@ -388,6 +412,7 @@ pub(crate) struct AlarmRecordState {
     pub(crate) show_can_x: bool,
     pub(crate) show_can_y: bool,
     pub(crate) show_can_z: bool,
+    pub(crate) show_can_timeout: bool,
     pub(crate) show_sent_t1: bool,
     pub(crate) show_sent_t2: bool,
     pub(crate) show_sent_s: bool,
@@ -408,6 +433,7 @@ impl AlarmRecordState {
             show_can_x: true,
             show_can_y: true,
             show_can_z: true,
+            show_can_timeout: true,
             show_sent_t1: true,
             show_sent_t2: true,
             show_sent_s: true,

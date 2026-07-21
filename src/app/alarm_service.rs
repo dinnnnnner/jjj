@@ -15,6 +15,9 @@ const DEFAULT_SENT_TORQUE_PURPLE: f64 = 0.4;
 const DEFAULT_SENT_T1_ANGLE_RED: f64 = 0.2;
 const DEFAULT_SENT_T2_ANGLE_RED: f64 = 0.2;
 const DEFAULT_SENT_S_ANGLE_RED: f64 = 1.0;
+const DEFAULT_SENT_T1_FRAME_GAP_US: u64 = 1_500;
+const DEFAULT_SENT_T2_FRAME_GAP_US: u64 = 3_000;
+const DEFAULT_SENT_S_FRAME_GAP_US: u64 = 1_500;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SentJumpAlarmConfig {
@@ -67,6 +70,32 @@ impl SentJumpAlarmConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SentFrameGapAlarmConfig {
+    pub t1_us: u64,
+    pub t2_us: u64,
+    pub s_us: u64,
+}
+
+impl Default for SentFrameGapAlarmConfig {
+    fn default() -> Self {
+        Self {
+            t1_us: DEFAULT_SENT_T1_FRAME_GAP_US,
+            t2_us: DEFAULT_SENT_T2_FRAME_GAP_US,
+            s_us: DEFAULT_SENT_S_FRAME_GAP_US,
+        }
+    }
+}
+
+impl SentFrameGapAlarmConfig {
+    fn validated(self) -> Result<Self, &'static str> {
+        if self.t1_us == 0 || self.t2_us == 0 || self.s_us == 0 {
+            return Err("SENT frame gap thresholds must be greater than zero");
+        }
+        Ok(self)
+    }
+}
+
 /// Per-sensor threshold rule.
 ///
 /// - high/high_clear: raise high alarm when value >= high, clear when value <= high_clear.
@@ -105,13 +134,66 @@ pub struct AlarmService {
     states: Arc<RwLock<HashMap<(String, usize), SensorAlarmState>>>,
     sent_torque_states: Arc<RwLock<HashMap<(String, usize), SentTorqueJumpState>>>,
     sent_angle_states: Arc<RwLock<HashMap<(String, usize), SentAngleJumpState>>>,
+    sent_frame_gap_states: Arc<RwLock<HashMap<(String, SentFrameGapSignal), SentFrameGapState>>>,
     sent_jump_config: Arc<RwLock<SentJumpAlarmConfig>>,
+    sent_frame_gap_config: Arc<RwLock<SentFrameGapAlarmConfig>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct SensorAlarmState {
     high_active: bool,
     low_active: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum SentFrameGapSignal {
+    T1,
+    T2,
+    S,
+}
+
+impl SentFrameGapSignal {
+    fn from_sample(source_kind: TelemetrySourceKind, sensor_id: usize) -> Option<Self> {
+        if source_kind != TelemetrySourceKind::CanSent {
+            return None;
+        }
+        match sensor_id {
+            0 => Some(Self::T1),
+            2 => Some(Self::T2),
+            4 => Some(Self::S),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::T1 => "T1",
+            Self::T2 => "T2",
+            Self::S => "S",
+        }
+    }
+
+    fn alarm_id(self) -> &'static str {
+        match self {
+            Self::T1 => "sent_frame_gap_t1",
+            Self::T2 => "sent_frame_gap_t2",
+            Self::S => "sent_frame_gap_s",
+        }
+    }
+
+    fn threshold_us(self, config: SentFrameGapAlarmConfig) -> u64 {
+        match self {
+            Self::T1 => config.t1_us,
+            Self::T2 => config.t2_us,
+            Self::S => config.s_us,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SentFrameGapState {
+    last_t_sec: Option<f64>,
+    alarm_active: bool,
 }
 
 impl AlarmService {
@@ -122,7 +204,9 @@ impl AlarmService {
             states: Arc::new(RwLock::new(HashMap::new())),
             sent_torque_states: Arc::new(RwLock::new(HashMap::new())),
             sent_angle_states: Arc::new(RwLock::new(HashMap::new())),
+            sent_frame_gap_states: Arc::new(RwLock::new(HashMap::new())),
             sent_jump_config: Arc::new(RwLock::new(SentJumpAlarmConfig::default())),
+            sent_frame_gap_config: Arc::new(RwLock::new(SentFrameGapAlarmConfig::default())),
         }
     }
 
@@ -148,16 +232,91 @@ impl AlarmService {
             .unwrap_or_default()
     }
 
+    pub fn set_sent_frame_gap_config(
+        &self,
+        config: SentFrameGapAlarmConfig,
+    ) -> Result<(), &'static str> {
+        let config = config.validated()?;
+        if let Ok(mut current) = self.sent_frame_gap_config.write() {
+            *current = config;
+        }
+        Ok(())
+    }
+
+    pub fn sent_frame_gap_config(&self) -> SentFrameGapAlarmConfig {
+        self.sent_frame_gap_config
+            .read()
+            .map(|config| *config)
+            .unwrap_or_default()
+    }
+
     /// Evaluate one telemetry sample.
     pub fn evaluate_sample(
         &self,
         device_id: &str,
         sensor_id: usize,
+        t_sec: f64,
         value: f64,
         source_kind: TelemetrySourceKind,
     ) {
         self.evaluate_rule_sample(device_id, sensor_id, value);
         self.evaluate_sent_jump_sample(device_id, sensor_id, value, source_kind);
+        self.evaluate_sent_frame_gap(device_id, sensor_id, t_sec, source_kind);
+    }
+
+    fn evaluate_sent_frame_gap(
+        &self,
+        device_id: &str,
+        sensor_id: usize,
+        t_sec: f64,
+        source_kind: TelemetrySourceKind,
+    ) {
+        let Some(signal) = SentFrameGapSignal::from_sample(source_kind, sensor_id) else {
+            return;
+        };
+        if !t_sec.is_finite() {
+            return;
+        }
+
+        let threshold_us = signal.threshold_us(self.sent_frame_gap_config());
+        let key = (device_id.to_string(), signal);
+        let mut event = None;
+        if let Ok(mut states) = self.sent_frame_gap_states.write() {
+            let state = states.entry(key).or_default();
+            let previous_t_sec = state.last_t_sec.replace(t_sec);
+            let Some(previous_t_sec) = previous_t_sec else {
+                return;
+            };
+            if t_sec < previous_t_sec {
+                return;
+            }
+
+            let gap_us = ((t_sec - previous_t_sec) * 1_000_000.0).round() as u64;
+            let alarm_active = gap_us > threshold_us;
+            if alarm_active == state.alarm_active {
+                return;
+            }
+
+            state.alarm_active = alarm_active;
+            let state_label = if alarm_active { "exceeded" } else { "restored" };
+            event = Some(AlarmEvent {
+                device_id: device_id.to_string(),
+                alarm_id: signal.alarm_id().to_string(),
+                level: AlarmLevel::Warning,
+                message: format!(
+                    "signal={}, frame_gap_us={}, threshold_us={}, state={state_label}",
+                    signal.label(),
+                    gap_us,
+                    threshold_us
+                ),
+                raised_at: SystemTime::now(),
+                cleared: !alarm_active,
+            });
+        }
+
+        if let Some(event) = event {
+            self.publish_alarm(event);
+        }
     }
 
     fn evaluate_rule_sample(&self, device_id: &str, sensor_id: usize, value: f64) {
@@ -403,15 +562,15 @@ mod tests {
             },
         );
 
-        service.evaluate_sample("dev1", 1, 11.0, TelemetrySourceKind::Unknown);
+        service.evaluate_sample("dev1", 1, 0.0, 11.0, TelemetrySourceKind::Unknown);
         let raised = next_alarm(&mut rx);
         assert_eq!(raised.alarm_id, "temperature_sensor_1_high");
         assert!(!raised.cleared);
 
-        service.evaluate_sample("dev1", 1, 9.0, TelemetrySourceKind::Unknown);
+        service.evaluate_sample("dev1", 1, 0.0, 9.0, TelemetrySourceKind::Unknown);
         assert!(rx.try_recv().is_err());
 
-        service.evaluate_sample("dev1", 1, 8.0, TelemetrySourceKind::Unknown);
+        service.evaluate_sample("dev1", 1, 0.0, 8.0, TelemetrySourceKind::Unknown);
         let cleared = next_alarm(&mut rx);
         assert_eq!(cleared.alarm_id, "temperature_sensor_1_high");
         assert!(cleared.cleared);
@@ -434,12 +593,12 @@ mod tests {
             },
         );
 
-        service.evaluate_sample("dev1", 2, -6.0, TelemetrySourceKind::Unknown);
-        service.evaluate_sample("dev2", 2, -6.0, TelemetrySourceKind::Unknown);
+        service.evaluate_sample("dev1", 2, 0.0, -6.0, TelemetrySourceKind::Unknown);
+        service.evaluate_sample("dev2", 2, 0.0, -6.0, TelemetrySourceKind::Unknown);
         assert_eq!(next_alarm(&mut rx).device_id, "dev1");
         assert_eq!(next_alarm(&mut rx).device_id, "dev2");
 
-        service.evaluate_sample("dev1", 2, -1.0, TelemetrySourceKind::Unknown);
+        service.evaluate_sample("dev1", 2, 0.0, -1.0, TelemetrySourceKind::Unknown);
         let cleared = next_alarm(&mut rx);
         assert_eq!(cleared.device_id, "dev1");
         assert!(cleared.cleared);
@@ -485,17 +644,50 @@ mod tests {
     }
 
     #[test]
+    fn sent_frame_gap_config_updates_and_rejects_zero() {
+        let service = AlarmService::new(EventBus::new(16));
+        assert_eq!(
+            service.sent_frame_gap_config(),
+            SentFrameGapAlarmConfig {
+                t1_us: 1_500,
+                t2_us: 3_000,
+                s_us: 1_500,
+            }
+        );
+
+        service
+            .set_sent_frame_gap_config(SentFrameGapAlarmConfig {
+                t1_us: 1_600,
+                t2_us: 3_200,
+                s_us: 1_700,
+            })
+            .unwrap();
+        assert_eq!(service.sent_frame_gap_config().t2_us, 3_200);
+
+        assert!(
+            service
+                .set_sent_frame_gap_config(SentFrameGapAlarmConfig {
+                    t1_us: 0,
+                    t2_us: 3_000,
+                    s_us: 1_500,
+                })
+                .is_err()
+        );
+        assert_eq!(service.sent_frame_gap_config().t1_us, 1_600);
+    }
+
+    #[test]
     fn sent_torque_jump_is_emitted_by_service() {
         let bus = EventBus::new(16);
         let mut rx = bus.subscribe();
         let service = AlarmService::new(bus);
 
         for _ in 0..10 {
-            service.evaluate_sample("dev1", 1, 1.0, TelemetrySourceKind::CanSent);
+            service.evaluate_sample("dev1", 1, 0.0, 1.0, TelemetrySourceKind::CanSent);
             assert!(rx.try_recv().is_err());
         }
 
-        service.evaluate_sample("dev1", 1, 1.35, TelemetrySourceKind::CanSent);
+        service.evaluate_sample("dev1", 1, 0.0, 1.35, TelemetrySourceKind::CanSent);
         let raised = next_alarm(&mut rx);
         assert_eq!(raised.alarm_id, "sent_torque_jump_t1");
         assert!(matches!(raised.level, AlarmLevel::Critical));
@@ -509,11 +701,11 @@ mod tests {
         let service = AlarmService::new(bus);
 
         for _ in 0..10 {
-            service.evaluate_sample("dev1", 4, 0.0, TelemetrySourceKind::CanSent);
+            service.evaluate_sample("dev1", 4, 0.0, 0.0, TelemetrySourceKind::CanSent);
             assert!(rx.try_recv().is_err());
         }
 
-        service.evaluate_sample("dev1", 4, 2.0, TelemetrySourceKind::CanSent);
+        service.evaluate_sample("dev1", 4, 0.0, 2.0, TelemetrySourceKind::CanSent);
         let raised = next_alarm(&mut rx);
         assert_eq!(raised.alarm_id, "sent_angle_jump_s");
         assert!(matches!(raised.level, AlarmLevel::Critical));
@@ -535,17 +727,63 @@ mod tests {
             .unwrap();
 
         for _ in 0..10 {
-            service.evaluate_sample("dev1", 0, 0.0, TelemetrySourceKind::CanSent);
-            service.evaluate_sample("dev1", 2, 0.0, TelemetrySourceKind::CanSent);
+            service.evaluate_sample("dev1", 0, 0.0, 0.0, TelemetrySourceKind::CanSent);
+            service.evaluate_sample("dev1", 2, 0.0, 0.0, TelemetrySourceKind::CanSent);
         }
         assert!(rx.try_recv().is_err());
 
-        service.evaluate_sample("dev1", 0, 0.5, TelemetrySourceKind::CanSent);
+        service.evaluate_sample("dev1", 0, 0.0, 0.5, TelemetrySourceKind::CanSent);
         let raised = next_alarm(&mut rx);
         assert_eq!(raised.alarm_id, "sent_angle_jump_t1");
         assert!(raised.message.contains("red=0.300"));
 
-        service.evaluate_sample("dev1", 2, 0.5, TelemetrySourceKind::CanSent);
+        service.evaluate_sample("dev1", 2, 0.0, 0.5, TelemetrySourceKind::CanSent);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn sent_frame_gap_uses_raw_telemetry_time_and_independent_thresholds() {
+        let bus = EventBus::new(16);
+        let mut rx = bus.subscribe();
+        let service = AlarmService::new(bus);
+
+        service.evaluate_sample("dev1", 0, 0.010_000, 0.0, TelemetrySourceKind::CanSent);
+        service.evaluate_sample("dev1", 0, 0.011_500, 0.0, TelemetrySourceKind::CanSent);
+        assert!(rx.try_recv().is_err());
+
+        service.evaluate_sample("dev1", 0, 0.013_001, 0.0, TelemetrySourceKind::CanSent);
+        let t1_raised = next_alarm(&mut rx);
+        assert_eq!(t1_raised.alarm_id, "sent_frame_gap_t1");
+        assert!(t1_raised.message.contains("frame_gap_us=1501"));
+        assert!(t1_raised.message.contains("threshold_us=1500"));
+        assert!(!t1_raised.cleared);
+
+        service.evaluate_sample("dev1", 0, 0.014_501, 0.0, TelemetrySourceKind::CanSent);
+        let t1_cleared = next_alarm(&mut rx);
+        assert_eq!(t1_cleared.alarm_id, "sent_frame_gap_t1");
+        assert!(t1_cleared.cleared);
+
+        service.evaluate_sample("dev1", 2, 0.020_000, 0.0, TelemetrySourceKind::CanSent);
+        service.evaluate_sample("dev1", 2, 0.023_001, 0.0, TelemetrySourceKind::CanSent);
+        assert_eq!(next_alarm(&mut rx).alarm_id, "sent_frame_gap_t2");
+
+        service.evaluate_sample("dev1", 4, 0.030_000, 0.0, TelemetrySourceKind::CanSent);
+        service.evaluate_sample("dev1", 4, 0.031_501, 0.0, TelemetrySourceKind::CanSent);
+        assert_eq!(next_alarm(&mut rx).alarm_id, "sent_frame_gap_s");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn sent_frame_gap_ignores_non_sent_and_duplicate_torque_samples() {
+        let bus = EventBus::new(16);
+        let mut rx = bus.subscribe();
+        let service = AlarmService::new(bus);
+
+        service.evaluate_sample("dev1", 0, 0.0, 0.0, TelemetrySourceKind::Unknown);
+        service.evaluate_sample("dev1", 0, 1.0, 0.0, TelemetrySourceKind::Unknown);
+        service.evaluate_sample("dev1", 1, 0.0, 0.0, TelemetrySourceKind::CanSent);
+        service.evaluate_sample("dev1", 1, 1.0, 0.0, TelemetrySourceKind::CanSent);
+
         assert!(rx.try_recv().is_err());
     }
 }

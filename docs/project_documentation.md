@@ -661,6 +661,12 @@ can_baud_kbps = 500
 can_data_baud_kbps = 2000
 can_channels = [0, 1, 2, 3]
 can_autostart_tsmaster = true
+can_signal_watchdog_enabled = true
+can_signal_timeout_ms = 2000
+can_signal_watchdogs = [
+  { channel = 0, can_id = 1, label = "SENT T2/S" },
+  { channel = 1, can_id = 2, label = "SENT T1" },
+]
 
 db_filter_enabled = false
 db_filter_order = 10
@@ -702,6 +708,8 @@ DEMO2_COLLECTOR_CAN_TSMASTER_BIN
 DEMO2_COLLECTOR_CAN_AUTOSTART_TSMASTER
 DEMO2_COLLECTOR_CAN_BAUD_KBPS
 DEMO2_COLLECTOR_CAN_DATA_BAUD_KBPS
+DEMO2_CAN_SIGNAL_WATCHDOG_ENABLED
+DEMO2_CAN_SIGNAL_TIMEOUT_MS
 DEMO2_SENT_FILTER_ENABLED
 DEMO2_SENT_FILTER_WINDOW
 ```

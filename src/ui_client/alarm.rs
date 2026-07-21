@@ -15,18 +15,23 @@ impl UiClientApp {
     pub(crate) fn apply_alarm(&mut self, alarm: AlarmEvent) {
         let key = Self::alarm_key(&alarm);
         let received_at = Instant::now();
-        self.total_alarm_count = self.total_alarm_count.saturating_add(1);
 
         if alarm.cleared {
             self.active_alarms.remove(&key);
+            self.acknowledged_alarms.remove(&key);
         } else {
+            let is_new = !self.active_alarms.contains_key(&key);
             self.active_alarms.insert(
-                key,
+                key.clone(),
                 AlarmViewItem {
                     event: alarm.clone(),
                     received_at,
                 },
             );
+            if is_new {
+                self.total_alarm_count = self.total_alarm_count.saturating_add(1);
+                self.acknowledged_alarms.remove(&key);
+            }
         }
 
         self.alarm_history.push_front(AlarmViewItem {
@@ -36,6 +41,38 @@ impl UiClientApp {
         while self.alarm_history.len() > Self::MAX_ALARM_HISTORY {
             self.alarm_history.pop_back();
         }
+    }
+
+    pub(crate) fn can_channel_from_device_id(device_id: &str) -> Option<u8> {
+        let (_, channel) = device_id.rsplit_once(":ch")?;
+        channel.parse().ok()
+    }
+
+    pub(crate) fn is_can_signal_timeout(event: &AlarmEvent) -> bool {
+        event.alarm_id.starts_with("can_signal_timeout_")
+            && Self::can_channel_from_device_id(&event.device_id).is_some()
+    }
+
+    pub(crate) fn dismiss_channel_alarms(&mut self, channel: u8) {
+        self.dismissed_can_channels.insert(channel);
+        let keys = self
+            .active_alarms
+            .iter()
+            .filter(|(_, item)| {
+                Self::is_can_signal_timeout(&item.event)
+                    && Self::can_channel_from_device_id(&item.event.device_id) == Some(channel)
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.active_alarms.remove(&key);
+            self.acknowledged_alarms.remove(&key);
+        }
+    }
+
+    pub(crate) fn acknowledge_all_alarms(&mut self) {
+        let keys = self.active_alarms.keys().cloned().collect::<Vec<_>>();
+        self.acknowledged_alarms.extend(keys);
     }
 
     pub(crate) fn parse_optional_threshold(text: &str) -> Option<f64> {
@@ -195,6 +232,55 @@ impl UiClientApp {
         Ok(())
     }
 
+    fn parse_frame_gap_threshold(text: &str, signal: &str) -> Result<u64, String> {
+        let trimmed = text.trim();
+        match trimmed.parse::<u64>() {
+            Ok(value) if value > 0 => Ok(value),
+            _ => Err(format!(
+                "{signal} frame gap threshold must be a positive integer"
+            )),
+        }
+    }
+
+    pub(crate) fn sent_frame_gap_thresholds(&self) -> (u64, u64, u64) {
+        let t1_us = self
+            .sent_frame_gap_thresholds
+            .t1_us_applied
+            .parse()
+            .unwrap_or(1_500);
+        let t2_us = self
+            .sent_frame_gap_thresholds
+            .t2_us_applied
+            .parse()
+            .unwrap_or(3_000);
+        let s_us = self
+            .sent_frame_gap_thresholds
+            .s_us_applied
+            .parse()
+            .unwrap_or(1_500);
+        (t1_us, t2_us, s_us)
+    }
+
+    pub(crate) fn apply_sent_frame_gap_thresholds(&mut self) -> Result<(), String> {
+        let t1_us =
+            Self::parse_frame_gap_threshold(&self.sent_frame_gap_thresholds.t1_us_input, "T1")?;
+        let t2_us =
+            Self::parse_frame_gap_threshold(&self.sent_frame_gap_thresholds.t2_us_input, "T2")?;
+        let s_us =
+            Self::parse_frame_gap_threshold(&self.sent_frame_gap_thresholds.s_us_input, "S")?;
+        let payload = serde_json::json!({
+            "type": "set_sent_frame_gap_thresholds",
+            "t1_us": t1_us,
+            "t2_us": t2_us,
+            "s_us": s_us,
+        });
+        self.send_control_command(payload)?;
+        self.sent_frame_gap_thresholds.t1_us_applied = t1_us.to_string();
+        self.sent_frame_gap_thresholds.t2_us_applied = t2_us.to_string();
+        self.sent_frame_gap_thresholds.s_us_applied = s_us.to_string();
+        Ok(())
+    }
+
     fn push_sent_jump_thresholds_to_collector(
         &self,
         torque_warn: f64,
@@ -213,6 +299,10 @@ impl UiClientApp {
             "angle_t2_red": angle_t2_red,
             "angle_s_red": angle_s_red,
         });
+        self.send_control_command(payload)
+    }
+
+    fn send_control_command(&self, payload: serde_json::Value) -> Result<(), String> {
         let mut stream = TcpStream::connect(&self.control_addr)
             .map_err(|err| format!("connect collector control failed: {err}"))?;
         writeln!(stream, "{payload}")

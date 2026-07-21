@@ -155,13 +155,24 @@ impl UiClientApp {
     }
 
     fn handle_sample(&mut self, sample: TelemetryMsg) {
+        if let Some(channel) = Self::can_channel_from_device_id(&sample.device_id) {
+            self.dismissed_can_channels.remove(&channel);
+            self.can_channel_last_seen.insert(channel, Instant::now());
+        }
+        if sample.source_kind == TelemetrySourceKind::CanSent {
+            self.ensure_can_sent_window(&sample.device_id, sample.sensor_id);
+            self.can_sent_sensors
+                .entry((sample.device_id.clone(), sample.sensor_id))
+                .or_insert_with(super::series::SensorSeries::new)
+                .push(&sample);
+        }
         if sample.source_kind == TelemetrySourceKind::SerialDemo {
             self.demo_alarm_bit_state = Some(sample.alarm_bit);
         }
 
         if let Some(view) = Self::detect_view_for_sample(&sample) {
             let should_switch = self.selected_view != view || self.dynamic_windows.is_empty();
-            if should_switch {
+            if should_switch && sample.source_kind != TelemetrySourceKind::CanSent {
                 self.switch_to_view(view);
             }
         }
@@ -183,5 +194,107 @@ impl UiClientApp {
 
         self.total_samples = self.total_samples.saturating_add(1);
         self.last_req = sample.request_id;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::FeedStats;
+    use demo2::domain::{AlarmEvent, AlarmLevel};
+    use std::sync::{Arc, mpsc};
+    use std::time::SystemTime;
+
+    fn test_app() -> UiClientApp {
+        let (tx, rx) = mpsc::sync_channel(16);
+        UiClientApp::new(
+            rx,
+            tx,
+            Arc::new(FeedStats::default()),
+            "127.0.0.1:19011".to_string(),
+            "127.0.0.1:19013".to_string(),
+            "host=127.0.0.1 dbname=demo2".to_string(),
+            None,
+        )
+    }
+
+    fn can_sent_sample(device_id: &str, sensor_id: usize, value: f64) -> TelemetryMsg {
+        TelemetryMsg {
+            device_id: device_id.to_string(),
+            sensor_id,
+            axis: String::new(),
+            alarm_bit: false,
+            t_sec: 1.0,
+            value,
+            request_id: 1,
+            source_kind: TelemetrySourceKind::CanSent,
+        }
+    }
+
+    #[test]
+    fn confirming_channel_alarm_hides_card_until_new_data_arrives() {
+        let mut app = test_app();
+        let alarm = AlarmEvent {
+            device_id: "can://TC1016:ch1".to_string(),
+            alarm_id: "can_signal_timeout_ch1_id002".to_string(),
+            level: AlarmLevel::Critical,
+            message: "timeout".to_string(),
+            raised_at: SystemTime::now(),
+            cleared: false,
+        };
+        let key = UiClientApp::alarm_key(&alarm);
+
+        app.apply_alarm(alarm);
+        app.dismiss_channel_alarms(1);
+
+        assert!(!app.active_alarms.contains_key(&key));
+        assert!(!app.acknowledged_alarms.contains(&key));
+        assert!(app.dismissed_can_channels.contains(&1));
+        assert_eq!(app.alarm_history.len(), 1);
+
+        app.handle_sample(can_sent_sample("can://TC1016:ch1", 0, 1.0));
+
+        assert!(!app.dismissed_can_channels.contains(&1));
+        assert!(app.can_channel_last_seen.contains_key(&1));
+    }
+
+    #[test]
+    fn can_sent_channels_only_get_windows_for_their_own_signals() {
+        let mut app = test_app();
+
+        app.handle_sample(can_sent_sample("can://TC1016:ch0", 2, 20.0));
+        app.handle_sample(can_sent_sample("can://TC1016:ch0", 3, 30.0));
+        app.handle_sample(can_sent_sample("can://TC1016:ch0", 4, 40.0));
+        app.handle_sample(can_sent_sample("can://TC1016:ch1", 0, 10.0));
+        app.handle_sample(can_sent_sample("can://TC1016:ch1", 1, 11.0));
+        app.handle_sample(can_sent_sample("can://TC1016:ch1", 1, 12.0));
+
+        assert_eq!(app.dynamic_windows.len(), 5);
+        assert_eq!(
+            app.can_sent_sensors
+                .get(&("can://TC1016:ch0".to_string(), 2))
+                .and_then(|series| series.latest),
+            Some(20.0)
+        );
+        assert_eq!(
+            app.can_sent_sensors
+                .get(&("can://TC1016:ch1".to_string(), 1))
+                .and_then(|series| series.latest),
+            Some(12.0)
+        );
+        assert_eq!(
+            app.dynamic_windows
+                .iter()
+                .filter(|window| window.device_id.as_deref() == Some("can://TC1016:ch0"))
+                .count(),
+            3
+        );
+        assert_eq!(
+            app.dynamic_windows
+                .iter()
+                .filter(|window| window.device_id.as_deref() == Some("can://TC1016:ch1"))
+                .count(),
+            2
+        );
     }
 }

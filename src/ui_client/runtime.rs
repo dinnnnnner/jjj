@@ -4,17 +4,20 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
 
-use super::config::{load_control_addr, load_embed_collector, load_feed_addr, load_pg_dsn};
+use super::config::{
+    load_config_error, load_control_addr, load_embed_collector, load_feed_addr, load_pg_dsn,
+};
 use super::feed::{FeedStats, resilient_feed_thread};
 use super::fonts::setup_chinese_fonts;
 
 const UI_EMBED_COLLECTOR_ENV: &str = "DEMO2_UI_EMBED_COLLECTOR";
 
 pub(crate) fn run_collector_then_ui() -> eframe::Result<()> {
+    let config_error = load_config_error();
     if env_flag(UI_EMBED_COLLECTOR_ENV).unwrap_or_else(load_embed_collector) {
         start_embedded_collector();
     }
-    run_ui()
+    run_ui(config_error)
 }
 
 fn start_embedded_collector() {
@@ -36,7 +39,7 @@ fn start_embedded_collector() {
     });
 }
 
-fn run_ui() -> eframe::Result<()> {
+fn run_ui(config_error: Option<String>) -> eframe::Result<()> {
     let (tx, rx) = mpsc::sync_channel::<UiMsg>(UI_QUEUE_CAPACITY);
     let feed_stats = Arc::new(FeedStats::default());
     let feed_addr = load_feed_addr();
@@ -65,6 +68,7 @@ fn run_ui() -> eframe::Result<()> {
             feed_addr,
             control_addr,
             pg_dsn,
+            config_error,
         )))
     };
 

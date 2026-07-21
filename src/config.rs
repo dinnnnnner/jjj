@@ -7,6 +7,7 @@ const DEFAULT_DB_FILTER_ORDER: usize = 10;
 const DEFAULT_DB_FILTER_SAMPLE_RATE_HZ: f32 = 48_000.0;
 const DEFAULT_DB_FILTER_CUTOFF_HZ: f32 = 4_000.0;
 const DEFAULT_SENT_FILTER_WINDOW: usize = 10;
+const DEFAULT_CAN_SIGNAL_TIMEOUT_MS: u64 = 2_000;
 
 fn default_db_filter_enabled() -> bool {
     false
@@ -36,6 +37,18 @@ fn default_can_autostart_tsmaster() -> bool {
     true
 }
 
+fn default_can_hardware_subtype() -> Option<i32> {
+    Some(HW_SUBTYPE_TC1016)
+}
+
+fn default_can_signal_watchdog_enabled() -> bool {
+    true
+}
+
+fn default_can_signal_timeout_ms() -> u64 {
+    DEFAULT_CAN_SIGNAL_TIMEOUT_MS
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum CollectorCanChannelConfig {
@@ -53,6 +66,15 @@ pub struct CollectorCanChannelDetail {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct CollectorCanSignalWatchdogConfig {
+    pub channel: u8,
+    #[serde(default, alias = "identifier")]
+    pub can_id: Option<u32>,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct CollectorConfig {
     pub ingress_addr: String,
@@ -64,13 +86,19 @@ pub struct CollectorConfig {
     #[serde(default = "default_can_autostart_tsmaster")]
     pub can_autostart_tsmaster: bool,
     pub can_hardware_name: String,
-    #[serde(default)]
+    #[serde(default = "default_can_hardware_subtype")]
     pub can_hardware_subtype: Option<i32>,
     pub can_channel: u8,
     pub can_baud_kbps: u32,
     pub can_data_baud_kbps: u32,
     #[serde(default)]
     pub can_channels: Vec<CollectorCanChannelConfig>,
+    #[serde(default = "default_can_signal_watchdog_enabled")]
+    pub can_signal_watchdog_enabled: bool,
+    #[serde(default = "default_can_signal_timeout_ms")]
+    pub can_signal_timeout_ms: u64,
+    #[serde(default)]
+    pub can_signal_watchdogs: Vec<CollectorCanSignalWatchdogConfig>,
     pub serial_port: Option<String>,
     pub serial_baud: u32,
     pub serial_mode: String,
@@ -110,6 +138,9 @@ impl Default for CollectorConfig {
             can_baud_kbps: 500,
             can_data_baud_kbps: 2_000,
             can_channels: Vec::new(),
+            can_signal_watchdog_enabled: true,
+            can_signal_timeout_ms: DEFAULT_CAN_SIGNAL_TIMEOUT_MS,
+            can_signal_watchdogs: Vec::new(),
             serial_port: None,
             serial_baud: 2_000_000,
             serial_mode: "sent".to_string(),
