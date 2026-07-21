@@ -201,6 +201,29 @@ impl Default for SentAngleJumpThresholds {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct SentFrameGapThresholds {
+    pub(crate) t1_us_input: String,
+    pub(crate) t2_us_input: String,
+    pub(crate) s_us_input: String,
+    pub(crate) t1_us_applied: String,
+    pub(crate) t2_us_applied: String,
+    pub(crate) s_us_applied: String,
+}
+
+impl Default for SentFrameGapThresholds {
+    fn default() -> Self {
+        Self {
+            t1_us_input: "1500".to_string(),
+            t2_us_input: "3000".to_string(),
+            s_us_input: "1500".to_string(),
+            t1_us_applied: "1500".to_string(),
+            t2_us_applied: "3000".to_string(),
+            s_us_applied: "1500".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct AlarmPlotPoint {
     pub(crate) point: [f64; 2],
     pub(crate) level: String,

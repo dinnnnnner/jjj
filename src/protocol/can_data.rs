@@ -7,7 +7,7 @@ pub struct SentCanError {
 }
 
 pub fn decode_sent_values(is_tx: bool, identifier: u32, data: &[u8]) -> Option<[(usize, f64); 5]> {
-    if is_tx || matches!(identifier, 1 | 3) {
+    if is_tx || matches!(identifier, 1 | 2 | 3) {
         return None;
     }
     if data.len() < 53 {
@@ -28,15 +28,25 @@ pub fn decode_sent_1(is_tx: bool, identifier: u32, data: &[u8]) -> Option<Vec<(u
         return None;
     }
 
-    let s: i16 = read_i16_le(data, 4)?;
-    let t2_angle: i16 = read_i16_le(data, 6)?;
-    let t2_torque: i16 = read_i16_le(data, 8)?;
+    let flag: u8 = data.first().copied()?;
+    match flag {
+        1 => {
+            let t2_angle = read_i16_le(data, 6)?;
+            let t2_torque = read_i16_le(data, 8)?;
 
-    let s_f64 = (s as f64 - 4089.0 / 2.0) * 296.0 / 4087.0;
-    let t2_angle_f64 = (2047.0 - t2_angle as f64) * 10.0 / 1023.0;
-    let t2_torque_f64 = (4095.0 / 2.0 - t2_torque as f64) * 12.0 / 4079.0;
+            let angle = (2047.0 - t2_angle as f64) * 10.0 / 1023.0;
+            let torque = (4095.0 / 2.0 - t2_torque as f64) * 12.0 / 4079.0;
 
-    Some(vec![(2, t2_angle_f64), (3, t2_torque_f64), (4, s_f64)])
+            Some(vec![(2, angle), (3, torque)])
+        }
+        2 => {
+            let s = read_i16_le(data, 4)?;
+            let value = (s as f64 - 4089.0 / 2.0) * 296.0 / 4087.0;
+
+            Some(vec![(4, value)])
+        }
+        _ => None,
+    }
 }
 
 pub fn decode_sent_2(is_tx: bool, identifier: u32, data: &[u8]) -> Option<Vec<(usize, f64)>> {
@@ -112,20 +122,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sent_1_reads_raw_i16_fields() {
-        let mut data = [0u8; 64];
-        data[4..10].copy_from_slice(&[0x34, 0x12, 0x00, 0x80, 0xFF, 0x7F]);
-
-        let values = decode_sent_1(false, 1, &data).unwrap();
-
+    fn sent_1_flag_selects_t2_or_s_values() {
+        let mut data = [0u8; 10];
+        data[0] = 1;
+        data[6..8].copy_from_slice(&i16::MIN.to_le_bytes());
+        data[8..10].copy_from_slice(&i16::MAX.to_le_bytes());
         assert_eq!(
-            values,
-            vec![
-                (2, 340.3225806451613),
-                (3, -90.37362098553567),
-                (4, 189.42696354294102)
-            ]
+            decode_sent_1(false, 1, &data),
+            Some(vec![(2, 340.3225806451613), (3, -90.37362098553567)])
         );
+
+        data[0] = 2;
+        data[4..6].copy_from_slice(&0x1234_i16.to_le_bytes());
+        assert_eq!(
+            decode_sent_1(false, 1, &data),
+            Some(vec![(4, 189.42696354294102)])
+        );
+
+        data[0] = 3;
+        assert!(decode_sent_1(false, 1, &data).is_none());
+    }
+
+    #[test]
+    fn specialized_sent_ids_skip_the_generic_decoder() {
+        let data = [0u8; 64];
+        for identifier in [1, 2, 3] {
+            assert!(decode_sent_values(false, identifier, &data).is_none());
+        }
     }
 
     #[test]

@@ -88,6 +88,7 @@ enum CanIngressEvent {
     Telemetry {
         device_id: String,
         sensor_id: usize,
+        t_sec: f64,
         value: f64,
         frame_count: u64,
         source_kind: TelemetrySourceKind,
@@ -140,6 +141,7 @@ impl CanIngressCore {
         frame: CanFrame,
         now: SystemTime,
     ) -> Vec<CanIngressEvent> {
+        let t_sec = frame.timestamp_us as f64 / 1_000_000.0;
         let device_id = can_device_id(config, frame.channel);
         let state = self
             .channel_states
@@ -182,18 +184,19 @@ impl CanIngressCore {
             } else {
                 values
             };
-            push_can_sent_value_events(&mut events, &device_id, frame_count, output_values);
+            push_can_sent_value_events(&mut events, &device_id, frame_count, t_sec, output_values);
         }
         if let Some(values) = decode_sent_1(is_tx, identifier, data) {
-            push_can_sent_value_events(&mut events, &device_id, frame_count, values);
+            push_can_sent_value_events(&mut events, &device_id, frame_count, t_sec, values);
         }
         if let Some(values) = decode_sent_2(is_tx, identifier, data) {
-            push_can_sent_value_events(&mut events, &device_id, frame_count, values);
+            push_can_sent_value_events(&mut events, &device_id, frame_count, t_sec, values);
         }
         if let Some((sensor_id, value)) = decode_axis_sample(identifier, data) {
             events.push(CanIngressEvent::Telemetry {
                 device_id: device_id.clone(),
                 sensor_id,
+                t_sec,
                 value,
                 frame_count,
                 source_kind: TelemetrySourceKind::CanAxis,
@@ -325,7 +328,7 @@ pub async fn run_can_ingress(
                     .iter()
                     .any(|event| matches!(event, CanIngressEvent::Telemetry { .. }));
                 for event in events {
-                    publish_can_ingress_event(&bus, &start, event);
+                    publish_can_ingress_event(&bus, event);
                 }
                 let device_id = can_device_id(&active_config, channel);
                 for event in core.observe_signal_frame(
@@ -337,7 +340,7 @@ pub async fn run_can_ingress(
                     observed_at,
                     wall_time,
                 ) {
-                    publish_can_ingress_event(&bus, &start, event);
+                    publish_can_ingress_event(&bus, event);
                 }
             }
             Ok(None) => {}
@@ -363,7 +366,7 @@ pub async fn run_can_ingress(
             }
         }
         for event in core.poll_signal_timeouts(&active_config, Instant::now(), SystemTime::now()) {
-            publish_can_ingress_event(&bus, &start, event);
+            publish_can_ingress_event(&bus, event);
         }
     }
 
@@ -529,7 +532,7 @@ async fn drain_tx_queue(
     }
 }
 
-fn publish_can_ingress_event(bus: &EventBus, start: &Instant, event: CanIngressEvent) {
+fn publish_can_ingress_event(bus: &EventBus, event: CanIngressEvent) {
     match event {
         CanIngressEvent::Status(msg) => publish_status(bus, msg),
         CanIngressEvent::Log {
@@ -546,6 +549,7 @@ fn publish_can_ingress_event(bus: &EventBus, start: &Instant, event: CanIngressE
         CanIngressEvent::Telemetry {
             device_id,
             sensor_id,
+            t_sec,
             value,
             frame_count,
             source_kind,
@@ -553,7 +557,7 @@ fn publish_can_ingress_event(bus: &EventBus, start: &Instant, event: CanIngressE
             bus.publish(AppEvent::Device(DeviceEvent::TelemetrySample {
                 device_id,
                 sensor_id,
-                t_sec: start.elapsed().as_secs_f64(),
+                t_sec,
                 value,
                 req_id: frame_count,
                 alarm_bit: false,
@@ -573,12 +577,14 @@ fn push_can_sent_value_events(
     events: &mut Vec<CanIngressEvent>,
     device_id: &str,
     frame_count: u64,
+    t_sec: f64,
     values: impl IntoIterator<Item = (usize, f64)>,
 ) {
     for (sensor_id, value) in values {
         events.push(CanIngressEvent::Telemetry {
             device_id: device_id.to_string(),
             sensor_id,
+            t_sec,
             value,
             frame_count,
             source_kind: TelemetrySourceKind::CanSent,
@@ -823,6 +829,31 @@ mod tests {
         assert_eq!(axis_frame_count(&first_ch0), Some(1));
         assert_eq!(axis_frame_count(&first_ch1), Some(1));
         assert_eq!(axis_frame_count(&second_ch0), Some(2));
+    }
+
+    #[test]
+    fn can_telemetry_uses_the_frame_raw_timestamp() {
+        let config = CanTransportConfig::default();
+        let mut core = CanIngressCore::new(
+            SentFilterConfig::default(),
+            &CanSignalWatchdogConfig::default(),
+            &config.channels,
+            Instant::now(),
+        );
+        let mut frame = sent_t1_frame(0);
+        frame.timestamp_us = 12_345_678;
+
+        let events = core.handle_frame(&config, frame, SystemTime::UNIX_EPOCH);
+        let telemetry_times = events.iter().filter_map(|event| match event {
+            CanIngressEvent::Telemetry { t_sec, .. } => Some(*t_sec),
+            _ => None,
+        });
+
+        assert!(
+            telemetry_times
+                .into_iter()
+                .all(|t_sec| (t_sec - 12.345_678).abs() < f64::EPSILON)
+        );
     }
 
     #[test]

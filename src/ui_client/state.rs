@@ -1,6 +1,7 @@
 use crate::{
     AlarmRecordState, AlarmViewItem, CanAlarmThresholds, CanReplayState, DynamicSignalWindow,
-    SENSOR_COUNT, SentAngleJumpThresholds, SentTorqueJumpThresholds, TestSignalView,
+    SENSOR_COUNT, SentAngleJumpThresholds, SentFrameGapThresholds, SentTorqueJumpThresholds,
+    TestSignalView,
 };
 use demo2::signal::{SignalProcessor, default_signal_specs};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -34,6 +35,7 @@ pub(crate) struct UiClientState {
     pub(crate) can_alarm_thresholds: CanAlarmThresholds,
     pub(crate) sent_jump_thresholds: SentTorqueJumpThresholds,
     pub(crate) sent_angle_jump_thresholds: SentAngleJumpThresholds,
+    pub(crate) sent_frame_gap_thresholds: SentFrameGapThresholds,
     pub(crate) last_can_self_test_result: String,
     pub(crate) can_replay: CanReplayState,
     pub(crate) alarm_records: AlarmRecordState,
@@ -67,6 +69,7 @@ impl UiClientState {
             can_alarm_thresholds: CanAlarmThresholds::default(),
             sent_jump_thresholds: SentTorqueJumpThresholds::default(),
             sent_angle_jump_thresholds: SentAngleJumpThresholds::default(),
+            sent_frame_gap_thresholds: SentFrameGapThresholds::default(),
             last_can_self_test_result: "not run".to_string(),
             can_replay: CanReplayState::new(pg_dsn.clone()),
             alarm_records: AlarmRecordState::new(pg_dsn),

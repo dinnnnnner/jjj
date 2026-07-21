@@ -521,6 +521,66 @@ impl UiClientApp {
             });
     }
 
+    pub(crate) fn draw_sent_frame_gap_threshold_panel(&mut self, ctx: &egui::Context) {
+        if self.selected_view != TestSignalView::Sent {
+            return;
+        }
+
+        egui::Window::new("SENT Frame Gap Threshold")
+            .title_bar(true)
+            .resizable(false)
+            .collapsible(false)
+            .default_pos(egui::pos2(940.0, 542.0))
+            .fixed_size(egui::vec2(320.0, 176.0))
+            .show(ctx, |ui| {
+                ui.heading("SENT frame gap threshold (us)");
+                ui.add_space(6.0);
+                egui::Grid::new("sent_frame_gap_threshold_grid")
+                    .num_columns(2)
+                    .spacing(egui::vec2(8.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.label("T1 >");
+                        ui.add(
+                            egui::TextEdit::singleline(
+                                &mut self.sent_frame_gap_thresholds.t1_us_input,
+                            )
+                            .desired_width(96.0),
+                        );
+                        ui.end_row();
+
+                        ui.label("T2 >");
+                        ui.add(
+                            egui::TextEdit::singleline(
+                                &mut self.sent_frame_gap_thresholds.t2_us_input,
+                            )
+                            .desired_width(96.0),
+                        );
+                        ui.end_row();
+
+                        ui.label("S >");
+                        ui.add(
+                            egui::TextEdit::singleline(
+                                &mut self.sent_frame_gap_thresholds.s_us_input,
+                            )
+                            .desired_width(96.0),
+                        );
+                        ui.end_row();
+                    });
+
+                ui.add_space(8.0);
+                if ui.button("Apply").clicked() {
+                    self.status = match self.apply_sent_frame_gap_thresholds() {
+                        Ok(()) => "SENT frame gap thresholds applied".to_string(),
+                        Err(err) => format!("SENT frame gap threshold error: {err}"),
+                    };
+                }
+                let (t1_us, t2_us, s_us) = self.sent_frame_gap_thresholds();
+                ui.small(format!(
+                    "current: T1 > {t1_us} us, T2 > {t2_us} us, S > {s_us} us"
+                ));
+            });
+    }
+
     pub(crate) fn draw_can_threshold_panel(&mut self, ctx: &egui::Context) {
         if self.selected_view != TestSignalView::CanFrame {
             return;
@@ -1196,6 +1256,7 @@ impl eframe::App for UiClientApp {
         self.draw_sent_jump_threshold_panel(ctx);
         self.draw_sent_angle_jump_indicator(ctx);
         self.draw_sent_angle_jump_threshold_panel(ctx);
+        self.draw_sent_frame_gap_threshold_panel(ctx);
         self.draw_can_alarm_indicator(ctx);
         self.draw_can_threshold_panel(ctx);
         self.draw_can_replay_window(ctx);

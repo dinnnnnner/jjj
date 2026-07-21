@@ -232,6 +232,55 @@ impl UiClientApp {
         Ok(())
     }
 
+    fn parse_frame_gap_threshold(text: &str, signal: &str) -> Result<u64, String> {
+        let trimmed = text.trim();
+        match trimmed.parse::<u64>() {
+            Ok(value) if value > 0 => Ok(value),
+            _ => Err(format!(
+                "{signal} frame gap threshold must be a positive integer"
+            )),
+        }
+    }
+
+    pub(crate) fn sent_frame_gap_thresholds(&self) -> (u64, u64, u64) {
+        let t1_us = self
+            .sent_frame_gap_thresholds
+            .t1_us_applied
+            .parse()
+            .unwrap_or(1_500);
+        let t2_us = self
+            .sent_frame_gap_thresholds
+            .t2_us_applied
+            .parse()
+            .unwrap_or(3_000);
+        let s_us = self
+            .sent_frame_gap_thresholds
+            .s_us_applied
+            .parse()
+            .unwrap_or(1_500);
+        (t1_us, t2_us, s_us)
+    }
+
+    pub(crate) fn apply_sent_frame_gap_thresholds(&mut self) -> Result<(), String> {
+        let t1_us =
+            Self::parse_frame_gap_threshold(&self.sent_frame_gap_thresholds.t1_us_input, "T1")?;
+        let t2_us =
+            Self::parse_frame_gap_threshold(&self.sent_frame_gap_thresholds.t2_us_input, "T2")?;
+        let s_us =
+            Self::parse_frame_gap_threshold(&self.sent_frame_gap_thresholds.s_us_input, "S")?;
+        let payload = serde_json::json!({
+            "type": "set_sent_frame_gap_thresholds",
+            "t1_us": t1_us,
+            "t2_us": t2_us,
+            "s_us": s_us,
+        });
+        self.send_control_command(payload)?;
+        self.sent_frame_gap_thresholds.t1_us_applied = t1_us.to_string();
+        self.sent_frame_gap_thresholds.t2_us_applied = t2_us.to_string();
+        self.sent_frame_gap_thresholds.s_us_applied = s_us.to_string();
+        Ok(())
+    }
+
     fn push_sent_jump_thresholds_to_collector(
         &self,
         torque_warn: f64,
@@ -250,6 +299,10 @@ impl UiClientApp {
             "angle_t2_red": angle_t2_red,
             "angle_s_red": angle_s_red,
         });
+        self.send_control_command(payload)
+    }
+
+    fn send_control_command(&self, payload: serde_json::Value) -> Result<(), String> {
         let mut stream = TcpStream::connect(&self.control_addr)
             .map_err(|err| format!("connect collector control failed: {err}"))?;
         writeln!(stream, "{payload}")
