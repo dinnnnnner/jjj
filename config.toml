@@ -12,6 +12,11 @@ can_hardware_subtype = 11
 can_channel = 0
 can_baud_kbps = 500
 can_data_baud_kbps = 2000
+can_channels = [0, 1, 2, 3]
+can_signal_watchdog_enabled = true
+can_signal_timeout_ms = 2000
+
+serial_baud = 2000000
 serial_mode = "sent"
 pg_dsn = "host=127.0.0.1 port=5432 user=postgres password=123456 dbname=demo2"
 pg_connect_max_retries = 20
