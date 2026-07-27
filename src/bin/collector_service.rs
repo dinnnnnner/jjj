@@ -11,7 +11,8 @@ use demo2::ingress::can::{
     CanSignalWatchdogConfig, CanSignalWatchdogTarget, SentFilterConfig, run_can_ingress,
 };
 use demo2::ingress::serial::{
-    SerialIngressMode, parse_serial_mode, publish_status, run_serial_ingress,
+    SerialIngressMode, parse_serial_mode, publish_status, run_auto_serial_ingress,
+    run_serial_ingress,
 };
 use demo2::ingress::tcp::run_tcp_ingress;
 use demo2::protocol::SimpleFrameCodec;
@@ -831,18 +832,20 @@ pub async fn run() -> anyhow::Result<()> {
         });
     }
 
-    if let Some(port_name) = cfg
-        .serial_port
-        .clone()
-        .or_else(|| std::env::var("DEMO2_COLLECTOR_SERIAL_PORT").ok())
-    {
-        let serial_baud = std::env::var("DEMO2_COLLECTOR_SERIAL_BAUD")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(cfg.serial_baud);
-        let serial_mode_text = std::env::var("DEMO2_COLLECTOR_SERIAL_MODE")
-            .unwrap_or_else(|_| cfg.serial_mode.clone());
-        let serial_mode = parse_serial_mode(&serial_mode_text).unwrap_or(SerialIngressMode::Sent);
+    let configured_serial_port = std::env::var("DEMO2_COLLECTOR_SERIAL_PORT")
+        .ok()
+        .or_else(|| cfg.serial_port.clone());
+    let serial_auto_detect =
+        env_flag("DEMO2_COLLECTOR_SERIAL_AUTO_DETECT").unwrap_or(cfg.serial_auto_detect);
+    let serial_baud = std::env::var("DEMO2_COLLECTOR_SERIAL_BAUD")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(cfg.serial_baud);
+    let serial_mode_text =
+        std::env::var("DEMO2_COLLECTOR_SERIAL_MODE").unwrap_or_else(|_| cfg.serial_mode.clone());
+    let serial_mode = parse_serial_mode(&serial_mode_text).unwrap_or(SerialIngressMode::Sent);
+
+    if let Some(port_name) = configured_serial_port {
         match serial_mode {
             SerialIngressMode::Legacy => {
                 let device_id = format!("serial://{}", port_name);
@@ -868,6 +871,11 @@ pub async fn run() -> anyhow::Result<()> {
                 });
             }
         }
+    } else if serial_auto_detect {
+        let bus_for_serial = raw_bus.clone();
+        tokio::spawn(async move {
+            run_auto_serial_ingress(serial_baud, serial_mode, bus_for_serial).await;
+        });
     }
 
     let ui_listener = TcpListener::bind(&cfg.ui_feed_addr).await?;

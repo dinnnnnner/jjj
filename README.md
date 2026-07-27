@@ -138,6 +138,7 @@ pg_connect_max_retries = 20
 pg_connect_retry_ms = 1000
 
 serial_port = "COM3"
+serial_auto_detect = false
 serial_baud = 2000000
 serial_mode = "sent"
 
@@ -188,6 +189,7 @@ CAN SENT 原始值在 `src/ingress/can.rs` 的 `decode_sent_values` 中解析为
 
 - `DEMO2_DISABLE_DB=1`：禁用 PostgreSQL 持久化。
 - `DEMO2_COLLECTOR_SERIAL_PORT` / `DEMO2_COLLECTOR_SERIAL_BAUD` / `DEMO2_COLLECTOR_SERIAL_MODE`：覆盖串口接入。
+- `DEMO2_COLLECTOR_SERIAL_AUTO_DETECT=1`：未指定 `serial_port` 时持续扫描串口；只有收到当前 `serial_mode` 的有效帧才会选中端口，断开后自动恢复扫描。手动端口优先。
 - `DEMO2_COLLECTOR_CAN_ENABLED` / `DEMO2_COLLECTOR_CAN_CHANNEL` / `DEMO2_COLLECTOR_CAN_CHANNELS` / `DEMO2_COLLECTOR_CAN_HW_NAME` / `DEMO2_COLLECTOR_CAN_HW_SUBTYPE`：覆盖 CAN 接入。TC1016 的 subtype 为 `11`。
 - `DEMO2_COLLECTOR_CAN_TSMASTER_BIN` / `DEMO2_COLLECTOR_CAN_AUTOSTART_TSMASTER`：配置 TSMaster 启动。
 - `DEMO2_COLLECTOR_CAN_BAUD_KBPS` / `DEMO2_COLLECTOR_CAN_DATA_BAUD_KBPS`：覆盖 CAN 仲裁/数据波特率。
@@ -237,9 +239,21 @@ CAN SENT 原始值在 `src/ingress/can.rs` 的 `decode_sent_values` 中解析为
 ```toml
 [collector]
 serial_port = "COM3"
+serial_auto_detect = false
 serial_baud = 2000000
 serial_mode = "sent"
 ```
+
+也可以不设置 `serial_port`，改为自动识别：
+
+```toml
+[collector]
+serial_auto_detect = true
+serial_baud = 2000000
+serial_mode = "sent"
+```
+
+自动识别会持续枚举系统串口，并逐个试读有效协议帧；SENT 模式下会继续根据 `pause` 字段区分 SENT1、SENT2 和 SENT3。
 
 2. 启动采集服务和 UI：
 

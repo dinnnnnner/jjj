@@ -100,6 +100,7 @@ pub struct CollectorConfig {
     #[serde(default)]
     pub can_signal_watchdogs: Vec<CollectorCanSignalWatchdogConfig>,
     pub serial_port: Option<String>,
+    pub serial_auto_detect: bool,
     pub serial_baud: u32,
     pub serial_mode: String,
     pub pg_dsn: String,
@@ -142,6 +143,7 @@ impl Default for CollectorConfig {
             can_signal_timeout_ms: DEFAULT_CAN_SIGNAL_TIMEOUT_MS,
             can_signal_watchdogs: Vec::new(),
             serial_port: None,
+            serial_auto_detect: false,
             serial_baud: 2_000_000,
             serial_mode: "sent".to_string(),
             pg_dsn: "host=127.0.0.1 port=5432 user=postgres password=123456 dbname=demo2"
@@ -292,6 +294,7 @@ mod tests {
 
         assert!(config.can_enabled);
         assert_eq!(config.can_hardware_subtype, Some(HW_SUBTYPE_TC1016));
+        assert!(!config.serial_auto_detect);
         assert_eq!(config.serial_baud, 2_000_000);
     }
 }

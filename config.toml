@@ -18,6 +18,7 @@ can_signal_timeout_ms = 2000
 
 serial_baud = 2000000
 serial_mode = "sent"
+serial_auto_detect = true
 pg_dsn = "host=127.0.0.1 port=5432 user=postgres password=123456 dbname=demo2"
 pg_connect_max_retries = 20
 pg_connect_retry_ms = 1000
