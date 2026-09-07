@@ -6,6 +6,33 @@ use std::io::Write;
 use std::thread;
 use tokio_postgres::NoTls;
 
+fn choose_replay_device(requested: &str, devices: &[String]) -> String {
+    if requested.trim().is_empty() {
+        devices.first().cloned().unwrap_or_default()
+    } else {
+        requested.trim().to_string()
+    }
+}
+
+async fn replay_devices(
+    client: &tokio_postgres::Client,
+    start: i64,
+    end: i64,
+    mode: ReplayMode,
+) -> Result<Vec<String>, String> {
+    let axes: Vec<&str> = mode.axis_filters().to_vec();
+    client
+        .query(
+            "SELECT DISTINCT device_id FROM telemetry_samples
+        WHERE device_id LIKE 'can://%' AND ts_ms >= $1 AND ts_ms <= $2 AND axis = ANY($3)
+        ORDER BY device_id",
+            &[&start, &end, &axes],
+        )
+        .await
+        .map(|rows| rows.into_iter().map(|r| r.get(0)).collect())
+        .map_err(|e| e.to_string())
+}
+
 #[derive(Clone, Copy)]
 struct ReplayBucket {
     min: PlotPoint,
@@ -154,6 +181,7 @@ impl UiClientApp {
 
         self.can_replay.loading = true;
         let dsn = self.can_replay.pg_dsn.clone();
+        let requested_device = self.can_replay.device_input.clone();
         let mode = self.can_replay.mode;
         self.can_replay.status = self.can_replay.mode.load_status().to_string();
         let tx = self.ui_tx.clone();
@@ -172,15 +200,18 @@ impl UiClientApp {
                     });
 
                     let axes = mode.axis_filters();
+                    let available_devices =
+                        replay_devices(&client, start_ts_ms, end_ts_ms, mode).await?;
+                    let device_id = choose_replay_device(&requested_device, &available_devices);
                     let rows = client
                         .query_raw(
                             "SELECT ts_ms, axis, value
                              FROM telemetry_samples
-                             WHERE device_id LIKE 'can://%'
+                             WHERE device_id = $8
                                AND ts_ms >= $1
                                AND ts_ms <= $2
                                AND axis IN ($3, $4, $5, $6, $7)
-                             ORDER BY ts_ms ASC, axis ASC",
+                             ORDER BY ts_ms ASC, id ASC",
                             [
                                 &start_ts_ms as &(dyn tokio_postgres::types::ToSql + Sync),
                                 &end_ts_ms,
@@ -189,6 +220,7 @@ impl UiClientApp {
                                 &axes[2],
                                 &axes[3],
                                 &axes[4],
+                                &device_id,
                             ],
                         )
                         .await
@@ -222,6 +254,8 @@ impl UiClientApp {
 
                     let [x_sampler, y_sampler, z_sampler, u_sampler, v_sampler] = samplers;
                     let mut data = CanReplayData {
+                        device_id: device_id.clone(),
+                        available_devices,
                         x_points: x_sampler.finish(),
                         y_points: y_sampler.finish(),
                         z_points: z_sampler.finish(),
@@ -239,11 +273,13 @@ impl UiClientApp {
                              FROM alarm_events
                              WHERE ts_ms >= $1
                                AND ts_ms <= $2
+                               AND device_id = $3
                                AND (alarm_id LIKE 'can_%' OR alarm_id LIKE 'sent_%')
                              ORDER BY ts_ms ASC, id ASC",
                             [
                                 &start_ts_ms as &(dyn tokio_postgres::types::ToSql + Sync),
                                 &end_ts_ms,
+                                &device_id,
                             ],
                         )
                         .await
@@ -361,6 +397,7 @@ impl UiClientApp {
         self.can_replay.exporting = true;
         self.can_replay.status = "正在流式导出 txt...".to_string();
         let dsn = self.can_replay.pg_dsn.clone();
+        let requested_device = self.can_replay.device_input.clone();
         let mode = self.can_replay.mode;
         let tx = self.ui_tx.clone();
         let show_x = self.can_replay.show_x;
@@ -382,6 +419,8 @@ impl UiClientApp {
                         let _ = connection.await;
                     });
 
+                    let devices = replay_devices(&client, start_ts_ms, end_ts_ms, mode).await?;
+                    let device_id = choose_replay_device(&requested_device, &devices);
                     let now_ts_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as i64)
@@ -412,7 +451,7 @@ impl UiClientApp {
                     let axes = mode.axis_filters();
                     let sql = "SELECT ts_ms, device_id, axis, value, request_id
                                FROM telemetry_samples
-                               WHERE device_id LIKE 'can://%'
+                               WHERE device_id = $13
                                  AND ts_ms >= $1
                                  AND ts_ms <= $2
                                  AND (($3 AND axis = $8)
@@ -420,9 +459,9 @@ impl UiClientApp {
                                    OR ($5 AND axis = $10)
                                    OR ($6 AND axis = $11)
                                    OR ($7 AND axis = $12))
-                               ORDER BY ts_ms ASC, axis ASC";
+                               ORDER BY ts_ms ASC, id ASC";
 
-                    let params: [&(dyn tokio_postgres::types::ToSql + Sync); 12] = [
+                    let params: [&(dyn tokio_postgres::types::ToSql + Sync); 13] = [
                         &start_ts_ms,
                         &end_ts_ms,
                         &show_x,
@@ -435,6 +474,7 @@ impl UiClientApp {
                         &axes[2],
                         &axes[3],
                         &axes[4],
+                        &device_id,
                     ];
                     let rows = client
                         .query_raw(sql, params)
@@ -600,6 +640,31 @@ impl UiClientApp {
             .min_width(860.0)
             .min_height(520.0)
             .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("设备 / 通道");
+                    ui.add_enabled_ui(
+                        !self.can_replay.loading && !self.can_replay.exporting,
+                        |ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.can_replay.device_input)
+                                    .hint_text("留空时选择该时段第一个设备")
+                                    .desired_width(300.0),
+                            );
+                            let devices = self.can_replay.available_devices.clone();
+                            egui::ComboBox::from_id_salt("replay_device")
+                                .selected_text("已发现设备")
+                                .show_ui(ui, |ui| {
+                                    for device in devices {
+                                        ui.selectable_value(
+                                            &mut self.can_replay.device_input,
+                                            device.clone(),
+                                            device,
+                                        );
+                                    }
+                                });
+                        },
+                    );
+                });
                 ui.horizontal_wrapped(|ui| {
                     ui.label("模式");
                     let previous_mode = self.can_replay.mode;
@@ -670,6 +735,7 @@ impl UiClientApp {
 
                 let available_height = (ui.available_height() - 56.0).max(240.0);
                 if let Some(data) = self.can_replay.data.as_ref() {
+                    ui.label(format!("当前已加载设备: {}", data.device_id));
                     let chart_result = self.draw_can_replay_chart(ui, data, available_height);
                     ui.horizontal(|ui| {
                         ui.label(format!("ts_ms: {}", data.min_ts_ms));
@@ -702,6 +768,18 @@ impl UiClientApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_selects_one_device_and_respects_explicit_channel() {
+        let devices = vec!["can://a:ch0".into(), "can://a:ch1".into()];
+        assert_eq!(choose_replay_device("", &devices), "can://a:ch0");
+        assert_eq!(choose_replay_device("can://a:ch1", &devices), "can://a:ch1");
+        assert_eq!(
+            choose_replay_device("can://offline:ch0", &[]),
+            "can://offline:ch0"
+        );
+        assert_eq!(choose_replay_device("", &[]), "");
+    }
 
     #[test]
     fn replay_sampler_bounds_output_and_keeps_extrema() {

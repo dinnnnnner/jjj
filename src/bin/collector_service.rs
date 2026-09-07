@@ -1,10 +1,8 @@
 use demo2::app::{AlarmService, SentJumpAlarmConfig};
 use demo2::bus::{AppEvent, DeviceEvent, EventBus, Store, TelemetrySourceKind};
 use demo2::config::{CollectorConfig, collector_can_channels, env_flag, load_collector_config};
-use demo2::db::SCHEMA_SQL;
-use demo2::db::writer::{
-    DbCmd, TelemetryRow, flush_telemetry_batch, insert_alarm_event, insert_system_event,
-};
+use demo2::db::retry::{PgSink, WriteBatch, retry_write};
+use demo2::db::writer::{DbCmd, TelemetryRow};
 use demo2::domain::telemetry::axis_name;
 use demo2::feed::{TelemetryMsg, UiFeedMsg, encode_feed_msg};
 use demo2::ingress::can::{SentFilterConfig, run_can_ingress};
@@ -27,7 +25,6 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
-use tokio_postgres::NoTls;
 use tracing::{info, warn};
 
 const DB_CMD_CHANNEL_CAPACITY: usize = 50_000;
@@ -45,11 +42,13 @@ struct CollectorStats {
     ui_drop: AtomicU64,
     db_drop: AtomicU64,
     db_write_fail: AtomicU64,
+    db_connected: AtomicBool,
     last_db_error: Mutex<Option<String>>,
 }
 
 fn telemetry_row_from_msg(msg: TelemetryMsg) -> anyhow::Result<TelemetryRow> {
     Ok(TelemetryRow {
+        captured_at_ms: msg.captured_at_ms,
         device_id: msg.device_id,
         sensor_id: i32::try_from(msg.sensor_id).map_err(|_| {
             anyhow::anyhow!(
@@ -71,6 +70,7 @@ fn telemetry_row_from_msg(msg: TelemetryMsg) -> anyhow::Result<TelemetryRow> {
 }
 
 fn telemetry_msg_from_sample(
+    captured_at_ms: i64,
     device_id: String,
     sensor_id: usize,
     t_sec: f64,
@@ -80,6 +80,7 @@ fn telemetry_msg_from_sample(
     source_kind: TelemetrySourceKind,
 ) -> TelemetryMsg {
     TelemetryMsg {
+        captured_at_ms,
         device_id,
         sensor_id,
         axis: axis_name(source_kind, sensor_id).to_string(),
@@ -161,16 +162,32 @@ fn record_db_write_error(stats: &CollectorStats, op: &'static str, err: anyhow::
 }
 
 async fn flush_db_telemetry_batch(
-    client: &tokio_postgres::Client,
+    sink: &mut PgSink,
     batch: &mut Vec<TelemetryRow>,
     stats: &CollectorStats,
-) -> bool {
-    match flush_telemetry_batch(client, batch).await {
-        Ok(()) => true,
-        Err(err) => {
-            record_db_write_error(stats, "telemetry_batch", err);
-            false
-        }
+    delay: Duration,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    let pending = WriteBatch::Telemetry(std::mem::take(batch));
+    persist_batch(sink, &pending, stats, delay).await;
+}
+
+async fn persist_batch(
+    sink: &mut PgSink,
+    batch: &WriteBatch,
+    stats: &CollectorStats,
+    delay: Duration,
+) {
+    retry_write(sink, batch, delay, |err| {
+        stats.db_connected.store(false, Ordering::Relaxed);
+        record_db_write_error(stats, "persistence_retry", err);
+    })
+    .await;
+    stats.db_connected.store(true, Ordering::Relaxed);
+    if let Ok(mut error) = stats.last_db_error.lock() {
+        *error = None;
     }
 }
 
@@ -178,45 +195,8 @@ async fn start_pg_writer(
     cfg: &CollectorConfig,
     stats: Arc<CollectorStats>,
 ) -> anyhow::Result<mpsc::Sender<DbCmd>> {
-    let mut attempt = 0_u32;
-    let (client, connection) = loop {
-        attempt = attempt.saturating_add(1);
-        match tokio_postgres::connect(&cfg.pg_dsn, NoTls).await {
-            Ok(ok) => {
-                info!("postgres connected on attempt {}", attempt);
-                break ok;
-            }
-            Err(err) => {
-                if attempt >= cfg.pg_connect_max_retries {
-                    return Err(anyhow::anyhow!(
-                        "postgres connect failed after {} attempts: {}",
-                        attempt,
-                        err
-                    ));
-                }
-                warn!(
-                    attempt,
-                    max_attempts = cfg.pg_connect_max_retries,
-                    retry_ms = cfg.pg_connect_retry_ms,
-                    error = %err,
-                    "postgres connect failed, retrying"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(cfg.pg_connect_retry_ms)).await;
-            }
-        }
-    };
-
-    tokio::spawn(async move {
-        if let Err(err) = connection.await {
-            warn!(error = %err, "postgres connection task ended");
-        }
-    });
-
-    client
-        .batch_execute(SCHEMA_SQL)
-        .await
-        .map_err(|err| anyhow::anyhow!("postgres schema init failed: {err}"))?;
-
+    let mut sink = PgSink::new(cfg.pg_dsn.clone());
+    let delay = Duration::from_millis(cfg.pg_connect_retry_ms.max(1));
     let (tx, mut rx) = mpsc::channel::<DbCmd>(DB_CMD_CHANNEL_CAPACITY);
     tokio::spawn(async move {
         let mut telemetry_batch = Vec::with_capacity(TELEMETRY_BATCH_SIZE);
@@ -231,39 +211,25 @@ async fn start_pg_writer(
                     };
                     match cmd {
                         DbCmd::Telemetry(t) => {
-                            if telemetry_batch.len() >= TELEMETRY_BATCH_SIZE
-                                && !flush_db_telemetry_batch(&client, &mut telemetry_batch, &stats).await
-                            {
-                                stats.db_drop.fetch_add(1, Ordering::Relaxed);
-                                continue;
-                            }
                             telemetry_batch.push(t);
                             if telemetry_batch.len() >= TELEMETRY_BATCH_SIZE {
-                                let _ = flush_db_telemetry_batch(&client, &mut telemetry_batch, &stats).await;
+                                flush_db_telemetry_batch(&mut sink, &mut telemetry_batch, &stats, delay).await;
                             }
                         }
-                        DbCmd::Alarm(a) => {
-                            let _ = flush_db_telemetry_batch(&client, &mut telemetry_batch, &stats).await;
-                            if let Err(err) = insert_alarm_event(&client, &a).await {
-                                record_db_write_error(&stats, "alarm", err);
-                            }
-                        }
-                        DbCmd::System { level, message } => {
-                            let _ = flush_db_telemetry_batch(&client, &mut telemetry_batch, &stats).await;
-                            if let Err(err) = insert_system_event(&client, &level, &message).await {
-                                record_db_write_error(&stats, "system", err);
-                            }
+                        event => {
+                            flush_db_telemetry_batch(&mut sink, &mut telemetry_batch, &stats, delay).await;
+                            persist_batch(&mut sink, &WriteBatch::Event(event), &stats, delay).await;
                         }
                     }
                 }
                 _ = flush_tick.tick() => {
-                    let _ = flush_db_telemetry_batch(&client, &mut telemetry_batch, &stats).await;
+                    flush_db_telemetry_batch(&mut sink, &mut telemetry_batch, &stats, delay).await;
                 }
                 else => break,
             }
         }
 
-        let _ = flush_db_telemetry_batch(&client, &mut telemetry_batch, &stats).await;
+        flush_db_telemetry_batch(&mut sink, &mut telemetry_batch, &stats, delay).await;
     });
 
     Ok(tx)
@@ -273,10 +239,23 @@ async fn serve_ui_client(
     mut socket: TcpStream,
     mut rx: broadcast::Receiver<Vec<u8>>,
     stats: Arc<CollectorStats>,
+    bus: EventBus,
 ) {
     stats.ui_clients.fetch_add(1, Ordering::Relaxed);
+    let mut snapshot_tick = tokio::time::interval(Duration::from_secs(1));
+    snapshot_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        let line = match rx.recv().await {
+        let next = tokio::select! {
+            biased;
+            _ = snapshot_tick.tick() => {
+                match encode_feed_msg(&UiFeedMsg::AlarmSnapshot(bus.active_alarms())) {
+                    Ok(frame) => Ok(frame),
+                    Err(err) => { warn!(%err, "alarm snapshot encode failed"); break; }
+                }
+            }
+            event = rx.recv() => event,
+        };
+        let line = match next {
             Ok(line) => line,
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 warn!(skipped, "ui feed lagged, skipping stale messages");
@@ -309,6 +288,7 @@ async fn run_ui_forwarder(
     loop {
         match sub.recv().await {
             Ok(AppEvent::Device(DeviceEvent::TelemetrySample {
+                captured_at_ms,
                 device_id,
                 sensor_id,
                 t_sec,
@@ -318,6 +298,7 @@ async fn run_ui_forwarder(
                 source_kind,
             })) => {
                 let msg = telemetry_msg_from_sample(
+                    captured_at_ms,
                     device_id,
                     sensor_id,
                     t_sec,
@@ -505,6 +486,7 @@ async fn run_persistence_forwarder(
     loop {
         match sub.recv().await {
             Ok(AppEvent::Device(DeviceEvent::TelemetrySample {
+                captured_at_ms,
                 device_id,
                 sensor_id,
                 t_sec,
@@ -514,6 +496,7 @@ async fn run_persistence_forwarder(
                 source_kind,
             })) => {
                 let msg = telemetry_msg_from_sample(
+                    captured_at_ms,
                     device_id,
                     sensor_id,
                     t_sec,
@@ -574,6 +557,7 @@ async fn run_filtered_event_forwarder(
     loop {
         match sub.recv().await {
             Ok(AppEvent::Device(DeviceEvent::TelemetrySample {
+                captured_at_ms,
                 device_id,
                 sensor_id,
                 t_sec,
@@ -583,6 +567,7 @@ async fn run_filtered_event_forwarder(
                 source_kind,
             })) => {
                 let filtered = filter.apply(telemetry_msg_from_sample(
+                    captured_at_ms,
                     device_id,
                     sensor_id,
                     t_sec,
@@ -592,6 +577,7 @@ async fn run_filtered_event_forwarder(
                     source_kind,
                 ));
                 processed_bus.publish(AppEvent::Device(DeviceEvent::TelemetrySample {
+                    captured_at_ms: filtered.captured_at_ms,
                     device_id: filtered.device_id,
                     sensor_id: filtered.sensor_id,
                     t_sec: filtered.t_sec,
@@ -601,7 +587,7 @@ async fn run_filtered_event_forwarder(
                     source_kind: filtered.source_kind,
                 }));
             }
-            Ok(other) => processed_bus.publish(other),
+            Ok(other) => processed_bus.publish_forwarded(other),
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 warn!(skipped, "filter forwarder lagged, skipping stale messages");
                 continue;
@@ -626,6 +612,7 @@ fn health_json(stats: &CollectorStats) -> String {
         "ui_drop": stats.ui_drop.load(Ordering::Relaxed),
         "db_drop": stats.db_drop.load(Ordering::Relaxed),
         "db_write_fail": stats.db_write_fail.load(Ordering::Relaxed),
+        "db_connected": stats.db_connected.load(Ordering::Relaxed),
         "last_db_error": last_db_error,
     })
     .to_string()
@@ -677,7 +664,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     let stats = Arc::new(CollectorStats::default());
     let raw_bus = EventBus::new(cfg.bus_capacity);
-    let processed_bus = EventBus::new(cfg.bus_capacity);
+    let processed_bus = raw_bus.processing_stage(cfg.bus_capacity);
     let store = Store::default();
     let sessions: Arc<tokio::sync::RwLock<HashMap<String, DeviceSessionHandle>>> =
         Arc::new(tokio::sync::RwLock::new(HashMap::new()));
@@ -830,11 +817,17 @@ pub async fn run() -> anyhow::Result<()> {
     let ui_listener = TcpListener::bind(&cfg.ui_feed_addr).await?;
     stats.ui_ready.store(true, Ordering::Relaxed);
     let stats_for_ui = stats.clone();
+    let bus_for_ui = processed_bus.clone();
     tokio::spawn(async move {
         loop {
             if let Ok((socket, _)) = ui_listener.accept().await {
                 let rx = ui_tx.subscribe();
-                tokio::spawn(serve_ui_client(socket, rx, stats_for_ui.clone()));
+                tokio::spawn(serve_ui_client(
+                    socket,
+                    rx,
+                    stats_for_ui.clone(),
+                    bus_for_ui.clone(),
+                ));
             }
         }
     });

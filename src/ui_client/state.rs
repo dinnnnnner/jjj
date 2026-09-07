@@ -9,8 +9,9 @@ use super::series::SensorSeries;
 
 pub(crate) struct UiClientState {
     pub(crate) status: String,
-    pub(crate) sensors: Vec<SensorSeries>,
-    pub(crate) tcp_sensors: Vec<SensorSeries>,
+    pub(crate) source_series: HashMap<(String, TestSignalView, usize), SensorSeries>,
+    pub(crate) selected_devices: HashMap<TestSignalView, String>,
+    pub(crate) view_initialized: bool,
     pub(crate) total_samples: u64,
     pub(crate) last_req: u64,
     pub(crate) can_self_test_counter: u8,
@@ -38,8 +39,9 @@ impl UiClientState {
     pub(crate) fn new(pg_dsn: String, max_alarm_history: usize) -> Self {
         Self {
             status: "starting...".to_string(),
-            sensors: (0..SENSOR_COUNT).map(|_| SensorSeries::new()).collect(),
-            tcp_sensors: (0..SENSOR_COUNT).map(|_| SensorSeries::new()).collect(),
+            source_series: HashMap::new(),
+            selected_devices: HashMap::new(),
+            view_initialized: false,
             total_samples: 0,
             last_req: 0,
             can_self_test_counter: 0,

@@ -408,6 +408,7 @@ fn publish_can_ingress_event(bus: &EventBus, start: &Instant, event: CanIngressE
             source_kind,
         } => {
             bus.publish(AppEvent::Device(DeviceEvent::TelemetrySample {
+                captured_at_ms: crate::db::writer::now_ms(),
                 device_id,
                 sensor_id,
                 t_sec: start.elapsed().as_secs_f64(),

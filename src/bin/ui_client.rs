@@ -27,6 +27,7 @@ enum UiMsg {
     Status(String),
     Sample(TelemetryMsg),
     Alarm(AlarmEvent),
+    AlarmSnapshot(Vec<AlarmEvent>),
     CanReplayLoaded(ReplayMode, Result<CanReplayData, String>),
     CanReplayExported(Result<String, String>),
     AlarmRecordsLoaded(Result<AlarmRecordData, String>),

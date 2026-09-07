@@ -3,6 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug)]
 pub struct TelemetryRow {
+    pub captured_at_ms: i64,
     pub device_id: String,
     pub sensor_id: i32,
     pub axis: String,
@@ -29,30 +30,24 @@ pub async fn ensure_telemetry_partitions(
     client: &tokio_postgres::Client,
     ts_values: &[i64],
 ) -> anyhow::Result<()> {
-    let mut days = ts_values
-        .iter()
-        .map(|ts_ms| ts_ms.div_euclid(86_400_000))
-        .collect::<Vec<_>>();
-    days.sort_unstable();
-    days.dedup();
-
-    for day in days {
-        let day_start_ms = (day * 86_400_000) as f64;
-        client
-            .execute(
-                "SELECT ensure_telemetry_partition_for_day(to_timestamp($1::double precision / 1000.0)::date)",
-                &[&day_start_ms],
-            )
-            .await
-            .map_err(|err| anyhow::anyhow!("ensure telemetry partition failed: {err}"))?;
-    }
+    // Derive dates from actual capture instants in the same PostgreSQL timezone
+    // as partition boundaries, including delayed batches and midnight crossings.
+    client
+        .execute(
+            "SELECT ensure_telemetry_partition_for_day(day) FROM
+         (SELECT DISTINCT to_timestamp(ts::double precision / 1000.0)::date AS day
+          FROM unnest($1::bigint[]) AS ts) AS days",
+            &[&ts_values],
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("ensure telemetry partition failed: {err}"))?;
 
     Ok(())
 }
 
 pub async fn flush_telemetry_batch(
     client: &tokio_postgres::Client,
-    batch: &mut Vec<TelemetryRow>,
+    batch: &[TelemetryRow],
 ) -> anyhow::Result<()> {
     if batch.is_empty() {
         return Ok(());
@@ -68,7 +63,7 @@ pub async fn flush_telemetry_batch(
     let mut request_ids = Vec::with_capacity(batch.len());
 
     for item in batch.iter() {
-        let row_ts_ms = now_ms();
+        let row_ts_ms = item.captured_at_ms;
         ts_ms.push(row_ts_ms);
         device_ids.push(item.device_id.clone());
         sensor_ids.push(item.sensor_id);
@@ -127,7 +122,6 @@ pub async fn flush_telemetry_batch(
         .await
         .map_err(|err| anyhow::anyhow!("telemetry batch insert failed: {err}"))?;
 
-    batch.clear();
     Ok(())
 }
 
@@ -135,7 +129,11 @@ pub async fn insert_alarm_event(
     client: &tokio_postgres::Client,
     alarm: &AlarmEvent,
 ) -> anyhow::Result<()> {
-    let ts_ms = now_ms();
+    let ts_ms = alarm
+        .raised_at
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
     client
         .execute(
             "INSERT INTO alarm_events (ts_ms, device_id, alarm_id, level, message, cleared)

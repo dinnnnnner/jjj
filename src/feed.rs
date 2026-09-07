@@ -4,13 +4,14 @@ use bincode::Options;
 use serde::{Deserialize, Serialize};
 
 pub const FEED_MAGIC: [u8; 4] = *b"JJJF";
-pub const FEED_PROTOCOL_VERSION: u16 = 1;
+pub const FEED_PROTOCOL_VERSION: u16 = 2;
 pub const MAX_FEED_FRAME_LEN: usize = 1024 * 1024;
 const FEED_HEADER_LEN: usize = FEED_MAGIC.len() + size_of::<u16>();
 const MAX_FEED_PAYLOAD_LEN: u64 = (MAX_FEED_FRAME_LEN - FEED_HEADER_LEN) as u64;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TelemetryMsg {
+    pub captured_at_ms: i64,
     pub device_id: String,
     pub sensor_id: usize,
     pub axis: String,
@@ -26,6 +27,7 @@ pub enum UiFeedMsg {
     Telemetry(TelemetryMsg),
     Alarm(AlarmEvent),
     Status(String),
+    AlarmSnapshot(Vec<AlarmEvent>),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -85,6 +87,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn capture_time_and_alarm_snapshots_roundtrip() {
+        let msg = UiFeedMsg::Telemetry(TelemetryMsg {
+            captured_at_ms: 123456789,
+            device_id: "can://test:ch0".into(),
+            sensor_id: 0,
+            axis: "x".into(),
+            alarm_bit: false,
+            t_sec: 0.123,
+            value: 1.5,
+            request_id: 7,
+            source_kind: TelemetrySourceKind::CanAxis,
+        });
+        let UiFeedMsg::Telemetry(decoded) =
+            decode_feed_msg(&encode_feed_msg(&msg).unwrap()).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(decoded.captured_at_ms, 123456789);
+        assert_eq!(decoded.t_sec, 0.123);
+        assert!(
+            matches!(decode_feed_msg(&encode_feed_msg(&UiFeedMsg::AlarmSnapshot(vec![])).unwrap()).unwrap(),
+            UiFeedMsg::AlarmSnapshot(alarms) if alarms.is_empty())
+        );
+    }
+
+    #[test]
     fn feed_frame_roundtrips_with_versioned_header() {
         let frame = encode_feed_msg(&UiFeedMsg::Status("ready".to_string())).unwrap();
 
@@ -106,7 +134,7 @@ mod tests {
 
         assert!(matches!(
             decode_feed_msg(&frame),
-            Err(FeedDecodeError::UnsupportedVersion(2))
+            Err(FeedDecodeError::UnsupportedVersion(version)) if version == FEED_PROTOCOL_VERSION + 1
         ));
     }
 

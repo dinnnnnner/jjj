@@ -990,7 +990,7 @@ enum UiFeedMsg {
 }
 ```
 
-线上 frame 结构为 `u32 大端长度 + "JJJF" + u16 大端版本 + bincode payload`。长度前缀不计入 frame，frame 最大为 1 MiB；当前协议版本为 1。
+线上 frame 结构为 `u32 大端长度 + "JJJF" + u16 大端版本 + bincode payload`。长度前缀不计入 frame，frame 最大为 1 MiB；当前协议版本为 2，新增采集时间和活动告警快照，采集端与 UI 必须同时升级。
 
 ## 11. UI feed 消息格式
 
@@ -1391,7 +1391,7 @@ cargo run --bin check_db_partition
 - 更完整的集成测试。
 - 指标系统和结构化日志采集。
 - CAN / 串口错误恢复策略。
-- 数据库写入失败后的重试、缓冲或补偿机制。
+- 数据库已支持有界内存缓冲及退避重连；后续仍需磁盘日志、幂等去重和进程退出后的补偿机制。
 
 ## 21. 快速命令清单
 

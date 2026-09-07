@@ -61,6 +61,7 @@ pub fn publish_telemetry_sample(
     source_kind: TelemetrySourceKind,
 ) {
     bus.publish(AppEvent::Device(DeviceEvent::TelemetrySample {
+        captured_at_ms: crate::db::writer::now_ms(),
         device_id: device_id.to_string(),
         sensor_id,
         t_sec,
