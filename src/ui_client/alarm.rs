@@ -47,6 +47,23 @@ impl UiClientApp {
         }
     }
 
+    pub(crate) fn apply_alarm_snapshot(&mut self, alarms: Vec<AlarmEvent>) {
+        let received_at = Instant::now();
+        let previous = std::mem::take(&mut self.active_alarms);
+        self.active_alarms = alarms
+            .into_iter()
+            .filter(|a| !a.cleared)
+            .map(|event| {
+                let key = Self::alarm_key(&event);
+                let received_at = previous
+                    .get(&key)
+                    .map(|item| item.received_at)
+                    .unwrap_or(received_at);
+                (key, AlarmViewItem { event, received_at })
+            })
+            .collect();
+    }
+
     pub(crate) fn validate_threshold_text(text: &str) -> Result<String, String> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
@@ -242,28 +259,13 @@ impl UiClientApp {
         };
 
         match spec.kind {
-            SignalKind::SourceSensor { sensor_id } => {
-                let is_tcp = sample.device_id.starts_with("tcp://");
-                let msg = TelemetryMsg {
-                    device_id: sample.device_id,
-                    sensor_id,
-                    axis: String::new(),
-                    t_sec: sample.t_sec,
-                    value: sample.value,
-                    request_id: sample.req_id,
-                    alarm_bit: false,
-                    source_kind: TelemetrySourceKind::Unknown,
-                };
-                if is_tcp {
-                    self.tcp_sensors[sensor_id].push(&msg);
-                } else {
-                    self.sensors[sensor_id].push(&msg);
-                }
-            }
+            // Raw series are stored with their source identity in handle_sample.
+            SignalKind::SourceSensor { .. } => {}
             SignalKind::Derived { .. } => {
                 let device_id = sample.device_id.clone();
                 let signal_id = sample.signal_id;
                 let msg = TelemetryMsg {
+                    captured_at_ms: 0,
                     device_id: device_id.clone(),
                     sensor_id: 0,
                     axis: String::new(),

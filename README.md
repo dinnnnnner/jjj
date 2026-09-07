@@ -37,7 +37,7 @@ src/
 - Rust stable，项目使用 edition 2024。
 - Windows PowerShell，串口 / UI / 一键启动脚本主要按 Windows 环境编写。
 - Docker Desktop，可选，用于启动本地 PostgreSQL。
-- PostgreSQL 16，可选；未启用或不可用时，采集服务会降级为无持久化模式继续运行。
+- PostgreSQL 16，可选；不可用时采集服务继续运行，后台写入器保留当前批次并退避重连。显式禁用持久化请设置 `DEMO2_DISABLE_DB=1`。
 
 ## 快速开始
 
@@ -303,6 +303,19 @@ sid=3,value=47.381
 - `config.toml` 不生效：确认文件位于项目根目录，并且 `[collector]` 表名正确。
 
 ## 测试
+
+修复后的采集端与 UI 使用 feed 协议 v2，必须一起更新和重启。实时曲线按设备、数据来源和传感器隔离，设备下拉框控制对应视图使用的设备。自动视图识别仅执行一次，后续样本不会重置用户窗口。CAN 回放和导出每次查询一个设备，留空时选择该时段第一个设备，可从已发现设备列表切换。
+
+持久化使用采集时刻 `captured_at_ms` 写入 `ts_ms`/`created_at`，同毫秒记录以 `id` 稳定排序。旧记录的写库时间无法自动还原成采集时间。数据库连接或写入失败会重试同一批次，初始间隔由 `pg_connect_retry_ms` 设置，指数退避上限 30 秒；`pg_connect_max_retries` 保留用于旧配置兼容，不再终止后台恢复。`/health` 的 `db_connected` 表示最近一次写入尝试成功，失败后置为 false，恢复成功会清除 `last_db_error`。
+
+当前恢复机制使用有界内存缓存（写入队列 50,000 条及当前批次），不是磁盘日志。长时间中断超过缓存容量会产生已计数的总线丢弃，进程退出也会失去未写入数据。重试为至少一次语义：提交成功但响应丢失时可能出现重复记录。UI 每秒接收活动告警快照以校正漏掉的触发/恢复；快照校正当前状态，不补齐丢失的历史事件。
+
+数据库故障回归测试可显式运行；测试创建并删除自己的临时数据库，需要实例上的建库权限：
+
+```powershell
+$env:DEMO2_TEST_PG_DSN = "host=127.0.0.1 port=25439 user=postgres dbname=postgres"
+cargo test --test postgres_recovery -- --ignored
+```
 
 ```powershell
 cargo test

@@ -72,6 +72,7 @@ impl UiClientApp {
         match msg {
             UiMsg::Status(status) => self.handle_status(status),
             UiMsg::Alarm(alarm) => self.apply_alarm(alarm),
+            UiMsg::AlarmSnapshot(alarms) => self.apply_alarm_snapshot(alarms),
             UiMsg::CanReplayLoaded(mode, result) => {
                 self.can_replay.loading = false;
                 if mode != self.can_replay.mode {
@@ -79,6 +80,8 @@ impl UiClientApp {
                 }
                 match result {
                     Ok(data) => {
+                        self.can_replay.device_input = data.device_id.clone();
+                        self.can_replay.available_devices = data.available_devices.clone();
                         let span_sec = data.total_span_sec();
                         self.can_replay.view_start_sec = 0.0;
                         self.can_replay.view_span_sec =
@@ -155,15 +158,25 @@ impl UiClientApp {
     }
 
     fn handle_sample(&mut self, sample: TelemetryMsg) {
+        if sample.sensor_id >= SENSOR_COUNT {
+            return;
+        }
         if sample.source_kind == TelemetrySourceKind::SerialDemo {
             self.demo_alarm_bit_state = Some(sample.alarm_bit);
         }
 
         if let Some(view) = Self::detect_view_for_sample(&sample) {
-            let should_switch = self.selected_view != view || self.dynamic_windows.is_empty();
-            if should_switch {
+            if !self.view_initialized {
                 self.switch_to_view(view);
+                self.view_initialized = true;
             }
+            self.selected_devices
+                .entry(view)
+                .or_insert_with(|| sample.device_id.clone());
+            self.source_series
+                .entry((sample.device_id.clone(), view, sample.sensor_id))
+                .or_insert_with(super::series::SensorSeries::new)
+                .push(&sample);
         }
 
         if sample.sensor_id >= SENSOR_COUNT {
@@ -183,5 +196,95 @@ impl UiClientApp {
 
         self.total_samples = self.total_samples.saturating_add(1);
         self.last_req = sample.request_id;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use demo2::domain::{AlarmEvent, AlarmLevel};
+    fn app() -> UiClientApp {
+        let (tx, rx) = std::sync::mpsc::sync_channel(16);
+        UiClientApp::new(
+            rx,
+            tx,
+            std::sync::Arc::default(),
+            String::new(),
+            String::new(),
+            String::new(),
+        )
+    }
+    fn sample(device: &str, kind: TelemetrySourceKind, value: f64) -> TelemetryMsg {
+        TelemetryMsg {
+            captured_at_ms: 1234,
+            device_id: device.into(),
+            sensor_id: 0,
+            axis: String::new(),
+            alarm_bit: false,
+            t_sec: 1.0,
+            value,
+            request_id: 1,
+            source_kind: kind,
+        }
+    }
+    #[test]
+    fn devices_and_source_kinds_do_not_share_curves() {
+        let mut app = app();
+        app.handle_sample(sample("can://a:ch0", TelemetrySourceKind::CanAxis, 10.0));
+        app.handle_sample(sample("can://a:ch1", TelemetrySourceKind::CanAxis, 20.0));
+        app.handle_sample(sample("can://a:ch0", TelemetrySourceKind::CanSent, 30.0));
+        assert_eq!(app.source_series.len(), 3);
+        for (device, view, expected) in [
+            ("can://a:ch0", TestSignalView::CanFrame, 10.0),
+            ("can://a:ch1", TestSignalView::CanFrame, 20.0),
+            ("can://a:ch0", TestSignalView::Sent, 30.0),
+        ] {
+            let series = &app.source_series[&(device.into(), view, 0)];
+            assert_eq!(series.points.len(), 1);
+            assert_eq!(series.latest, Some(expected));
+        }
+    }
+    #[test]
+    fn mixed_sources_preserve_view_and_user_windows() {
+        let mut app = app();
+        app.handle_sample(sample("can://a", TelemetrySourceKind::CanAxis, 10.0));
+        app.dynamic_windows[0].title = "user window".into();
+        app.handle_sample(sample("tcp://b", TelemetrySourceKind::TcpFrame, 20.0));
+        assert_eq!(app.selected_view, TestSignalView::CanFrame);
+        assert_eq!(app.dynamic_windows[0].title, "user window");
+        app.dynamic_windows.clear();
+        app.handle_sample(sample("tcp://b", TelemetrySourceKind::TcpFrame, 30.0));
+        assert!(app.dynamic_windows.is_empty());
+    }
+    #[test]
+    fn manual_view_before_first_sample_is_respected() {
+        let mut app = app();
+        app.selected_view = TestSignalView::Demo;
+        app.view_initialized = true;
+        app.handle_sample(sample("tcp://b", TelemetrySourceKind::TcpFrame, 20.0));
+        assert_eq!(app.selected_view, TestSignalView::Demo);
+    }
+    #[test]
+    fn snapshot_repairs_missing_raise_and_clear_without_counting_duplicates() {
+        let mut app = app();
+        let alarm = AlarmEvent {
+            device_id: "a".into(),
+            alarm_id: "high".into(),
+            level: AlarmLevel::Critical,
+            message: "high".into(),
+            raised_at: std::time::SystemTime::now(),
+            cleared: false,
+        };
+        app.handle_ui_msg(UiMsg::AlarmSnapshot(vec![alarm.clone()]));
+        assert_eq!(app.active_alarms.len(), 1);
+        let first_received_at = app.active_alarms.values().next().unwrap().received_at;
+        app.handle_ui_msg(UiMsg::AlarmSnapshot(vec![alarm]));
+        assert_eq!(
+            app.active_alarms.values().next().unwrap().received_at,
+            first_received_at
+        );
+        assert_eq!(app.total_alarm_count, 0);
+        app.handle_ui_msg(UiMsg::AlarmSnapshot(vec![]));
+        assert!(app.active_alarms.is_empty());
     }
 }

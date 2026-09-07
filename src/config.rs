@@ -260,7 +260,8 @@ mod tests {
         let config = file.collector.unwrap();
 
         assert!(config.can_enabled);
-        assert_eq!(config.can_hardware_subtype, Some(HW_SUBTYPE_TC1016));
+        // Missing subtype requests model-based selection in the collector.
+        assert_eq!(config.can_hardware_subtype, None);
         assert_eq!(config.serial_baud, 2_000_000);
     }
 }

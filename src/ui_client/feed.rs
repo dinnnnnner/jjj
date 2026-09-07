@@ -20,11 +20,16 @@ fn send_feed_msg(tx: &SyncSender<UiMsg>, stats: &FeedStats, msg: FeedMsg) -> boo
         FeedMsg::Telemetry(msg) => UiMsg::Sample(msg),
         FeedMsg::Alarm(alarm) => UiMsg::Alarm(alarm),
         FeedMsg::Status(status) => UiMsg::Status(status),
+        FeedMsg::AlarmSnapshot(alarms) => UiMsg::AlarmSnapshot(alarms),
     };
     try_send_ui_msg(tx, stats, ui_msg)
 }
 
 fn try_send_ui_msg(tx: &SyncSender<UiMsg>, stats: &FeedStats, msg: UiMsg) -> bool {
+    // Keep the bounded queue, but never discard authoritative alarm state.
+    if matches!(msg, UiMsg::AlarmSnapshot(_)) {
+        return tx.send(msg).is_ok();
+    }
     match tx.try_send(msg) {
         Ok(()) => true,
         Err(TrySendError::Full(_)) => {
@@ -32,6 +37,34 @@ fn try_send_ui_msg(tx: &SyncSender<UiMsg>, stats: &FeedStats, msg: UiMsg) -> boo
             true
         }
         Err(TrySendError::Disconnected(_)) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn full_queue_drops_telemetry_but_delivers_alarm_snapshot() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let stats = FeedStats::default();
+        tx.send(UiMsg::Status("occupied".into())).unwrap();
+        assert!(try_send_ui_msg(
+            &tx,
+            &stats,
+            UiMsg::Status("droppable".into())
+        ));
+        assert_eq!(stats.dropped_messages.load(Ordering::Relaxed), 1);
+        let producer =
+            thread::spawn(move || try_send_ui_msg(&tx, &stats, UiMsg::AlarmSnapshot(vec![])));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            UiMsg::Status(_)
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            UiMsg::AlarmSnapshot(_)
+        ));
+        assert!(producer.join().unwrap());
     }
 }
 

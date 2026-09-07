@@ -485,6 +485,7 @@ impl DeviceSession {
 
         self.bus
             .publish(AppEvent::Device(DeviceEvent::TelemetrySample {
+                captured_at_ms: crate::db::writer::now_ms(),
                 device_id: self.device_id.clone(),
                 sensor_id,
                 t_sec: connection_start.elapsed().as_secs_f64(),

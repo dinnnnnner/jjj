@@ -3,7 +3,7 @@ pub(crate) use demo2::domain::alarm::SentJumpLevel;
 use eframe::egui;
 use std::time::Instant;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) enum TestSignalView {
     Demo,
     Sent,
@@ -28,6 +28,14 @@ pub(crate) enum SignalBinding {
 }
 
 impl SignalBinding {
+    pub(crate) fn view(self) -> TestSignalView {
+        match self {
+            Self::DemoAxisX | Self::DemoAxisY | Self::DemoAxisZ => TestSignalView::Demo,
+            Self::CanAxisX | Self::CanAxisY | Self::CanAxisZ => TestSignalView::CanFrame,
+            Self::TcpSensor(_) => TestSignalView::TcpFrame,
+            _ => TestSignalView::Sent,
+        }
+    }
     pub(crate) fn title(self, index: u32) -> String {
         match self {
             Self::DemoAxisX => format!("demo_x_{index}"),
@@ -60,10 +68,6 @@ impl SignalBinding {
             Self::CanAxisZ => 2,
             Self::TcpSensor(sensor_id) => sensor_id,
         }
-    }
-
-    pub(crate) fn uses_tcp_series(self) -> bool {
-        matches!(self, Self::TcpSensor(_))
     }
 
     pub(crate) fn chart_label(self) -> Option<&'static str> {
@@ -226,6 +230,8 @@ pub(crate) fn nearest_plot_point(points: &[egui_plot::PlotPoint], x_sec: f64) ->
 
 #[derive(Debug, Default)]
 pub(crate) struct CanReplayData {
+    pub(crate) device_id: String,
+    pub(crate) available_devices: Vec<String>,
     // PlotPoint lets egui_plot borrow these slices instead of rebuilding and
     // copying every series on every frame.
     pub(crate) x_points: Vec<egui_plot::PlotPoint>,
@@ -309,6 +315,8 @@ impl ReplayMode {
 }
 
 pub(crate) struct CanReplayState {
+    pub(crate) device_input: String,
+    pub(crate) available_devices: Vec<String>,
     pub(crate) open: bool,
     pub(crate) loading: bool,
     pub(crate) exporting: bool,
@@ -332,6 +340,8 @@ pub(crate) struct CanReplayState {
 impl CanReplayState {
     pub(crate) fn new(pg_dsn: String) -> Self {
         Self {
+            device_input: String::new(),
+            available_devices: Vec::new(),
             open: false,
             loading: false,
             exporting: false,

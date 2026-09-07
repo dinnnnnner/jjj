@@ -1033,14 +1033,51 @@ impl eframe::App for UiClientApp {
             });
             ui.horizontal(|ui| {
                 ui.label("Test signal");
-                ui.selectable_value(&mut self.selected_view, TestSignalView::Demo, "DEMO");
-                ui.selectable_value(&mut self.selected_view, TestSignalView::Sent, "SENT");
-                ui.selectable_value(&mut self.selected_view, TestSignalView::CanFrame, "CAN");
-                ui.selectable_value(&mut self.selected_view, TestSignalView::TcpFrame, "TCP");
+                for (view, label) in [
+                    (TestSignalView::Demo, "DEMO"),
+                    (TestSignalView::Sent, "SENT"),
+                    (TestSignalView::CanFrame, "CAN"),
+                    (TestSignalView::TcpFrame, "TCP"),
+                ] {
+                    if ui
+                        .selectable_value(&mut self.selected_view, view, label)
+                        .clicked()
+                    {
+                        self.view_initialized = true;
+                    }
+                }
                 if ui.button("Add").clicked() {
                     self.add_dynamic_window();
                 }
             });
+            let view = self.selected_view;
+            let mut devices: Vec<_> = self
+                .source_series
+                .keys()
+                .filter(|(_, source, _)| *source == view)
+                .map(|(device, _, _)| device.clone())
+                .collect();
+            devices.sort();
+            devices.dedup();
+            let mut selected = self
+                .selected_devices
+                .get(&view)
+                .cloned()
+                .unwrap_or_default();
+            egui::ComboBox::from_id_salt("live_device")
+                .selected_text(if selected.is_empty() {
+                    "等待设备"
+                } else {
+                    &selected
+                })
+                .show_ui(ui, |ui| {
+                    for device in devices {
+                        ui.selectable_value(&mut selected, device.clone(), device);
+                    }
+                });
+            if !selected.is_empty() {
+                self.selected_devices.insert(view, selected);
+            }
             ui.label(format!("状态: {}", self.status));
             ui.label(format!("总样本数: {}", self.total_samples));
             ui.label(format!(
@@ -1094,10 +1131,16 @@ impl eframe::App for UiClientApp {
                             return;
                         }
                         let raw_signal_id = format!("sensor_{sensor_id}_raw");
-                        let series = if binding.uses_tcp_series() {
-                            &self.tcp_sensors[sensor_id]
-                        } else {
-                            &self.sensors[sensor_id]
+                        let view = binding.view();
+                        let Some(device) = self.selected_devices.get(&view) else {
+                            ui.label("等待设备数据");
+                            return;
+                        };
+                        let Some(series) =
+                            self.source_series.get(&(device.clone(), view, sensor_id))
+                        else {
+                            ui.label("所选设备暂无此信号");
+                            return;
                         };
                         if let Some(v) = series.latest {
                             let text = if binding.is_can_axis() {

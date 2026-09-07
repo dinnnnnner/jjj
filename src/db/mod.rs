@@ -113,4 +113,5 @@ SELECT ensure_telemetry_partition_for_day(CURRENT_DATE);
 SELECT ensure_telemetry_partition_for_day(CURRENT_DATE + 1);
 "#;
 
+pub mod retry;
 pub mod writer;

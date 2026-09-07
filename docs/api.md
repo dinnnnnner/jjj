@@ -56,7 +56,7 @@ UI feed 是 TCP 长连接，不是 HTTP 或 JSON Lines。客户端连接 `ui_fee
 ```text
 wire_len:         u32，大端，表示后续 frame 的字节数
 frame_magic:      [u8; 4] = "JJJF"
-protocol_version: u16，大端，当前为 1
+protocol_version: u16，大端，当前为 2
 payload:          bincode(UiFeedMsg)，固定宽度整数编码
 ```
 
@@ -71,13 +71,17 @@ enum UiFeedMsg {
     Telemetry(TelemetryMsg),
     Alarm(AlarmEvent),
     Status(String),
+    AlarmSnapshot(Vec<AlarmEvent>),
 }
 ```
 
 ### 3.1 telemetry
 
+v2 在遥测消息开头增加 `captured_at_ms: i64`（采集端生成的 Unix 毫秒），写库及重试不重新生成时间。collector 与 UI 必须同时升级。`AlarmSnapshot` 在连接时及每秒发送，完整替换 UI 的当前活动告警集合；它不增加历史告警计数，用于恢复丢包和重连后的状态。
+
 ```text
 TelemetryMsg {
+  captured_at_ms: 1700000000123,
   device_id: "tcp://127.0.0.1:54321",
   sensor_id: 0,
   axis: "",
