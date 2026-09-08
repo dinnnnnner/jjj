@@ -307,16 +307,14 @@ async fn run_ui_forwarder(
                     }
                 }
                 if let Ok(frame) = encode_feed_msg(&UiFeedMsg::Telemetry(msg)) {
-                    if ui_tx.send(frame).is_err() {
-                        stats.ui_drop.fetch_add(1, Ordering::Relaxed);
-                    }
+                    // No subscribers is normal; actual queue loss is counted on Lagged.
+                    let _ = ui_tx.send(frame);
                 }
             }
             Ok(AppEvent::System(msg)) => {
                 if let Ok(frame) = encode_feed_msg(&UiFeedMsg::Status(msg)) {
-                    if ui_tx.send(frame).is_err() {
-                        stats.ui_drop.fetch_add(1, Ordering::Relaxed);
-                    }
+                    // No subscribers is normal; actual queue loss is counted on Lagged.
+                    let _ = ui_tx.send(frame);
                 }
             }
             Ok(_) => {}
@@ -362,9 +360,9 @@ async fn run_alarm_ui_forwarder(
         };
         match encode_feed_msg(&msg) {
             Ok(frame) => {
-                if ui_tx.send(frame).is_err() {
-                    stats.ui_drop.fetch_add(1, Ordering::Relaxed);
-                }
+                // SendError means no UI subscribers, including disconnect races.
+                // Actual queue loss is counted by receivers reporting Lagged.
+                let _ = ui_tx.send(frame);
             }
             Err(err) => {
                 warn!(%err, "alarm UI feed encode failed");
@@ -893,6 +891,85 @@ mod review_regression_tests {
     use demo2::domain::alarm_sync::AlarmTracker;
     use demo2::domain::{AlarmEvent, AlarmLevel};
     use demo2::feed::decode_feed_msg;
+
+    #[tokio::test]
+    async fn idle_snapshots_do_not_count_as_drops_and_new_subscribers_receive_state() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let bus = EventBus::new(32);
+            let sub = bus.subscribe_alarm_feed();
+            let mut observer = bus.subscribe_alarm_feed();
+            let (ui_tx, _) = broadcast::channel(32);
+            let stats = Arc::new(CollectorStats::default());
+            bus.publish(AppEvent::Device(DeviceEvent::AlarmRaised(AlarmEvent {
+                device_id: "can://test:ch0".into(),
+                alarm_id: "active while disconnected".into(),
+                level: AlarmLevel::Critical,
+                message: "jump".into(),
+                raised_at: std::time::SystemTime::UNIX_EPOCH,
+                cleared: false,
+            })));
+            let alarm_task = tokio::spawn(run_alarm_ui_forwarder(
+                bus.clone(),
+                sub,
+                ui_tx.clone(),
+                stats.clone(),
+            ));
+            let general_sub = bus.subscribe();
+            bus.publish(AppEvent::System("idle status".into()));
+            let general_task =
+                tokio::spawn(run_ui_forwarder(general_sub, ui_tx.clone(), stats.clone()));
+            // Observe actual periodic ticks with no UI subscriber, not a fixed sleep.
+            let mut snapshots = 0;
+            while snapshots < 2 {
+                if matches!(observer.recv().await.unwrap(), AlarmFeedEvent::Snapshot(_)) {
+                    snapshots += 1;
+                }
+            }
+            let mut client = ui_tx.subscribe();
+            bus.publish_alarm_snapshot();
+            bus.publish(AppEvent::System("connected".into()));
+            let mut state_received = false;
+            let mut status_received = false;
+            while !state_received || !status_received {
+                match decode_feed_msg(&client.recv().await.unwrap()).unwrap() {
+                    UiFeedMsg::AlarmSnapshot(snapshot) => {
+                        assert_eq!(snapshot.revision, 1);
+                        assert_eq!(snapshot.alarms.len(), 1);
+                        state_received = true;
+                    }
+                    UiFeedMsg::Status(msg) if msg == "connected" => status_received = true,
+                    _ => {}
+                }
+            }
+            assert_eq!(stats.ui_drop.load(Ordering::Relaxed), 0);
+            alarm_task.abort();
+            general_task.abort();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn connected_socket_still_counts_real_queue_overflow() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let bus = EventBus::new(8);
+            let stats = Arc::new(CollectorStats::default());
+            let (ui_tx, ui_rx) = broadcast::channel(1);
+            for msg in ["lost", "retained"] {
+                ui_tx.send(encode_feed_msg(&UiFeedMsg::Status(msg.into())).unwrap()).unwrap();
+            }
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            let task = tokio::spawn(serve_ui_client(server, ui_rx, stats.clone(), bus));
+            let len = client.read_u32().await.unwrap() as usize;
+            let mut frame = vec![0; len];
+            client.read_exact(&mut frame).await.unwrap();
+            assert!(matches!(decode_feed_msg(&frame).unwrap(), UiFeedMsg::Status(msg) if msg == "retained"));
+            assert_eq!(stats.ui_drop.load(Ordering::Relaxed), 1);
+            task.abort();
+        }).await.unwrap();
+    }
 
     #[tokio::test]
     async fn socket_delivers_alarm_history_before_repair_despite_delayed_forwarding() {

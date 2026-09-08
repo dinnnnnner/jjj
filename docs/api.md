@@ -210,6 +210,8 @@ control 接口是 TCP JSON 行协议。客户端连接 `control_addr`，发送�
 }
 ```
 
+`ui_drop` 统计 UI 转发或客户端队列溢出，以及告警 feed 编码失败。没有 UI 订阅者时的发送失败不计入丢包，空闲期间的定时快照不会增加此指标。
+
 ### 5.2 `GET /ready`
 
 当 TCP ingress 和 UI feed 都已就绪时返回：
