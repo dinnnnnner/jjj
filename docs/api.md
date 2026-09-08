@@ -79,9 +79,9 @@ enum UiFeedMsg {
 
 v3 保留 v2 的 `captured_at_ms: i64`（采集端生成的 Unix 毫秒），写库及重试不重新生成时间；告警消息改为带版本的结构，collector 与 UI 必须同时升级。
 
-`AlarmUpdate { epoch: Uuid, revision: u64, event: AlarmEvent }` 和 `AlarmSnapshot { epoch: Uuid, revision: u64, alarms: Vec<AlarmEvent> }` 使用同一告警状态版本。采集服务启动时生成 `epoch`，每次触发或恢复原子递增 `revision`。连接时及每秒发送快照。UI 拒绝不晚于已接收快照或同一告警最新增量的旧事件，应用较旧快照时保留更晚的触发和恢复。新 `epoch` 的快照重置活动状态，旧 `epoch` 的增量被忽略。快照不增加历史计数，不补齐丢失的历史事件。
+`AlarmUpdate { epoch: Uuid, revision: u64, event: AlarmEvent }` 和 `AlarmSnapshot { epoch: Uuid, revision: u64, alarms: Vec<AlarmEvent> }` 使用同一告警状态版本。采集服务启动时生成 `epoch`，每次触发或恢复原子递增 `revision`。连接时及每秒请求快照。增量与快照在同一告警状态锁内入队，由单一 UI 告警转发任务发送，快照不会越过队列中更早的增量。UI 拒绝不晚于已接收快照或同一告警最新增量的旧事件，应用较旧快照时保留更晚的触发和恢复。新 `epoch` 的快照重置活动状态，旧 `epoch` 的增量被忽略。快照不增加历史计数，不补齐丢失的历史事件。
 
-CAN 以每通道首个有效硬件微秒时间戳和回调入口主机时间建立映射，后续采样沿用硬件时间差，同帧信号共用时间。零时间戳回退到回调时间，倒退按时钟重置重新校准。这依赖每通道回调有序；绝对时间包含初次回调延迟，不保证跨设备时钟同步。
+CAN 以每通道首个有效硬件微秒时间戳和回调入口主机时间建立映射，后续采样沿用硬件时间差，同帧信号共用时间。零时间戳回退到回调时间，下一个有效时间戳重新校准；硬件时间倒退也按时钟重置重新校准。输出时间被限制为不小于上一帧，主机时钟倒退时也不会打乱曲线点的顺序。这依赖每通道回调有序；绝对时间包含初次回调延迟，不保证跨设备时钟同步。
 
 ```text
 TelemetryMsg {
@@ -209,6 +209,8 @@ control 接口是 TCP JSON 行协议。客户端连接 `control_addr`，发送�
   "last_db_error": null
 }
 ```
+
+`ui_drop` 统计 UI 转发或客户端队列溢出，以及告警 feed 编码失败。没有 UI 订阅者时的发送失败不计入丢包，空闲期间的定时快照不会增加此指标。
 
 ### 5.2 `GET /ready`
 

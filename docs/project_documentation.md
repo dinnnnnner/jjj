@@ -998,7 +998,7 @@ enum UiFeedMsg {
 
 ## 11. UI feed 消息格式
 
-采集服务向 UI feed 输出长度前缀二进制帧，每帧一个 `UiFeedMsg`。当前支持 `Telemetry`、`Alarm`、`Status` 和 `AlarmSnapshot` 四种枚举变体。快照每秒校准活动状态；UI 忽略旧增量，应用较旧快照时保留之后的增量，新进程的快照重置版本。详细结构见 `docs/api.md`。解码会校验 1 MiB 上限、魔数、协议版本、payload 完整性和尾随字节。
+采集服务向 UI feed 输出长度前缀二进制帧，每帧一个 `UiFeedMsg`。当前支持 `Telemetry`、`Alarm`、`Status` 和 `AlarmSnapshot` 四种枚举变体。告警增量和快照在同一状态锁内进入专用广播队列，`run_alarm_ui_forwarder` 按队列顺序统一输出；普通事件转发任务跳过告警副本。连接时请求和每秒定时请求的快照均使用此路径。快照每秒校准活动状态；UI 忽略旧增量，应用较旧快照时保留之后的增量，新进程的快照重置版本。详细结构见 `docs/api.md`。解码会校验 1 MiB 上限、魔数、协议版本、payload 完整性和尾随字节。
 
 Telemetry payload：
 
