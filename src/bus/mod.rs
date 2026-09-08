@@ -57,6 +57,13 @@ pub enum AppEvent {
     Alarm(AlarmUpdate),
 }
 
+/// One ordered stream for alarm history and state repair, shared by all stages.
+#[derive(Clone, Debug)]
+pub enum AlarmFeedEvent {
+    Update(AlarmUpdate),
+    Snapshot(AlarmSnapshot),
+}
+
 /// In-process pub/sub bus.
 ///
 /// Note: broadcast channel is bounded; if a subscriber is too slow,
@@ -64,6 +71,7 @@ pub enum AppEvent {
 #[derive(Clone)]
 pub struct EventBus {
     tx: broadcast::Sender<AppEvent>,
+    alarm_tx: broadcast::Sender<AlarmFeedEvent>,
     active_alarms: Arc<std::sync::Mutex<AlarmState>>,
 }
 
@@ -86,8 +94,10 @@ impl Default for AlarmState {
 impl EventBus {
     pub fn new(capacity: usize) -> Self {
         let (tx, _) = broadcast::channel(capacity);
+        let (alarm_tx, _) = broadcast::channel(capacity);
         Self {
             tx,
+            alarm_tx,
             active_alarms: Arc::default(),
         }
     }
@@ -121,11 +131,13 @@ impl EventBus {
             state.active.insert(key, alarm.clone());
         }
         // Assign revisions, update truth and publish in the same critical section.
-        let _ = self.tx.send(AppEvent::Alarm(AlarmUpdate {
+        let update = AlarmUpdate {
             epoch: state.epoch,
             revision: state.revision,
             event: alarm,
-        }));
+        };
+        let _ = self.alarm_tx.send(AlarmFeedEvent::Update(update.clone()));
+        let _ = self.tx.send(AppEvent::Alarm(update));
     }
 
     pub fn alarm_snapshot(&self) -> AlarmSnapshot {
@@ -141,11 +153,28 @@ impl EventBus {
         self.tx.subscribe()
     }
 
+    pub fn subscribe_alarm_feed(&self) -> broadcast::Receiver<AlarmFeedEvent> {
+        self.alarm_tx.subscribe()
+    }
+
+    /// Queue the snapshot under the same lock as transitions. Reading state and
+    /// sending later would let a snapshot overtake otherwise deliverable history.
+    pub fn publish_alarm_snapshot(&self) {
+        let state = self.active_alarms.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshot = AlarmSnapshot {
+            epoch: state.epoch,
+            revision: state.revision,
+            alarms: state.active.values().cloned().collect(),
+        };
+        let _ = self.alarm_tx.send(AlarmFeedEvent::Snapshot(snapshot));
+    }
+
     /// A processing stage has a separate event queue but shares alarm truth.
     pub fn processing_stage(&self, capacity: usize) -> Self {
         let (tx, _) = broadcast::channel(capacity);
         Self {
             tx,
+            alarm_tx: self.alarm_tx.clone(),
             active_alarms: self.active_alarms.clone(),
         }
     }

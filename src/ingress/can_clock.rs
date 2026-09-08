@@ -15,13 +15,17 @@ pub(super) struct CanClock {
     origin: Option<SystemTime>,
     anchor: Option<(u64, SystemTime)>,
     last_timestamp_us: Option<u64>,
+    last_captured_at: Option<SystemTime>,
 }
 
 impl CanClock {
     pub fn capture(&mut self, timestamp_us: u64, received_at: SystemTime) -> FrameTime {
         let origin = *self.origin.get_or_insert(received_at);
         let captured_at = if timestamp_us == 0 {
-            // A missing hardware timestamp must not acquire ingress queue delay.
+            // Resume from a fresh mapping after fallback, rather than jumping
+            // back to the old hardware timeline on the next valid timestamp.
+            self.anchor = None;
+            self.last_timestamp_us = None;
             received_at
         } else {
             if self.anchor.is_none()
@@ -38,6 +42,15 @@ impl CanClock {
                 .checked_add(Duration::from_micros(timestamp_us - anchor_us))
                 .unwrap_or(received_at)
         };
+        // Host time can move backward too. Keep points ordered and re-anchor
+        // valid hardware time so subsequent frames retain their spacing.
+        let captured_at = self
+            .last_captured_at
+            .map_or(captured_at, |last| last.max(captured_at));
+        if timestamp_us != 0 {
+            self.anchor = Some((timestamp_us, captured_at));
+        }
+        self.last_captured_at = Some(captured_at);
         FrameTime {
             captured_at,
             t_sec: captured_at
@@ -68,7 +81,7 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_clock_uses_callback_time_without_resetting_valid_anchor() {
+    fn unavailable_clock_reanchors_the_next_valid_timestamp() {
         let start = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
         let mut clock = CanClock::default();
         assert_eq!(clock.capture(0, start).captured_at, start);
@@ -76,7 +89,26 @@ mod tests {
         assert_eq!(clock.capture(0, start + Duration::from_secs(2)).t_sec, 2.0);
         assert_eq!(
             clock.capture(1_100, start + Duration::from_secs(3)).t_sec,
-            1.001
+            3.0
         );
+        assert_eq!(
+            clock.capture(2_100, start + Duration::from_secs(4)).t_sec,
+            3.001
+        );
+    }
+
+    #[test]
+    fn repeated_missing_timestamps_and_host_clock_rollback_stay_ordered() {
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let mut clock = CanClock::default();
+        let inputs = [(100, 0), (0, 5), (0, 4), (1_100, 3), (2_100, 6), (10, 2)];
+        let expected = [0.0, 5.0, 5.0, 5.0, 5.001, 5.001];
+        let mut previous = start;
+        for ((hardware, received_secs), t_sec) in inputs.into_iter().zip(expected) {
+            let frame = clock.capture(hardware, start + Duration::from_secs(received_secs));
+            assert!(frame.captured_at >= previous);
+            assert_eq!(frame.t_sec, t_sec);
+            previous = frame.captured_at;
+        }
     }
 }

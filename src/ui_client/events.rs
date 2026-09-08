@@ -265,6 +265,40 @@ mod tests {
         assert_eq!(app.selected_view, TestSignalView::Demo);
     }
     #[test]
+    fn ordered_alarm_stream_preserves_history_when_snapshot_is_requested_before_delivery() {
+        use demo2::bus::{AlarmFeedEvent, AppEvent, DeviceEvent, EventBus};
+        let mut app = app();
+        let raw = EventBus::new(8);
+        let processed = raw.processing_stage(8);
+        let mut updates = processed.subscribe_alarm_feed();
+        let alarm = AlarmEvent {
+            device_id: "can://test:ch0".into(),
+            alarm_id: "jump".into(),
+            level: AlarmLevel::Critical,
+            message: "jump".into(),
+            raised_at: std::time::SystemTime::UNIX_EPOCH,
+            cleared: false,
+        };
+        raw.publish(AppEvent::Device(DeviceEvent::AlarmRaised(alarm.clone())));
+        processed.publish(AppEvent::Device(DeviceEvent::AlarmCleared(alarm)));
+        // Repair is queued before the UI has processed either transition.
+        processed.publish_alarm_snapshot();
+        while let Ok(event) = updates.try_recv() {
+            match event {
+                AlarmFeedEvent::Update(update) => app.handle_ui_msg(UiMsg::Alarm(update)),
+                AlarmFeedEvent::Snapshot(snapshot) => {
+                    app.handle_ui_msg(UiMsg::AlarmSnapshot(snapshot))
+                }
+            }
+        }
+        assert!(app.active_alarms.is_empty());
+        assert_eq!(app.total_alarm_count, 2);
+        assert_eq!(app.alarm_history.len(), 2);
+        assert!(app.alarm_history[0].event.cleared);
+        assert!(!app.alarm_history[1].event.cleared);
+    }
+
+    #[test]
     fn delayed_alarm_cannot_override_snapshot_or_increment_history() {
         let mut app = app();
         let epoch = uuid::Uuid::new_v4();
