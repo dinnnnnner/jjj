@@ -2,6 +2,7 @@ use crate::{
     AlarmRecordState, AlarmViewItem, CanAlarmThresholds, CanReplayState, DynamicSignalWindow,
     SENSOR_COUNT, SentAngleJumpThresholds, SentTorqueJumpThresholds, TestSignalView,
 };
+use demo2::domain::alarm_sync::AlarmTracker;
 use demo2::signal::{SignalProcessor, default_signal_specs};
 use std::collections::{HashMap, VecDeque};
 
@@ -24,6 +25,7 @@ pub(crate) struct UiClientState {
     pub(crate) sent1_group_index: u32,
     pub(crate) can_group_index: u32,
     pub(crate) tcp_group_index: u32,
+    pub(crate) alarm_tracker: AlarmTracker,
     pub(crate) active_alarms: HashMap<String, AlarmViewItem>,
     pub(crate) alarm_history: VecDeque<AlarmViewItem>,
     pub(crate) total_alarm_count: u64,
@@ -54,6 +56,7 @@ impl UiClientState {
             sent1_group_index: 1,
             can_group_index: 1,
             tcp_group_index: 1,
+            alarm_tracker: AlarmTracker::default(),
             active_alarms: HashMap::new(),
             alarm_history: VecDeque::with_capacity(max_alarm_history),
             total_alarm_count: 0,

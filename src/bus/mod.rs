@@ -1,3 +1,4 @@
+use crate::domain::alarm_sync::{AlarmSnapshot, AlarmUpdate};
 use crate::domain::{AlarmEvent, ConnState, DeviceId, DeviceSnapshot, RequestId};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -52,6 +53,8 @@ pub enum DeviceEvent {
 pub enum AppEvent {
     Device(DeviceEvent),
     System(String),
+    /// Alarm transition versioned atomically with shared state.
+    Alarm(AlarmUpdate),
 }
 
 /// In-process pub/sub bus.
@@ -61,7 +64,23 @@ pub enum AppEvent {
 #[derive(Clone)]
 pub struct EventBus {
     tx: broadcast::Sender<AppEvent>,
-    active_alarms: Arc<std::sync::Mutex<HashMap<(String, String), AlarmEvent>>>,
+    active_alarms: Arc<std::sync::Mutex<AlarmState>>,
+}
+
+struct AlarmState {
+    epoch: uuid::Uuid,
+    revision: u64,
+    active: HashMap<(String, String), AlarmEvent>,
+}
+
+impl Default for AlarmState {
+    fn default() -> Self {
+        Self {
+            epoch: uuid::Uuid::new_v4(),
+            revision: 0,
+            active: HashMap::new(),
+        }
+    }
 }
 
 impl EventBus {
@@ -74,35 +93,48 @@ impl EventBus {
     }
 
     pub fn publish(&self, evt: AppEvent) {
-        // Update authoritative state before the lossy broadcast channel.
-        match &evt {
-            AppEvent::Device(DeviceEvent::AlarmRaised(alarm)) => {
-                self.active_alarms
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(
-                        (alarm.device_id.clone(), alarm.alarm_id.clone()),
-                        alarm.clone(),
-                    );
+        match evt {
+            AppEvent::Device(DeviceEvent::AlarmRaised(mut alarm)) => {
+                alarm.cleared = false;
+                self.publish_alarm(alarm);
             }
-            AppEvent::Device(DeviceEvent::AlarmCleared(alarm)) => {
-                self.active_alarms
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&(alarm.device_id.clone(), alarm.alarm_id.clone()));
+            AppEvent::Device(DeviceEvent::AlarmCleared(mut alarm)) => {
+                alarm.cleared = true;
+                self.publish_alarm(alarm);
             }
-            _ => {}
+            other => {
+                let _ = self.tx.send(other);
+            }
         }
-        let _ = self.tx.send(evt);
     }
 
-    pub fn active_alarms(&self) -> Vec<AlarmEvent> {
-        self.active_alarms
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .cloned()
-            .collect()
+    fn publish_alarm(&self, alarm: AlarmEvent) {
+        let mut state = self.active_alarms.lock().unwrap_or_else(|e| e.into_inner());
+        state.revision = state
+            .revision
+            .checked_add(1)
+            .expect("alarm revision exhausted");
+        let key = (alarm.device_id.clone(), alarm.alarm_id.clone());
+        if alarm.cleared {
+            state.active.remove(&key);
+        } else {
+            state.active.insert(key, alarm.clone());
+        }
+        // Assign revisions, update truth and publish in the same critical section.
+        let _ = self.tx.send(AppEvent::Alarm(AlarmUpdate {
+            epoch: state.epoch,
+            revision: state.revision,
+            event: alarm,
+        }));
+    }
+
+    pub fn alarm_snapshot(&self) -> AlarmSnapshot {
+        let state = self.active_alarms.lock().unwrap_or_else(|e| e.into_inner());
+        AlarmSnapshot {
+            epoch: state.epoch,
+            revision: state.revision,
+            alarms: state.active.values().cloned().collect(),
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<AppEvent> {
@@ -142,16 +174,37 @@ mod tests {
             cleared: false,
         };
         raw.publish(AppEvent::Device(DeviceEvent::AlarmRaised(alarm.clone())));
-        assert_eq!(stage.active_alarms().len(), 1);
+        let raised = rx.try_recv().unwrap();
+        assert!(
+            matches!(&raised, AppEvent::Alarm(update) if update.revision == 1 && !update.event.cleared)
+        );
+        assert_eq!(stage.alarm_snapshot().alarms.len(), 1);
         alarm.cleared = true;
         raw.publish(AppEvent::Device(DeviceEvent::AlarmCleared(alarm.clone())));
+        let cleared = rx.try_recv().unwrap();
+        assert!(
+            matches!(&cleared, AppEvent::Alarm(update) if update.revision == 2 && update.event.cleared)
+        );
+        raw.publish(AppEvent::System("overflow 1".into()));
+        raw.publish(AppEvent::System("overflow 2".into()));
         assert!(matches!(
             rx.try_recv(),
             Err(broadcast::error::TryRecvError::Lagged(_))
         ));
-        alarm.cleared = false;
-        stage.publish_forwarded(AppEvent::Device(DeviceEvent::AlarmRaised(alarm)));
-        assert!(stage.active_alarms().is_empty());
+        let snapshot = stage.alarm_snapshot();
+        assert_eq!(snapshot.revision, 2);
+        let mut stage_rx = stage.subscribe();
+        stage.publish_forwarded(raised);
+        let AppEvent::Alarm(delayed) = stage_rx.try_recv().unwrap() else {
+            panic!("expected forwarded alarm update")
+        };
+        assert_eq!(delayed.epoch, snapshot.epoch);
+        assert_eq!(delayed.revision, 1);
+        let mut tracker = crate::domain::alarm_sync::AlarmTracker::default();
+        tracker.apply_snapshot(&snapshot);
+        assert!(!tracker.apply_update(&delayed));
+        assert_eq!(tracker.active().count(), 0);
+        assert!(stage.alarm_snapshot().alarms.is_empty());
     }
 }
 

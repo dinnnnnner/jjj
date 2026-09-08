@@ -374,14 +374,17 @@ CAN 数据解析约定：
 - `identifier = 0x102` -> sensor 1 / axis y
 - `identifier = 0x104` -> sensor 2 / axis z
 - `identifier = 3` -> SENT error
-- 其他非 TX 且数据长度足够的 CAN FD 帧可解析 SENT values：
+- `identifier = 1` -> 小端 i16，offset 4/6/8 分别对应 S angle / T2 angle / T2 torque。
+- `identifier = 2` -> 小端 i16，offset 6/8 对应 T1 angle / T1 torque。
+- ID 1/2 要求至少 10 字节，填充到 64 字节也只走整数解码器。
+- 其他非 TX、非 ID 1/2/3 且至少 53 字节的 CAN FD 帧可解析 SENT values：
   - sensor 0：T1 angle，读取 offset 25 的 little-endian f32
   - sensor 1：T1 torque，读取 offset 29 的 little-endian f32
   - sensor 2：T2 angle，读取 offset 1 的 little-endian f32
   - sensor 3：T2 torque，读取 offset 5 的 little-endian f32
   - sensor 4：S angle，读取 offset 49 的 little-endian f32
 
-SENT values 解析后是否经过入口移动平均滤波由 `sent_filter_enabled` 决定。启用后，角度信号使用圆周平均，扭矩信号使用普通算术平均。入口移动平均发生在 `run_can_ingress` 发布 `TelemetrySample` 之前。
+三种 SENT 数据格式解析后是否经过入口移动平均滤波都由 `sent_filter_enabled` 决定。启用后，角度信号使用圆周平均，扭矩信号使用普通算术平均。入口移动平均发生在 `run_can_ingress` 发布 `TelemetrySample` 之前。
 
 ### 4.8 `src/signal`
 
@@ -985,16 +988,17 @@ collector 侧上传的逻辑消息枚举为：
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum UiFeedMsg {
     Telemetry(TelemetryMsg),
-    Alarm(AlarmEvent),
+    Alarm(AlarmUpdate),
     Status(String),
+    AlarmSnapshot(AlarmSnapshot),
 }
 ```
 
-线上 frame 结构为 `u32 大端长度 + "JJJF" + u16 大端版本 + bincode payload`。长度前缀不计入 frame，frame 最大为 1 MiB；当前协议版本为 2，新增采集时间和活动告警快照，采集端与 UI 必须同时升级。
+线上 frame 结构为 `u32 大端长度 + "JJJF" + u16 大端版本 + bincode payload`。长度前缀不计入 frame，frame 最大为 1 MiB；当前协议版本为 3，告警增量和快照都携带采集进程 UUID `epoch` 与递增序号 `revision`，采集端与 UI 必须同时升级。
 
 ## 11. UI feed 消息格式
 
-采集服务向 UI feed 输出长度前缀二进制帧，每帧一个 `UiFeedMsg`。当前支持 `Telemetry`、`Alarm` 和 `Status` 三种枚举变体。解码会校验 1 MiB 上限、魔数、协议版本、payload 完整性和尾随字节。
+采集服务向 UI feed 输出长度前缀二进制帧，每帧一个 `UiFeedMsg`。当前支持 `Telemetry`、`Alarm`、`Status` 和 `AlarmSnapshot` 四种枚举变体。快照每秒校准活动状态；UI 忽略旧增量，应用较旧快照时保留之后的增量，新进程的快照重置版本。详细结构见 `docs/api.md`。解码会校验 1 MiB 上限、魔数、协议版本、payload 完整性和尾随字节。
 
 Telemetry payload：
 
@@ -1164,15 +1168,15 @@ sent_filter_window = 10
 
 实现位置：
 
-- `src/ingress/can.rs` 中的 `SentMovingAverage`。
-- `run_can_ingress` 收到 `decode_sent_values` 结果后，如果 `sent_filter_enabled = true`，会调用 `sent_filter.apply(values)`。
+- `src/signal/mod.rs` 中的 `SentMovingAverage`，由 `src/ingress/can.rs` 调用。
+- `CanIngressCore::handle_frame` 选择当前格式解码后，如果 `sent_filter_enabled = true`，会对每个信号调用 `sent_filter.apply_sample(sensor_id, value)`。
 
 处理规则：
 
 - sensor 0 / 2 / 4：T1 angle、T2 angle、S angle，使用圆周平均，避免 359 度与 0 度附近被错误平均到 180 度。
 - sensor 1 / 3：T1 torque、T2 torque，使用普通算术平均。
 
-该滤波发生在 CAN SENT 入口层，早于 raw bus 发布。关闭 `sent_filter_enabled` 后，CAN SENT 入口会直接发布 `decode_sent_values` 解析出的值。
+该滤波发生在 CAN SENT 入口层，早于 raw bus 发布。关闭 `sent_filter_enabled` 后，CAN SENT 入口会直接发布当前格式解码出的值。三个格式都只更新当前帧包含的信号窗口，各设备和通道互不影响。
 
 ### 15.3 原始值与下游可见值
 

@@ -1,4 +1,5 @@
 use demo2::domain::AlarmEvent;
+use demo2::domain::alarm_sync::{AlarmSnapshot, AlarmUpdate};
 use demo2::ingress::can::enqueue_can_tx;
 use demo2::transport::can::CanTxFrame;
 use eframe::egui;
@@ -26,8 +27,8 @@ pub(crate) use ui_client::time::*;
 enum UiMsg {
     Status(String),
     Sample(TelemetryMsg),
-    Alarm(AlarmEvent),
-    AlarmSnapshot(Vec<AlarmEvent>),
+    Alarm(AlarmUpdate),
+    AlarmSnapshot(AlarmSnapshot),
     CanReplayLoaded(ReplayMode, Result<CanReplayData, String>),
     CanReplayExported(Result<String, String>),
     AlarmRecordsLoaded(Result<AlarmRecordData, String>),

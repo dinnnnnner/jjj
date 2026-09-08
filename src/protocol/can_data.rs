@@ -7,7 +7,7 @@ pub struct SentCanError {
 }
 
 pub fn decode_sent_values(is_tx: bool, identifier: u32, data: &[u8]) -> Option<[(usize, f64); 5]> {
-    if is_tx || matches!(identifier, 1 | 3) {
+    if is_tx || matches!(identifier, 1..=3) {
         return None;
     }
     if data.len() < 53 {
@@ -110,6 +110,14 @@ fn read_i16_le(data: &[u8], offset: usize) -> Option<i16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_float_decoder_does_not_accept_either_integer_sent_id() {
+        for id in [1, 2, 3] {
+            assert!(decode_sent_values(false, id, &[0; 64]).is_none());
+        }
+        assert!(decode_sent_values(false, 4, &[0; 64]).is_some());
+    }
 
     #[test]
     fn sent_1_reads_raw_i16_fields() {

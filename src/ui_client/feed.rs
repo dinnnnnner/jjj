@@ -54,8 +54,17 @@ mod tests {
             UiMsg::Status("droppable".into())
         ));
         assert_eq!(stats.dropped_messages.load(Ordering::Relaxed), 1);
-        let producer =
-            thread::spawn(move || try_send_ui_msg(&tx, &stats, UiMsg::AlarmSnapshot(vec![])));
+        let producer = thread::spawn(move || {
+            try_send_ui_msg(
+                &tx,
+                &stats,
+                UiMsg::AlarmSnapshot(crate::AlarmSnapshot {
+                    epoch: uuid::Uuid::nil(),
+                    revision: 1,
+                    alarms: vec![],
+                }),
+            )
+        });
         assert!(matches!(
             rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             UiMsg::Status(_)

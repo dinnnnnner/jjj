@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use windows_sys::Win32::System::LibraryLoader::SetDllDirectoryW;
 
@@ -101,6 +101,8 @@ pub struct CanFrame {
     pub dlc: u8,
     pub identifier: u32,
     pub timestamp_us: u64,
+    /// Host time at callback entry, before queueing.
+    pub received_at: SystemTime,
     pub data: [u8; 64],
 }
 
@@ -523,6 +525,7 @@ unsafe extern "system" fn on_can_event(_: *mut i32, frame: *const TLibCan) {
         return;
     }
 
+    let received_at = SystemTime::now();
     let sender = CALLBACK_SENDERS.get_or_init(|| Mutex::new(Vec::new()));
     let Ok(guard) = sender.lock() else {
         return;
@@ -538,6 +541,7 @@ unsafe extern "system" fn on_can_event(_: *mut i32, frame: *const TLibCan) {
         dlc: raw.dlc,
         identifier: raw.identifier as u32,
         timestamp_us: raw.time_us,
+        received_at,
         data: {
             let mut data = [0u8; 64];
             data[..8].copy_from_slice(&raw.data);
@@ -554,6 +558,7 @@ unsafe extern "system" fn on_canfd_event(_: *mut i32, frame: *const TLibCanFd) {
         return;
     }
 
+    let received_at = SystemTime::now();
     let sender = CALLBACK_SENDERS.get_or_init(|| Mutex::new(Vec::new()));
     let Ok(guard) = sender.lock() else {
         return;
@@ -569,6 +574,7 @@ unsafe extern "system" fn on_canfd_event(_: *mut i32, frame: *const TLibCanFd) {
         dlc: raw.dlc,
         identifier: raw.identifier as u32,
         timestamp_us: raw.time_us,
+        received_at,
         data: raw.data,
     };
     for (_, tx) in guard.iter() {

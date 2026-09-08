@@ -276,21 +276,26 @@ impl SentMovingAverage {
     }
 
     pub fn apply(&mut self, values: [(usize, f64); 5]) -> [(usize, f64); 5] {
-        values.map(|(sensor_id, value)| {
-            let Some(window) = self.windows.get_mut(sensor_id) else {
-                return (sensor_id, value);
-            };
-            window.push_back(value);
-            while window.len() > self.window_size {
-                let _ = window.pop_front();
-            }
-            let filtered = if matches!(sensor_id, 0 | 2 | 4) {
-                circular_mean_degrees(window, value)
-            } else {
-                window.iter().sum::<f64>() / window.len() as f64
-            };
-            (sensor_id, filtered)
-        })
+        values.map(|(sensor_id, value)| (sensor_id, self.apply_sample(sensor_id, value)))
+    }
+
+    /// Update only the signal present in this frame; other windows stay intact.
+    pub fn apply_sample(&mut self, sensor_id: usize, value: f64) -> f64 {
+        let Some(window) = self.windows.get_mut(sensor_id) else {
+            return value;
+        };
+        if !value.is_finite() {
+            return value;
+        }
+        window.push_back(value);
+        while window.len() > self.window_size {
+            window.pop_front();
+        }
+        if matches!(sensor_id, 0 | 2 | 4) {
+            circular_mean_degrees(window, value)
+        } else {
+            window.iter().sum::<f64>() / window.len() as f64
+        }
     }
 }
 

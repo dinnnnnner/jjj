@@ -1,10 +1,10 @@
 use crate::bus::TelemetrySourceKind;
-use crate::domain::AlarmEvent;
+use crate::domain::alarm_sync::{AlarmSnapshot, AlarmUpdate};
 use bincode::Options;
 use serde::{Deserialize, Serialize};
 
 pub const FEED_MAGIC: [u8; 4] = *b"JJJF";
-pub const FEED_PROTOCOL_VERSION: u16 = 2;
+pub const FEED_PROTOCOL_VERSION: u16 = 3;
 pub const MAX_FEED_FRAME_LEN: usize = 1024 * 1024;
 const FEED_HEADER_LEN: usize = FEED_MAGIC.len() + size_of::<u16>();
 const MAX_FEED_PAYLOAD_LEN: u64 = (MAX_FEED_FRAME_LEN - FEED_HEADER_LEN) as u64;
@@ -25,9 +25,9 @@ pub struct TelemetryMsg {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum UiFeedMsg {
     Telemetry(TelemetryMsg),
-    Alarm(AlarmEvent),
+    Alarm(AlarmUpdate),
     Status(String),
-    AlarmSnapshot(Vec<AlarmEvent>),
+    AlarmSnapshot(AlarmSnapshot),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -106,10 +106,41 @@ mod tests {
         };
         assert_eq!(decoded.captured_at_ms, 123456789);
         assert_eq!(decoded.t_sec, 0.123);
-        assert!(
-            matches!(decode_feed_msg(&encode_feed_msg(&UiFeedMsg::AlarmSnapshot(vec![])).unwrap()).unwrap(),
-            UiFeedMsg::AlarmSnapshot(alarms) if alarms.is_empty())
-        );
+        let epoch = uuid::Uuid::new_v4();
+        let update = AlarmUpdate {
+            epoch,
+            revision: 7,
+            event: crate::domain::AlarmEvent {
+                device_id: "can://test:ch0".into(),
+                alarm_id: "sent_angle_jump_t1".into(),
+                level: crate::domain::AlarmLevel::Critical,
+                message: "jump".into(),
+                raised_at: std::time::SystemTime::UNIX_EPOCH,
+                cleared: false,
+            },
+        };
+        let msg = UiFeedMsg::Alarm(update.clone());
+        let UiFeedMsg::Alarm(decoded) = decode_feed_msg(&encode_feed_msg(&msg).unwrap()).unwrap()
+        else {
+            panic!("expected alarm update")
+        };
+        assert_eq!(decoded.epoch, epoch);
+        assert_eq!(decoded.revision, 7);
+        assert_eq!(decoded.event.alarm_id, update.event.alarm_id);
+        let msg = UiFeedMsg::AlarmSnapshot(AlarmSnapshot {
+            epoch,
+            revision: 7,
+            alarms: vec![update.event],
+        });
+        let UiFeedMsg::AlarmSnapshot(decoded) =
+            decode_feed_msg(&encode_feed_msg(&msg).unwrap()).unwrap()
+        else {
+            panic!("expected alarm snapshot")
+        };
+        assert_eq!(decoded.epoch, epoch);
+        assert_eq!(decoded.revision, 7);
+        assert_eq!(decoded.alarms.len(), 1);
+        assert_eq!(decoded.alarms[0].alarm_id, "sent_angle_jump_t1");
     }
 
     #[test]
@@ -130,12 +161,13 @@ mod tests {
     #[test]
     fn feed_frame_rejects_unknown_version() {
         let mut frame = encode_feed_msg(&UiFeedMsg::Status("ready".to_string())).unwrap();
-        frame[4..6].copy_from_slice(&(FEED_PROTOCOL_VERSION + 1).to_be_bytes());
-
-        assert!(matches!(
-            decode_feed_msg(&frame),
-            Err(FeedDecodeError::UnsupportedVersion(version)) if version == FEED_PROTOCOL_VERSION + 1
-        ));
+        for rejected in [2, FEED_PROTOCOL_VERSION + 1] {
+            frame[4..6].copy_from_slice(&rejected.to_be_bytes());
+            assert!(matches!(
+                decode_feed_msg(&frame),
+                Err(FeedDecodeError::UnsupportedVersion(version)) if version == rejected
+            ));
+        }
     }
 
     #[test]

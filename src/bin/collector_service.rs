@@ -248,7 +248,7 @@ async fn serve_ui_client(
         let next = tokio::select! {
             biased;
             _ = snapshot_tick.tick() => {
-                match encode_feed_msg(&UiFeedMsg::AlarmSnapshot(bus.active_alarms())) {
+                match encode_feed_msg(&UiFeedMsg::AlarmSnapshot(bus.alarm_snapshot())) {
                     Ok(frame) => Ok(frame),
                     Err(err) => { warn!(%err, "alarm snapshot encode failed"); break; }
                 }
@@ -321,8 +321,7 @@ async fn run_ui_forwarder(
                     }
                 }
             }
-            Ok(AppEvent::Device(DeviceEvent::AlarmRaised(alarm)))
-            | Ok(AppEvent::Device(DeviceEvent::AlarmCleared(alarm))) => {
+            Ok(AppEvent::Alarm(alarm)) => {
                 if let Ok(frame) = encode_feed_msg(&UiFeedMsg::Alarm(alarm)) {
                     if ui_tx.send(frame).is_err() {
                         stats.ui_drop.fetch_add(1, Ordering::Relaxed);
@@ -515,11 +514,8 @@ async fn run_persistence_forwarder(
                     }
                 }
             }
-            Ok(AppEvent::Device(DeviceEvent::AlarmRaised(alarm))) => {
-                let _ = db_tx.send(DbCmd::Alarm(alarm)).await;
-            }
-            Ok(AppEvent::Device(DeviceEvent::AlarmCleared(alarm))) => {
-                let _ = db_tx.send(DbCmd::Alarm(alarm)).await;
+            Ok(AppEvent::Alarm(update)) => {
+                let _ = db_tx.send(DbCmd::Alarm(update.event)).await;
             }
             Ok(AppEvent::System(msg)) => {
                 let _ = db_tx
