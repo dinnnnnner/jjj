@@ -1,6 +1,5 @@
 use crate::*;
 use demo2::bus::TelemetrySourceKind;
-use demo2::domain::AlarmEvent;
 use demo2::domain::telemetry::{sent_angle_label, sent_torque_label};
 use demo2::signal::{SignalKind, SignalSample};
 use std::io::{BufRead, BufReader, Write};
@@ -12,7 +11,11 @@ impl UiClientApp {
         format!("{}::{}", event.device_id, event.alarm_id)
     }
 
-    pub(crate) fn apply_alarm(&mut self, alarm: AlarmEvent) {
+    pub(crate) fn apply_alarm(&mut self, update: AlarmUpdate) {
+        if !self.alarm_tracker.apply_update(&update) {
+            return;
+        }
+        let alarm = update.event;
         let key = Self::alarm_key(&alarm);
         let received_at = Instant::now();
         self.total_alarm_count = self.total_alarm_count.saturating_add(1);
@@ -47,7 +50,15 @@ impl UiClientApp {
         }
     }
 
-    pub(crate) fn apply_alarm_snapshot(&mut self, alarms: Vec<AlarmEvent>) {
+    pub(crate) fn apply_alarm_snapshot(&mut self, snapshot: AlarmSnapshot) {
+        let same_epoch = self.alarm_tracker.epoch() == Some(snapshot.epoch);
+        if !self.alarm_tracker.apply_snapshot(&snapshot) {
+            return;
+        }
+        if !same_epoch {
+            self.active_alarms.clear();
+        }
+        let alarms: Vec<_> = self.alarm_tracker.active().cloned().collect();
         let received_at = Instant::now();
         let previous = std::mem::take(&mut self.active_alarms);
         self.active_alarms = alarms

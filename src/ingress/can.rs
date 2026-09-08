@@ -1,3 +1,4 @@
+use super::can_clock::{CanClock, FrameTime};
 use crate::bus::{AppEvent, DeviceEvent, EventBus, TelemetrySourceKind};
 use crate::domain::{AlarmEvent, AlarmLevel};
 use crate::ingress::serial::publish_status;
@@ -12,7 +13,6 @@ use crate::transport::can::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
 use std::time::SystemTime;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender, error::TryRecvError};
 
@@ -67,6 +67,7 @@ enum CanIngressEvent {
         sensor_id: usize,
         value: f64,
         frame_count: u64,
+        time: FrameTime,
         source_kind: TelemetrySourceKind,
     },
     AlarmRaised(AlarmEvent),
@@ -90,7 +91,6 @@ impl CanIngressCore {
         &mut self,
         config: &CanTransportConfig,
         frame: CanFrame,
-        now: SystemTime,
     ) -> Vec<CanIngressEvent> {
         let device_id = can_device_id(config, frame.channel);
         let state = self
@@ -100,7 +100,10 @@ impl CanIngressCore {
                 frame_count: 0,
                 sent_filter: SentMovingAverage::new(self.sent_filter_config.window_size),
                 active_sent_errors: HashSet::new(),
+                clock: CanClock::default(),
             });
+        let time = state.clock.capture(frame.timestamp_us, frame.received_at);
+        let now = time.captured_at;
         state.frame_count = state.frame_count.saturating_add(1);
         let frame_count = state.frame_count;
         let mut events = Vec::new();
@@ -128,19 +131,22 @@ impl CanIngressCore {
             );
         }
 
-        if let Some(values) = decode_sent_values(is_tx, identifier, data) {
-            let output_values = if self.sent_filter_config.enabled {
-                state.sent_filter.apply(values)
-            } else {
-                values
-            };
-            push_can_sent_value_events(&mut events, &device_id, frame_count, output_values);
-        }
-        if let Some(values) = decode_sent_1(is_tx, identifier, data) {
-            push_can_sent_value_events(&mut events, &device_id, frame_count, values);
-        }
-        if let Some(values) = decode_sent_2(is_tx, identifier, data) {
-            push_can_sent_value_events(&mut events, &device_id, frame_count, values);
+        // Select exactly one wire format, including padded CAN FD frames.
+        let sent_values = match identifier {
+            1 => decode_sent_1(is_tx, identifier, data),
+            2 => decode_sent_2(is_tx, identifier, data),
+            _ => decode_sent_values(is_tx, identifier, data).map(Vec::from),
+        };
+        if let Some(values) = sent_values {
+            let values = values.into_iter().map(|(sensor_id, value)| {
+                let value = if self.sent_filter_config.enabled {
+                    state.sent_filter.apply_sample(sensor_id, value)
+                } else {
+                    value
+                };
+                (sensor_id, value)
+            });
+            push_can_sent_value_events(&mut events, &device_id, frame_count, time, values);
         }
         if let Some((sensor_id, value)) = decode_axis_sample(identifier, data) {
             events.push(CanIngressEvent::Telemetry {
@@ -148,6 +154,7 @@ impl CanIngressCore {
                 sensor_id,
                 value,
                 frame_count,
+                time,
                 source_kind: TelemetrySourceKind::CanAxis,
             });
         }
@@ -190,14 +197,13 @@ pub async fn run_can_ingress(
         ),
     );
 
-    let start = Instant::now();
     let mut core = CanIngressCore::new(sent_filter_config);
     loop {
         drain_tx_queue(&mut transport, &bus, &active_config, &mut tx_receiver).await;
         match transport.recv().await {
             Ok(Some(frame)) => {
-                for event in core.handle_frame(&active_config, frame, SystemTime::now()) {
-                    publish_can_ingress_event(&bus, &start, event);
+                for event in core.handle_frame(&active_config, frame) {
+                    publish_can_ingress_event(&bus, event);
                 }
             }
             Ok(None) => {}
@@ -386,7 +392,7 @@ async fn drain_tx_queue(
     }
 }
 
-fn publish_can_ingress_event(bus: &EventBus, start: &Instant, event: CanIngressEvent) {
+fn publish_can_ingress_event(bus: &EventBus, event: CanIngressEvent) {
     match event {
         CanIngressEvent::Status(msg) => publish_status(bus, msg),
         CanIngressEvent::Log {
@@ -405,13 +411,18 @@ fn publish_can_ingress_event(bus: &EventBus, start: &Instant, event: CanIngressE
             sensor_id,
             value,
             frame_count,
+            time,
             source_kind,
         } => {
             bus.publish(AppEvent::Device(DeviceEvent::TelemetrySample {
-                captured_at_ms: crate::db::writer::now_ms(),
+                captured_at_ms: time
+                    .captured_at
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|duration| duration.as_millis() as i64)
+                    .unwrap_or(0),
                 device_id,
                 sensor_id,
-                t_sec: start.elapsed().as_secs_f64(),
+                t_sec: time.t_sec,
                 value,
                 req_id: frame_count,
                 alarm_bit: false,
@@ -431,6 +442,7 @@ fn push_can_sent_value_events(
     events: &mut Vec<CanIngressEvent>,
     device_id: &str,
     frame_count: u64,
+    time: FrameTime,
     values: impl IntoIterator<Item = (usize, f64)>,
 ) {
     for (sensor_id, value) in values {
@@ -439,6 +451,7 @@ fn push_can_sent_value_events(
             sensor_id,
             value,
             frame_count,
+            time,
             source_kind: TelemetrySourceKind::CanSent,
         });
     }
@@ -448,6 +461,7 @@ struct CanChannelRuntime {
     frame_count: u64,
     sent_filter: SentMovingAverage,
     active_sent_errors: HashSet<u8>,
+    clock: CanClock,
 }
 
 fn reconcile_sent_error_events(
@@ -528,6 +542,7 @@ mod tests {
             dlc: 4,
             identifier: 0x100,
             timestamp_us: 0,
+            received_at: SystemTime::UNIX_EPOCH,
             data,
         }
     }
@@ -543,15 +558,164 @@ mod tests {
         })
     }
 
+    fn sent_frame(identifier: u32, dlc: u8, raw: i16) -> CanFrame {
+        let mut frame = axis_frame(0, 0);
+        frame.identifier = identifier;
+        frame.dlc = dlc;
+        for offset in [4, 6, 8] {
+            frame.data[offset..offset + 2].copy_from_slice(&raw.to_le_bytes());
+        }
+        frame
+    }
+
+    fn sent_samples(events: &[CanIngressEvent]) -> Vec<(usize, f64)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                CanIngressEvent::Telemetry {
+                    sensor_id,
+                    value,
+                    source_kind: TelemetrySourceKind::CanSent,
+                    ..
+                } => Some((*sensor_id, *value)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn padded_sent_frames_are_exclusive_and_constant_input_never_raises_jump_alarms() {
+        let config = CanTransportConfig::default();
+        let mut core = CanIngressCore::new(SentFilterConfig {
+            enabled: false,
+            window_size: 10,
+        });
+        let bus = EventBus::new(256);
+        let mut rx = bus.subscribe();
+        let alarms = crate::app::AlarmService::new(bus);
+        for _ in 0..20 {
+            for (identifier, expected) in [(1, vec![2, 3, 4]), (2, vec![0, 1])] {
+                let samples =
+                    sent_samples(&core.handle_frame(&config, sent_frame(identifier, 15, 3000)));
+                assert_eq!(samples.iter().map(|s| s.0).collect::<Vec<_>>(), expected);
+                for (sensor_id, value) in samples {
+                    alarms.evaluate_sample(
+                        "can://test:ch0",
+                        sensor_id,
+                        value,
+                        TelemetrySourceKind::CanSent,
+                    );
+                }
+            }
+        }
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn sent_short_frames_and_tx_echoes_are_ignored() {
+        let config = CanTransportConfig::default();
+        let mut core = CanIngressCore::new(SentFilterConfig::default());
+        for identifier in [1, 2] {
+            assert!(
+                sent_samples(&core.handle_frame(&config, sent_frame(identifier, 8, 2047)))
+                    .is_empty()
+            );
+            let mut tx = sent_frame(identifier, 15, 2047);
+            tx.properties = 1;
+            assert!(sent_samples(&core.handle_frame(&config, tx)).is_empty());
+            assert_eq!(
+                sent_samples(&core.handle_frame(&config, sent_frame(identifier, 9, 2047))).len(),
+                if identifier == 1 { 3 } else { 2 }
+            );
+        }
+    }
+
+    #[test]
+    fn interleaved_sent_formats_filter_only_their_own_signals_and_channels() {
+        let config = CanTransportConfig::default();
+        let mut filtered = CanIngressCore::new(SentFilterConfig {
+            enabled: true,
+            window_size: 10,
+        });
+        let mut raw = CanIngressCore::new(SentFilterConfig {
+            enabled: false,
+            window_size: 10,
+        });
+        // Seed both formats, then alternate partial updates without filling missing signals.
+        let mut baseline = std::collections::HashMap::new();
+        for id in [1, 2] {
+            let frame = sent_frame(id, 9, 2047);
+            baseline.extend(sent_samples(&filtered.handle_frame(&config, frame)));
+        }
+        for id in [1, 2] {
+            let frame = sent_frame(id, 9, 3000);
+            let unfiltered = sent_samples(&raw.handle_frame(&config, frame));
+            let smoothed = sent_samples(&filtered.handle_frame(&config, frame));
+            for ((sid, actual), (_, next)) in smoothed.iter().zip(&unfiltered) {
+                // For these two angles the circular mean equals the arithmetic midpoint.
+                let expected = (baseline[sid] + next) / 2.0;
+                assert!(
+                    (actual - expected).abs() < 1e-9,
+                    "sensor {sid}: {actual} != {expected}"
+                );
+                assert!((actual - next).abs() > 0.1);
+            }
+            let mut other_channel = frame;
+            other_channel.channel = 1;
+            let isolated = sent_samples(&filtered.handle_frame(&config, other_channel));
+            for ((_, actual), (_, expected)) in isolated.iter().zip(&unfiltered) {
+                assert!((actual - expected).abs() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn all_values_in_a_frame_keep_hardware_spacing_through_event_publication() {
+        use std::time::Duration;
+        let mut core = CanIngressCore::new(SentFilterConfig {
+            enabled: false,
+            window_size: 10,
+        });
+        let config = CanTransportConfig::default();
+        let mut first = sent_frame(1, 9, 2047);
+        first.received_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        first.timestamp_us = 1_000_000;
+        core.handle_frame(&config, first);
+        let mut second = first;
+        second.timestamp_us += 2_000;
+        second.received_at += Duration::from_secs(5);
+        let bus = EventBus::new(16);
+        let mut rx = bus.subscribe();
+        for event in core.handle_frame(&config, second) {
+            publish_can_ingress_event(&bus, event);
+        }
+        let mut samples = 0;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::Device(DeviceEvent::TelemetrySample {
+                captured_at_ms,
+                t_sec,
+                ..
+            }) = event
+            {
+                assert_eq!(captured_at_ms, 100_002);
+                assert_eq!(t_sec, 0.002);
+                samples += 1;
+            }
+        }
+        assert_eq!(samples, 3);
+    }
+
     #[test]
     fn can_core_keeps_frame_count_order_per_channel() {
         let mut core = CanIngressCore::new(SentFilterConfig::default());
         let config = CanTransportConfig::default();
-        let now = SystemTime::UNIX_EPOCH;
 
-        let first_ch0 = core.handle_frame(&config, axis_frame(0, 10), now);
-        let first_ch1 = core.handle_frame(&config, axis_frame(1, 20), now);
-        let second_ch0 = core.handle_frame(&config, axis_frame(0, 30), now);
+        let first_ch0 = core.handle_frame(&config, axis_frame(0, 10));
+        let first_ch1 = core.handle_frame(&config, axis_frame(1, 20));
+        let second_ch0 = core.handle_frame(&config, axis_frame(0, 30));
 
         assert_eq!(axis_frame_count(&first_ch0), Some(1));
         assert_eq!(axis_frame_count(&first_ch1), Some(1));

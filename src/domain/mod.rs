@@ -101,3 +101,5 @@ impl Default for ConnState {
         Self::Disconnected
     }
 }
+
+pub mod alarm_sync;

@@ -380,8 +380,7 @@ mod tests {
 
     fn next_alarm(bus_rx: &mut tokio::sync::broadcast::Receiver<AppEvent>) -> AlarmEvent {
         match bus_rx.try_recv().unwrap() {
-            AppEvent::Device(DeviceEvent::AlarmRaised(event))
-            | AppEvent::Device(DeviceEvent::AlarmCleared(event)) => event,
+            AppEvent::Alarm(update) => update.event,
             other => panic!("unexpected event: {other:?}"),
         }
     }

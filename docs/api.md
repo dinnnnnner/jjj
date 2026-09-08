@@ -56,7 +56,7 @@ UI feed 是 TCP 长连接，不是 HTTP 或 JSON Lines。客户端连接 `ui_fee
 ```text
 wire_len:         u32，大端，表示后续 frame 的字节数
 frame_magic:      [u8; 4] = "JJJF"
-protocol_version: u16，大端，当前为 2
+protocol_version: u16，大端，当前为 3
 payload:          bincode(UiFeedMsg)，固定宽度整数编码
 ```
 
@@ -69,15 +69,19 @@ payload 的逻辑消息类型为：
 ```rust
 enum UiFeedMsg {
     Telemetry(TelemetryMsg),
-    Alarm(AlarmEvent),
+    Alarm(AlarmUpdate),
     Status(String),
-    AlarmSnapshot(Vec<AlarmEvent>),
+    AlarmSnapshot(AlarmSnapshot),
 }
 ```
 
 ### 3.1 telemetry
 
-v2 在遥测消息开头增加 `captured_at_ms: i64`（采集端生成的 Unix 毫秒），写库及重试不重新生成时间。collector 与 UI 必须同时升级。`AlarmSnapshot` 在连接时及每秒发送，完整替换 UI 的当前活动告警集合；它不增加历史告警计数，用于恢复丢包和重连后的状态。
+v3 保留 v2 的 `captured_at_ms: i64`（采集端生成的 Unix 毫秒），写库及重试不重新生成时间；告警消息改为带版本的结构，collector 与 UI 必须同时升级。
+
+`AlarmUpdate { epoch: Uuid, revision: u64, event: AlarmEvent }` 和 `AlarmSnapshot { epoch: Uuid, revision: u64, alarms: Vec<AlarmEvent> }` 使用同一告警状态版本。采集服务启动时生成 `epoch`，每次触发或恢复原子递增 `revision`。连接时及每秒发送快照。UI 拒绝不晚于已接收快照或同一告警最新增量的旧事件，应用较旧快照时保留更晚的触发和恢复。新 `epoch` 的快照重置活动状态，旧 `epoch` 的增量被忽略。快照不增加历史计数，不补齐丢失的历史事件。
+
+CAN 以每通道首个有效硬件微秒时间戳和回调入口主机时间建立映射，后续采样沿用硬件时间差，同帧信号共用时间。零时间戳回退到回调时间，倒退按时钟重置重新校准。这依赖每通道回调有序；绝对时间包含初次回调延迟，不保证跨设备时钟同步。
 
 ```text
 TelemetryMsg {
@@ -264,7 +268,9 @@ pause:       4-bit
 | `0x102` | `1` | `y` |
 | `0x104` | `2` | `z` |
 
-SENT over CAN 的 `f32` 小端偏移：
+SENT over CAN 按 ID 互斥选择格式。ID 1 使用 offset 4/6/8 的小端 `i16`，分别发布 S angle（4）、T2 angle（2）、T2 torque（3）；ID 2 使用 offset 6/8，发布 T1 angle（0）、T1 torque（1）。这两类帧要求至少 10 字节，填充到 64 字节也不进入浮点解码器。
+
+非 TX、非 ID 1/2/3 且至少 53 字节的帧使用以下 `f32` 小端偏移：
 
 | sensor_id | 信号 | offset |
 | --- | --- | --- |
@@ -274,7 +280,7 @@ SENT over CAN 的 `f32` 小端偏移：
 | `3` | T2 torque | `5` |
 | `4` | S angle | `49` |
 
-`identifier = 3` 表示 SENT error 帧，会被转换为告警事件。
+`identifier = 3` 表示 SENT error 帧，会被转换为告警事件。`sent_filter_enabled` 对上述三种数据格式都生效，按设备、通道、信号维护独立窗口，只更新当前帧含有的信号。
 
 ## 8. 数据库表
 

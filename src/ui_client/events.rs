@@ -265,6 +265,46 @@ mod tests {
         assert_eq!(app.selected_view, TestSignalView::Demo);
     }
     #[test]
+    fn delayed_alarm_cannot_override_snapshot_or_increment_history() {
+        let mut app = app();
+        let epoch = uuid::Uuid::new_v4();
+        let alarm = AlarmEvent {
+            device_id: "can://test:ch0".into(),
+            alarm_id: "sent_angle_jump_t1".into(),
+            level: AlarmLevel::Critical,
+            message: "jump".into(),
+            raised_at: std::time::SystemTime::UNIX_EPOCH,
+            cleared: false,
+        };
+        app.handle_ui_msg(UiMsg::AlarmSnapshot(crate::AlarmSnapshot {
+            epoch,
+            revision: 2,
+            alarms: vec![],
+        }));
+        app.handle_ui_msg(UiMsg::Alarm(crate::AlarmUpdate {
+            epoch,
+            revision: 1,
+            event: alarm.clone(),
+        }));
+        assert!(app.active_alarms.is_empty());
+        assert_eq!(app.total_alarm_count, 0);
+        assert!(app.alarm_history.is_empty());
+        app.handle_ui_msg(UiMsg::Alarm(crate::AlarmUpdate {
+            epoch,
+            revision: 3,
+            event: alarm,
+        }));
+        assert_eq!(app.active_alarms.len(), 1);
+        assert_eq!(app.total_alarm_count, 1);
+        app.handle_ui_msg(UiMsg::AlarmSnapshot(crate::AlarmSnapshot {
+            epoch,
+            revision: 2,
+            alarms: vec![],
+        }));
+        assert_eq!(app.active_alarms.len(), 1);
+    }
+
+    #[test]
     fn snapshot_repairs_missing_raise_and_clear_without_counting_duplicates() {
         let mut app = app();
         let alarm = AlarmEvent {
@@ -275,16 +315,28 @@ mod tests {
             raised_at: std::time::SystemTime::now(),
             cleared: false,
         };
-        app.handle_ui_msg(UiMsg::AlarmSnapshot(vec![alarm.clone()]));
+        app.handle_ui_msg(UiMsg::AlarmSnapshot(crate::AlarmSnapshot {
+            epoch: uuid::Uuid::nil(),
+            revision: 1,
+            alarms: vec![alarm.clone()],
+        }));
         assert_eq!(app.active_alarms.len(), 1);
         let first_received_at = app.active_alarms.values().next().unwrap().received_at;
-        app.handle_ui_msg(UiMsg::AlarmSnapshot(vec![alarm]));
+        app.handle_ui_msg(UiMsg::AlarmSnapshot(crate::AlarmSnapshot {
+            epoch: uuid::Uuid::nil(),
+            revision: 1,
+            alarms: vec![alarm],
+        }));
         assert_eq!(
             app.active_alarms.values().next().unwrap().received_at,
             first_received_at
         );
         assert_eq!(app.total_alarm_count, 0);
-        app.handle_ui_msg(UiMsg::AlarmSnapshot(vec![]));
+        app.handle_ui_msg(UiMsg::AlarmSnapshot(crate::AlarmSnapshot {
+            epoch: uuid::Uuid::nil(),
+            revision: 2,
+            alarms: vec![],
+        }));
         assert!(app.active_alarms.is_empty());
     }
 }
