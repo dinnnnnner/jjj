@@ -73,6 +73,12 @@ impl UiClientApp {
             UiMsg::Status(status) => self.handle_status(status),
             UiMsg::Alarm(alarm) => self.apply_alarm(alarm),
             UiMsg::AlarmSnapshot(alarms) => self.apply_alarm_snapshot(alarms),
+            UiMsg::CanReplayProgress(mode, current, total) => {
+                if self.can_replay.loading && mode == self.can_replay.mode {
+                    self.can_replay.load_progress_current = current.min(total);
+                    self.can_replay.load_progress_total = Some(total);
+                }
+            }
             UiMsg::CanReplayLoaded(mode, result) => {
                 self.can_replay.loading = false;
                 if mode != self.can_replay.mode {
@@ -161,18 +167,37 @@ impl UiClientApp {
         if sample.sensor_id >= SENSOR_COUNT {
             return;
         }
+        if let Some(channel) = Self::can_channel_from_device_id(&sample.device_id) {
+            self.dismissed_can_channels.remove(&channel);
+            self.can_channel_last_seen.insert(channel, Instant::now());
+        }
         if sample.source_kind == TelemetrySourceKind::SerialDemo {
             self.demo_alarm_bit_state = Some(sample.alarm_bit);
         }
 
         if let Some(view) = Self::detect_view_for_sample(&sample) {
             if !self.view_initialized {
-                self.switch_to_view(view);
+                if sample.source_kind == TelemetrySourceKind::CanSent {
+                    self.selected_view = view;
+                    self.dynamic_windows.clear();
+                } else {
+                    self.switch_to_view(view);
+                }
                 self.view_initialized = true;
             }
             self.selected_devices
                 .entry(view)
                 .or_insert_with(|| sample.device_id.clone());
+            if sample.source_kind == TelemetrySourceKind::CanSent
+                && self.selected_view == TestSignalView::Sent
+                && !self.source_series.contains_key(&(
+                    sample.device_id.clone(),
+                    view,
+                    sample.sensor_id,
+                ))
+            {
+                self.ensure_can_sent_window(&sample.device_id, sample.sensor_id);
+            }
             self.source_series
                 .entry((sample.device_id.clone(), view, sample.sensor_id))
                 .or_insert_with(super::series::SensorSeries::new)
@@ -212,6 +237,7 @@ mod tests {
             String::new(),
             String::new(),
             String::new(),
+            None,
         )
     }
     fn sample(device: &str, kind: TelemetrySourceKind, value: f64) -> TelemetryMsg {
@@ -338,5 +364,89 @@ mod tests {
             alarms: vec![],
         }));
         assert!(app.active_alarms.is_empty());
+    }
+    fn can_sent_sample(device: &str, sensor_id: usize, value: f64) -> TelemetryMsg {
+        TelemetryMsg {
+            sensor_id,
+            ..sample(device, TelemetrySourceKind::CanSent, value)
+        }
+    }
+    #[test]
+    fn confirming_channel_alarm_hides_card_until_new_data_arrives() {
+        let mut app = app();
+        let alarm = AlarmEvent {
+            device_id: "can://TC1016:ch1".to_string(),
+            alarm_id: "can_signal_timeout_ch1_id002".to_string(),
+            level: AlarmLevel::Critical,
+            message: "timeout".to_string(),
+            raised_at: std::time::SystemTime::now(),
+            cleared: false,
+        };
+        let key = UiClientApp::alarm_key(&alarm);
+
+        app.apply_alarm(crate::AlarmUpdate {
+            epoch: uuid::Uuid::nil(),
+            revision: 1,
+            event: alarm.clone(),
+        });
+        app.dismiss_channel_alarms(1);
+
+        assert!(!app.active_alarms.contains_key(&key));
+        assert!(!app.acknowledged_alarms.contains(&key));
+        assert!(app.dismissed_can_channels.contains(&1));
+        assert_eq!(app.alarm_history.len(), 1);
+
+        app.apply_alarm_snapshot(crate::AlarmSnapshot {
+            epoch: uuid::Uuid::nil(),
+            revision: 1,
+            alarms: vec![alarm],
+        });
+        assert!(!app.active_alarms.contains_key(&key));
+        assert!(app.dismissed_can_channels.contains(&1));
+
+        app.handle_sample(can_sent_sample("can://TC1016:ch1", 0, 1.0));
+
+        assert!(!app.dismissed_can_channels.contains(&1));
+        assert!(app.can_channel_last_seen.contains_key(&1));
+    }
+
+    #[test]
+    fn can_sent_channels_only_get_windows_for_their_own_signals() {
+        let mut app = app();
+
+        app.handle_sample(can_sent_sample("can://TC1016:ch0", 2, 20.0));
+        app.handle_sample(can_sent_sample("can://TC1016:ch0", 3, 30.0));
+        app.handle_sample(can_sent_sample("can://TC1016:ch0", 4, 40.0));
+        app.handle_sample(can_sent_sample("can://TC1016:ch1", 0, 10.0));
+        app.handle_sample(can_sent_sample("can://TC1016:ch1", 1, 11.0));
+        app.handle_sample(can_sent_sample("can://TC1016:ch1", 1, 12.0));
+
+        assert_eq!(app.dynamic_windows.len(), 5);
+        assert_eq!(
+            app.source_series
+                .get(&("can://TC1016:ch0".to_string(), TestSignalView::Sent, 2))
+                .and_then(|series| series.latest),
+            Some(20.0)
+        );
+        assert_eq!(
+            app.source_series
+                .get(&("can://TC1016:ch1".to_string(), TestSignalView::Sent, 1))
+                .and_then(|series| series.latest),
+            Some(12.0)
+        );
+        assert_eq!(
+            app.dynamic_windows
+                .iter()
+                .filter(|window| window.device_id.as_deref() == Some("can://TC1016:ch0"))
+                .count(),
+            3
+        );
+        assert_eq!(
+            app.dynamic_windows
+                .iter()
+                .filter(|window| window.device_id.as_deref() == Some("can://TC1016:ch1"))
+                .count(),
+            2
+        );
     }
 }

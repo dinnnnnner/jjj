@@ -1,13 +1,16 @@
-use demo2::app::{AlarmService, SentJumpAlarmConfig};
+use demo2::app::{AlarmService, SentFrameGapAlarmConfig, SentJumpAlarmConfig};
 use demo2::bus::{AppEvent, DeviceEvent, EventBus, Store, TelemetrySourceKind};
 use demo2::config::{CollectorConfig, collector_can_channels, env_flag, load_collector_config};
 use demo2::db::retry::{PgSink, WriteBatch, retry_write};
 use demo2::db::writer::{DbCmd, TelemetryRow};
 use demo2::domain::telemetry::axis_name;
 use demo2::feed::{TelemetryMsg, UiFeedMsg, encode_feed_msg};
-use demo2::ingress::can::{SentFilterConfig, run_can_ingress};
+use demo2::ingress::can::{
+    CanSignalWatchdogConfig, CanSignalWatchdogTarget, SentFilterConfig, run_can_ingress,
+};
 use demo2::ingress::serial::{
-    SerialIngressMode, parse_serial_mode, publish_status, run_serial_ingress,
+    SerialIngressMode, parse_serial_mode, publish_status, run_auto_serial_ingress,
+    run_serial_ingress,
 };
 use demo2::ingress::tcp::run_tcp_ingress;
 use demo2::protocol::SimpleFrameCodec;
@@ -103,6 +106,11 @@ enum ControlCmd {
         angle_t2_red: Option<f64>,
         angle_t_red: Option<f64>,
         angle_s_red: f64,
+    },
+    SetSentFrameGapThresholds {
+        t1_us: u64,
+        t2_us: u64,
+        s_us: u64,
     },
 }
 
@@ -357,12 +365,13 @@ async fn run_alarm_forwarder(
             Ok(AppEvent::Device(DeviceEvent::TelemetrySample {
                 device_id,
                 sensor_id,
+                t_sec,
                 value,
                 source_kind,
                 ..
             })) => {
                 stats.samples_rx.fetch_add(1, Ordering::Relaxed);
-                alarm_service.evaluate_sample(&device_id, sensor_id, value, source_kind);
+                alarm_service.evaluate_sample(&device_id, sensor_id, t_sec, value, source_kind);
             }
             Ok(AppEvent::Device(DeviceEvent::ConnStateChanged { device_id, to, .. })) => {
                 match to {
@@ -471,6 +480,16 @@ async fn handle_control_client(
                 config.angle_t1_red,
                 config.angle_t2_red,
                 config.angle_s_red
+            )));
+        }
+        ControlCmd::SetSentFrameGapThresholds { t1_us, t2_us, s_us } => {
+            alarm_service
+                .set_sent_frame_gap_config(SentFrameGapAlarmConfig { t1_us, t2_us, s_us })
+                .map_err(anyhow::Error::msg)?;
+            let config = alarm_service.sent_frame_gap_config();
+            bus.publish(AppEvent::System(format!(
+                "SENT frame gap thresholds updated: T1={}us, T2={}us, S={}us",
+                config.t1_us, config.t2_us, config.s_us
             )));
         }
     }
@@ -765,24 +784,51 @@ pub async fn run() -> anyhow::Result<()> {
                 .unwrap_or(cfg.sent_filter_window)
                 .max(1),
         };
+        let watchdog_config = CanSignalWatchdogConfig {
+            enabled: env_flag("DEMO2_CAN_SIGNAL_WATCHDOG_ENABLED")
+                .unwrap_or(cfg.can_signal_watchdog_enabled),
+            timeout: Duration::from_millis(
+                std::env::var("DEMO2_CAN_SIGNAL_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(cfg.can_signal_timeout_ms)
+                    .max(1),
+            ),
+            targets: cfg
+                .can_signal_watchdogs
+                .iter()
+                .map(|target| CanSignalWatchdogTarget {
+                    channel: target.channel,
+                    identifier: target.can_id,
+                    label: target.label.clone().unwrap_or_else(|| {
+                        target
+                            .can_id
+                            .map(|identifier| format!("CAN 0x{identifier:X}"))
+                            .unwrap_or_else(|| format!("Channel {} signal", target.channel))
+                    }),
+                })
+                .collect(),
+        };
         let bus_for_can = raw_bus.clone();
         tokio::spawn(async move {
-            run_can_ingress(can_config, sent_filter_config, bus_for_can).await;
+            run_can_ingress(can_config, sent_filter_config, watchdog_config, bus_for_can).await;
         });
     }
 
-    if let Some(port_name) = cfg
-        .serial_port
-        .clone()
-        .or_else(|| std::env::var("DEMO2_COLLECTOR_SERIAL_PORT").ok())
-    {
-        let serial_baud = std::env::var("DEMO2_COLLECTOR_SERIAL_BAUD")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(cfg.serial_baud);
-        let serial_mode_text = std::env::var("DEMO2_COLLECTOR_SERIAL_MODE")
-            .unwrap_or_else(|_| cfg.serial_mode.clone());
-        let serial_mode = parse_serial_mode(&serial_mode_text).unwrap_or(SerialIngressMode::Sent);
+    let configured_serial_port = std::env::var("DEMO2_COLLECTOR_SERIAL_PORT")
+        .ok()
+        .or_else(|| cfg.serial_port.clone());
+    let serial_auto_detect =
+        env_flag("DEMO2_COLLECTOR_SERIAL_AUTO_DETECT").unwrap_or(cfg.serial_auto_detect);
+    let serial_baud = std::env::var("DEMO2_COLLECTOR_SERIAL_BAUD")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(cfg.serial_baud);
+    let serial_mode_text =
+        std::env::var("DEMO2_COLLECTOR_SERIAL_MODE").unwrap_or_else(|_| cfg.serial_mode.clone());
+    let serial_mode = parse_serial_mode(&serial_mode_text).unwrap_or(SerialIngressMode::Sent);
+
+    if let Some(port_name) = configured_serial_port {
         match serial_mode {
             SerialIngressMode::Legacy => {
                 let device_id = format!("serial://{}", port_name);
@@ -808,6 +854,11 @@ pub async fn run() -> anyhow::Result<()> {
                 });
             }
         }
+    } else if serial_auto_detect {
+        let bus_for_serial = raw_bus.clone();
+        tokio::spawn(async move {
+            run_auto_serial_ingress(serial_baud, serial_mode, bus_for_serial).await;
+        });
     }
 
     let ui_listener = TcpListener::bind(&cfg.ui_feed_addr).await?;

@@ -374,9 +374,9 @@ CAN 数据解析约定：
 - `identifier = 0x102` -> sensor 1 / axis y
 - `identifier = 0x104` -> sensor 2 / axis z
 - `identifier = 3` -> SENT error
-- `identifier = 1` -> 小端 i16，offset 4/6/8 分别对应 S angle / T2 angle / T2 torque。
+- `identifier = 1` -> 首字节标志为 1 时，从 offset 6/8 读取 T2 angle / T2 torque；标志为 2 时，从 offset 4 读取 S angle。字段均为小端 i16。
 - `identifier = 2` -> 小端 i16，offset 6/8 对应 T1 angle / T1 torque。
-- ID 1/2 要求至少 10 字节，填充到 64 字节也只走整数解码器。
+- ID 1 的 T2 数据和 ID 2 要求至少 10 字节，ID 1 的 S 数据要求至少 6 字节；填充到 64 字节也只走整数解码器。
 - 其他非 TX、非 ID 1/2/3 且至少 53 字节的 CAN FD 帧可解析 SENT values：
   - sensor 0：T1 angle，读取 offset 25 的 little-endian f32
   - sensor 1：T1 torque，读取 offset 29 的 little-endian f32
@@ -664,6 +664,12 @@ can_baud_kbps = 500
 can_data_baud_kbps = 2000
 can_channels = [0, 1, 2, 3]
 can_autostart_tsmaster = true
+can_signal_watchdog_enabled = true
+can_signal_timeout_ms = 2000
+can_signal_watchdogs = [
+  { channel = 0, can_id = 1, label = "SENT T2/S" },
+  { channel = 1, can_id = 2, label = "SENT T1" },
+]
 
 db_filter_enabled = false
 db_filter_order = 10
@@ -705,6 +711,8 @@ DEMO2_COLLECTOR_CAN_TSMASTER_BIN
 DEMO2_COLLECTOR_CAN_AUTOSTART_TSMASTER
 DEMO2_COLLECTOR_CAN_BAUD_KBPS
 DEMO2_COLLECTOR_CAN_DATA_BAUD_KBPS
+DEMO2_CAN_SIGNAL_WATCHDOG_ENABLED
+DEMO2_CAN_SIGNAL_TIMEOUT_MS
 DEMO2_SENT_FILTER_ENABLED
 DEMO2_SENT_FILTER_WINDOW
 ```

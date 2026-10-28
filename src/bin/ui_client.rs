@@ -29,6 +29,7 @@ enum UiMsg {
     Sample(TelemetryMsg),
     Alarm(AlarmUpdate),
     AlarmSnapshot(AlarmSnapshot),
+    CanReplayProgress(ReplayMode, u64, u64),
     CanReplayLoaded(ReplayMode, Result<CanReplayData, String>),
     CanReplayExported(Result<String, String>),
     AlarmRecordsLoaded(Result<AlarmRecordData, String>),
@@ -40,6 +41,7 @@ struct UiClientApp {
     feed_stats: Arc<FeedStats>,
     feed_addr: String,
     control_addr: String,
+    config_error: Option<String>,
     state: UiClientState,
 }
 
@@ -74,6 +76,7 @@ impl UiClientApp {
         feed_addr: String,
         control_addr: String,
         pg_dsn: String,
+        config_error: Option<String>,
     ) -> Self {
         Self {
             rx,
@@ -81,6 +84,7 @@ impl UiClientApp {
             feed_stats,
             feed_addr,
             control_addr,
+            config_error,
             state: UiClientState::new(pg_dsn, Self::MAX_ALARM_HISTORY),
         }
     }

@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use std::fs;
+use std::path::Path;
 
 const FEED_ADDR: &str = "127.0.0.1:19011";
 const DEFAULT_PG_DSN: &str = "host=127.0.0.1 port=5432 user=postgres password=123456 dbname=demo2";
@@ -22,12 +23,33 @@ struct ConfigFile {
     ui: Option<UiConfig>,
 }
 
+fn parse_config(text: &str) -> Result<ConfigFile, toml::de::Error> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    toml::from_str(text)
+}
+
+pub fn load_config_error() -> Option<String> {
+    let path = Path::new("config.toml");
+    let display_path = std::env::current_dir()
+        .map(|dir| dir.join(path))
+        .unwrap_or_else(|_| path.to_path_buf());
+    match fs::read_to_string(path) {
+        Ok(text) => parse_config(&text)
+            .err()
+            .map(|err| format!("配置文件解析失败（{}）：{err}", display_path.display())),
+        Err(err) => Some(format!(
+            "配置文件读取失败（{}）：{err}",
+            display_path.display()
+        )),
+    }
+}
+
 pub fn load_embed_collector() -> bool {
     let Ok(text) = fs::read_to_string("config.toml") else {
         return false;
     };
 
-    toml::from_str::<ConfigFile>(&text)
+    parse_config(&text)
         .ok()
         .and_then(|file| file.ui)
         .and_then(|cfg| cfg.embed_collector)
@@ -45,7 +67,7 @@ pub fn load_feed_addr() -> String {
         return FEED_ADDR.to_string();
     };
 
-    match toml::from_str::<ConfigFile>(&text) {
+    match parse_config(&text) {
         Ok(file) => file
             .collector
             .and_then(|cfg| cfg.ui_feed_addr)
@@ -66,7 +88,7 @@ pub fn load_control_addr() -> String {
         return "127.0.0.1:19013".to_string();
     };
 
-    match toml::from_str::<ConfigFile>(&text) {
+    match parse_config(&text) {
         Ok(file) => file
             .collector
             .and_then(|cfg| cfg.control_addr)
@@ -87,7 +109,7 @@ pub fn load_pg_dsn() -> String {
         return DEFAULT_PG_DSN.to_string();
     };
 
-    match toml::from_str::<ConfigFile>(&text) {
+    match parse_config(&text) {
         Ok(file) => file
             .collector
             .and_then(|cfg| cfg.pg_dsn)
@@ -99,10 +121,10 @@ pub fn load_pg_dsn() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::ConfigFile;
+    use super::parse_config;
 
     fn embed_collector_from(text: &str) -> bool {
-        toml::from_str::<ConfigFile>(text)
+        parse_config(text)
             .ok()
             .and_then(|file| file.ui)
             .and_then(|cfg| cfg.embed_collector)
@@ -116,10 +138,22 @@ mod tests {
     }
 
     #[test]
+    fn reads_embed_collector_from_utf8_bom_config() {
+        assert!(embed_collector_from(
+            "\u{feff}[ui]\nembed_collector = true\n"
+        ));
+    }
+
+    #[test]
     fn embed_collector_defaults_to_false() {
         assert!(!embed_collector_from(
             "[collector]\nui_feed_addr = '127.0.0.1:19011'\n"
         ));
         assert!(!embed_collector_from("not valid toml"));
+    }
+
+    #[test]
+    fn invalid_config_returns_a_parse_error() {
+        assert!(parse_config("not valid toml").is_err());
     }
 }

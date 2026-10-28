@@ -2,6 +2,7 @@ use anyhow::{Context, bail};
 use bytes::BytesMut;
 use demo2::protocol::demo_serial::{CMD_STREAM, GROUP_COUNT, GROUP_SIZE, HEADER, STREAM_BODY_LEN};
 use demo2::protocol::{Frame, FrameCodec, SentFrameCodec, SimpleFrameCodec};
+use demo2::transport::available_serial_port_names;
 use demo2::transport::can::{CanTransport, CanTransportConfig, CanTxFrame, HW_SUBTYPE_TC1016};
 use eframe::egui;
 use serialport::FlowControl;
@@ -708,6 +709,7 @@ async fn run_sent_sender(
 
 struct SerialSenderUiApp {
     port: String,
+    available_ports: Vec<String>,
     baud: String,
     format: String,
     sensor_count: String,
@@ -726,8 +728,17 @@ struct SerialSenderUiApp {
 
 impl SerialSenderUiApp {
     fn new() -> Self {
+        let available_ports = available_serial_port_names().unwrap_or_default();
+        let port = if available_ports.iter().any(|port| port == DEFAULT_PORT) {
+            DEFAULT_PORT.to_string()
+        } else if available_ports.len() == 1 {
+            available_ports[0].clone()
+        } else {
+            DEFAULT_PORT.to_string()
+        };
         Self {
-            port: DEFAULT_PORT.to_string(),
+            port,
+            available_ports,
             baud: DEFAULT_BAUD.to_string(),
             format: "sent1".to_string(),
             sensor_count: DEFAULT_SENSOR_COUNT.to_string(),
@@ -754,6 +765,27 @@ impl SerialSenderUiApp {
 
     fn is_running(&self) -> bool {
         self.stop_flag.is_some()
+    }
+
+    fn refresh_serial_ports(&mut self) {
+        match available_serial_port_names() {
+            Ok(ports) => {
+                if !ports.is_empty() && !ports.iter().any(|port| port == self.port.trim()) {
+                    self.port = ports[0].clone();
+                }
+                self.status = if ports.is_empty() {
+                    "no serial ports found".to_string()
+                } else {
+                    format!("found serial ports: {}", ports.join(", "))
+                };
+                self.available_ports = ports;
+                self.push_log(self.status.clone());
+            }
+            Err(err) => {
+                self.status = format!("serial port scan failed: {err}");
+                self.push_log(self.status.clone());
+            }
+        }
     }
 
     fn parse_config(&self) -> anyhow::Result<SenderConfig> {
@@ -1189,6 +1221,21 @@ impl eframe::App for SerialSenderUiApp {
             ui.horizontal(|ui| {
                 ui.label("Port");
                 ui.text_edit_singleline(&mut self.port);
+                let available_ports = self.available_ports.clone();
+                egui::ComboBox::from_id_salt("available_serial_ports")
+                    .selected_text(if available_ports.is_empty() {
+                        "No detected ports"
+                    } else {
+                        "Detected ports"
+                    })
+                    .show_ui(ui, |ui| {
+                        for port in available_ports {
+                            ui.selectable_value(&mut self.port, port.clone(), port);
+                        }
+                    });
+                if ui.button("Refresh ports").clicked() {
+                    self.refresh_serial_ports();
+                }
                 ui.label("Baud");
                 ui.text_edit_singleline(&mut self.baud);
                 ui.label("Format");

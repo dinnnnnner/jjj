@@ -9,7 +9,7 @@ use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-pub use alarm_service::{AlarmRule, AlarmService, SentJumpAlarmConfig};
+pub use alarm_service::{AlarmRule, AlarmService, SentFrameGapAlarmConfig, SentJumpAlarmConfig};
 
 #[derive(Clone)]
 pub struct DeviceManager {

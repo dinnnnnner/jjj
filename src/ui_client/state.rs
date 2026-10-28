@@ -1,10 +1,12 @@
 use crate::{
     AlarmRecordState, AlarmViewItem, CanAlarmThresholds, CanReplayState, DynamicSignalWindow,
-    SENSOR_COUNT, SentAngleJumpThresholds, SentTorqueJumpThresholds, TestSignalView,
+    SENSOR_COUNT, SentAngleJumpThresholds, SentFrameGapThresholds, SentTorqueJumpThresholds,
+    TestSignalView,
 };
 use demo2::domain::alarm_sync::AlarmTracker;
 use demo2::signal::{SignalProcessor, default_signal_specs};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Instant;
 
 use super::series::SensorSeries;
 
@@ -15,6 +17,7 @@ pub(crate) struct UiClientState {
     pub(crate) view_initialized: bool,
     pub(crate) total_samples: u64,
     pub(crate) last_req: u64,
+    pub(crate) realtime_downsampling_enabled: bool,
     pub(crate) can_self_test_counter: u8,
     pub(crate) signal_processor: SignalProcessor,
     pub(crate) derived_signals: HashMap<(String, String), SensorSeries>,
@@ -27,11 +30,15 @@ pub(crate) struct UiClientState {
     pub(crate) tcp_group_index: u32,
     pub(crate) alarm_tracker: AlarmTracker,
     pub(crate) active_alarms: HashMap<String, AlarmViewItem>,
+    pub(crate) acknowledged_alarms: HashSet<String>,
     pub(crate) alarm_history: VecDeque<AlarmViewItem>,
     pub(crate) total_alarm_count: u64,
+    pub(crate) can_channel_last_seen: HashMap<u8, Instant>,
+    pub(crate) dismissed_can_channels: HashSet<u8>,
     pub(crate) can_alarm_thresholds: CanAlarmThresholds,
     pub(crate) sent_jump_thresholds: SentTorqueJumpThresholds,
     pub(crate) sent_angle_jump_thresholds: SentAngleJumpThresholds,
+    pub(crate) sent_frame_gap_thresholds: SentFrameGapThresholds,
     pub(crate) last_can_self_test_result: String,
     pub(crate) can_replay: CanReplayState,
     pub(crate) alarm_records: AlarmRecordState,
@@ -46,6 +53,7 @@ impl UiClientState {
             view_initialized: false,
             total_samples: 0,
             last_req: 0,
+            realtime_downsampling_enabled: true,
             can_self_test_counter: 0,
             signal_processor: SignalProcessor::new(default_signal_specs(SENSOR_COUNT)),
             derived_signals: HashMap::new(),
@@ -58,11 +66,15 @@ impl UiClientState {
             tcp_group_index: 1,
             alarm_tracker: AlarmTracker::default(),
             active_alarms: HashMap::new(),
+            acknowledged_alarms: HashSet::new(),
             alarm_history: VecDeque::with_capacity(max_alarm_history),
             total_alarm_count: 0,
+            can_channel_last_seen: HashMap::new(),
+            dismissed_can_channels: HashSet::new(),
             can_alarm_thresholds: CanAlarmThresholds::default(),
             sent_jump_thresholds: SentTorqueJumpThresholds::default(),
             sent_angle_jump_thresholds: SentAngleJumpThresholds::default(),
+            sent_frame_gap_thresholds: SentFrameGapThresholds::default(),
             last_can_self_test_result: "not run".to_string(),
             can_replay: CanReplayState::new(pg_dsn.clone()),
             alarm_records: AlarmRecordState::new(pg_dsn),

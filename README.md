@@ -138,6 +138,7 @@ pg_connect_max_retries = 20
 pg_connect_retry_ms = 1000
 
 serial_port = "COM3"
+serial_auto_detect = false
 serial_baud = 2000000
 serial_mode = "sent"
 
@@ -148,6 +149,12 @@ can_channel = 0
 can_baud_kbps = 500
 can_data_baud_kbps = 2000
 can_channels = [0, 1, 2, 3]
+can_signal_watchdog_enabled = true
+can_signal_timeout_ms = 2000
+can_signal_watchdogs = [
+  { channel = 0, can_id = 1, label = "SENT T2/S" },
+  { channel = 1, can_id = 2, label = "SENT T1" },
+]
 
 db_filter_enabled = false
 db_filter_order = 10
@@ -163,7 +170,7 @@ ui_feed_capacity = 10000
 
 ### T1 / T2 / S 数据处理
 
-CAN SENT 解码器位于 `src/protocol/can_data.rs`。ID 1 按小端 `i16` 解出 T2 angle、T2 torque、S angle；ID 2 解出 T1 angle、T1 torque。即使填充到 64 字节，这两种格式也只解码一次。其他非 TX 且非 ID 3 的足长帧通过 `decode_sent_values` 解析为 `f32`：
+CAN SENT 解码器位于 `src/protocol/can_data.rs`。ID 1 根据首字节标志选择小端 `i16` 数据：标志 1 解出 T2 angle、T2 torque，标志 2 解出 S angle；ID 2 解出 T1 angle、T1 torque。即使填充到 64 字节，这两种格式也只解码一次。其他非 TX 且非 ID 1/2/3 的足长帧通过 `decode_sent_values` 解析为 `f32`：
 
 - T1 angle：offset 25
 - T1 torque：offset 29
@@ -182,9 +189,11 @@ CAN SENT 解码器位于 `src/protocol/can_data.rs`。ID 1 按小端 `i16` 解�
 
 - `DEMO2_DISABLE_DB=1`：禁用 PostgreSQL 持久化。
 - `DEMO2_COLLECTOR_SERIAL_PORT` / `DEMO2_COLLECTOR_SERIAL_BAUD` / `DEMO2_COLLECTOR_SERIAL_MODE`：覆盖串口接入。
+- `DEMO2_COLLECTOR_SERIAL_AUTO_DETECT=1`：未指定 `serial_port` 时持续扫描串口；只有收到当前 `serial_mode` 的有效帧才会选中端口，断开后自动恢复扫描。手动端口优先。
 - `DEMO2_COLLECTOR_CAN_ENABLED` / `DEMO2_COLLECTOR_CAN_CHANNEL` / `DEMO2_COLLECTOR_CAN_CHANNELS` / `DEMO2_COLLECTOR_CAN_HW_NAME` / `DEMO2_COLLECTOR_CAN_HW_SUBTYPE`：覆盖 CAN 接入。TC1016 的 subtype 为 `11`。
 - `DEMO2_COLLECTOR_CAN_TSMASTER_BIN` / `DEMO2_COLLECTOR_CAN_AUTOSTART_TSMASTER`：配置 TSMaster 启动。
 - `DEMO2_COLLECTOR_CAN_BAUD_KBPS` / `DEMO2_COLLECTOR_CAN_DATA_BAUD_KBPS`：覆盖 CAN 仲裁/数据波特率。
+- `DEMO2_CAN_SIGNAL_WATCHDOG_ENABLED` / `DEMO2_CAN_SIGNAL_TIMEOUT_MS`：启用 CAN 信号中断看门狗并覆盖超时时间。`can_signal_watchdogs` 留空时按每个启用 Channel 监控任意成功解析的信号帧；配置目标后按 `Channel + CAN ID` 独立监控。
 - `DEMO2_SENT_FILTER_ENABLED` / `DEMO2_SENT_FILTER_WINDOW`：覆盖 SENT 滤波配置。
 - `DEMO2_UI_FEED_ADDR`：覆盖 UI 客户端连接的 feed 地址。
 - `DEMO2_UI_EMBED_COLLECTOR=1`：让 `ui_client` 启动内嵌 collector；优先级高于 `config.toml` 中的 `[ui].embed_collector`。
@@ -230,9 +239,21 @@ CAN SENT 解码器位于 `src/protocol/can_data.rs`。ID 1 按小端 `i16` 解�
 ```toml
 [collector]
 serial_port = "COM3"
+serial_auto_detect = false
 serial_baud = 2000000
 serial_mode = "sent"
 ```
+
+也可以不设置 `serial_port`，改为自动识别：
+
+```toml
+[collector]
+serial_auto_detect = true
+serial_baud = 2000000
+serial_mode = "sent"
+```
+
+自动识别会持续枚举系统串口，并逐个试读有效协议帧；SENT 模式下会继续根据 `pause` 字段区分 SENT1、SENT2 和 SENT3。
 
 2. 启动采集服务和 UI：
 

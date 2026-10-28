@@ -2,7 +2,8 @@ use async_trait::async_trait;
 use bytes::BytesMut;
 
 pub mod can;
-use serialport::{DataBits, FlowControl, Parity, StopBits};
+use serialport::{DataBits, FlowControl, Parity, SerialPortInfo, SerialPortType, StopBits};
+use std::cmp::Ordering;
 use std::io;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
@@ -63,6 +64,46 @@ pub struct SerialTransport {
 pub struct ConnectedSerialTransport {
     port: Arc<Mutex<Option<Box<dyn serialport::SerialPort>>>>,
     read_chunk: usize,
+}
+
+fn serial_port_type_priority(port_type: &SerialPortType) -> u8 {
+    match port_type {
+        SerialPortType::UsbPort(_) => 0,
+        SerialPortType::PciPort => 1,
+        SerialPortType::BluetoothPort => 2,
+        SerialPortType::Unknown => 3,
+    }
+}
+
+fn windows_com_number(port_name: &str) -> Option<u32> {
+    port_name
+        .to_ascii_uppercase()
+        .strip_prefix("COM")?
+        .parse()
+        .ok()
+}
+
+fn compare_serial_ports(left: &SerialPortInfo, right: &SerialPortInfo) -> Ordering {
+    serial_port_type_priority(&left.port_type)
+        .cmp(&serial_port_type_priority(&right.port_type))
+        .then_with(|| {
+            match (
+                windows_com_number(&left.port_name),
+                windows_com_number(&right.port_name),
+            ) {
+                (Some(left), Some(right)) => left.cmp(&right),
+                _ => left.port_name.cmp(&right.port_name),
+            }
+        })
+}
+
+/// Returns currently available serial ports in a stable preference order.
+/// USB serial devices are preferred, followed by PCI, Bluetooth and unknown ports.
+pub fn available_serial_port_names() -> Result<Vec<String>, TransportError> {
+    let mut ports = serialport::available_ports()
+        .map_err(|err| TransportError::Io(io::Error::other(err.to_string())))?;
+    ports.sort_by(compare_serial_ports);
+    Ok(ports.into_iter().map(|port| port.port_name).collect())
 }
 
 impl TcpTransport {
