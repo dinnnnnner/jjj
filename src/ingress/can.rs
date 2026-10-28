@@ -1,4 +1,4 @@
-use super::can_clock::{CanClock, FrameTime};
+﻿use super::can_clock::{CanClock, FrameTime};
 use crate::bus::{AppEvent, DeviceEvent, EventBus, TelemetrySourceKind};
 use crate::domain::{AlarmEvent, AlarmLevel};
 use crate::ingress::serial::publish_status;
