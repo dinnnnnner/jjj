@@ -112,7 +112,13 @@ impl SentFrameCodec {
                 return Ok(None);
             }
 
-            let raw = src.split_to(SENT_FRAME_LEN);
+            // A corrupt candidate may contain the next sync marker. Consume only
+            // one byte on failure so the following valid frame remains available.
+            if src[1..SENT_FRAME_LEN].iter().any(|byte| *byte > 0x0F) {
+                src.advance(1);
+                continue;
+            }
+            let raw = &src[..SENT_FRAME_LEN];
             let status = raw[1] & 0x0F;
             let channel_1 = (((raw[2] & 0x0F) as u16) << 8)
                 | (((raw[3] & 0x0F) as u16) << 4)
@@ -125,9 +131,11 @@ impl SentFrameCodec {
             let expected_crc = sent_crc_nibble(status, channel_1, channel_2);
 
             if crc != expected_crc {
+                src.advance(1);
                 continue;
             }
 
+            src.advance(SENT_FRAME_LEN);
             return Ok(Some(SentFrame {
                 status,
                 channel_1,
@@ -175,7 +183,7 @@ impl FrameCodec for SimpleFrameCodec {
             }
 
             let body_len = u16::from_be_bytes([src[2], src[3]]) as usize;
-            if body_len < 9 || body_len > self.max_payload + 9 {
+            if body_len < 9 || body_len - 9 > self.max_payload {
                 src.advance(1);
                 continue;
             }
@@ -268,6 +276,23 @@ pub fn sent3_check_nibble(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sent_decoder_recovers_a_good_frame_inside_a_corrupt_candidate() {
+        let expected = SentFrameCodec::with_crc(2, 0x456, 0x789, 6);
+        let encoded = SentFrameCodec::encode_frame(expected);
+        for prefix_len in 1..SENT_FRAME_LEN {
+            let mut buf = BytesMut::from(&[SENT_SYNC_MARKER][..]);
+            buf.extend_from_slice(&vec![0; prefix_len - 1]);
+            buf.extend_from_slice(&encoded);
+            assert_eq!(
+                SentFrameCodec.try_decode(&mut buf).unwrap(),
+                Some(expected),
+                "prefix {prefix_len}"
+            );
+            assert!(buf.is_empty());
+        }
+    }
 
     #[test]
     fn decode_split_and_sticky_packets() {

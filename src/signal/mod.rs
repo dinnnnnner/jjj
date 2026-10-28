@@ -311,14 +311,10 @@ pub fn circular_mean_degrees(samples: &VecDeque<f64>, reference: f64) -> f64 {
             (sin_sum + radians.sin(), cos_sum + radians.cos())
         });
 
-    let mut mean = sin_sum.atan2(cos_sum).to_degrees();
-    while mean - reference > 180.0 {
-        mean -= 360.0;
-    }
-    while reference - mean > 180.0 {
-        mean += 360.0;
-    }
-    mean
+    let mean = sin_sum.atan2(cos_sum).to_degrees();
+    // Constant-time wrapping also works when subtracting 360 would round back
+    // to the same large floating-point value and loop forever.
+    reference + (mean - reference + 180.0).rem_euclid(360.0) - 180.0
 }
 
 pub struct ButterworthCascade {
@@ -401,6 +397,10 @@ where
     }
 
     pub fn apply(&mut self, key: K, value: f64) -> anyhow::Result<f64> {
+        anyhow::ensure!(
+            (value as f32).is_finite(),
+            "filter sample must be finite and fit f32"
+        );
         match self.filters.entry(key) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 Ok(entry.get_mut().run(value))
@@ -423,6 +423,35 @@ fn butterworth_section_q(order: usize, section_index: usize) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_sample_does_not_poison_future_filter_outputs() {
+        let config = ButterworthConfig {
+            order: 2,
+            sample_rate_hz: 1000.0,
+            cutoff_hz: 100.0,
+        };
+        let mut filter = KeyedButterworthFilter::new(config);
+        let mut reference = KeyedButterworthFilter::new(config);
+        assert_eq!(
+            filter.apply(0, 1.0).unwrap(),
+            reference.apply(0, 1.0).unwrap()
+        );
+        for invalid in [f64::NAN, f64::INFINITY, f64::MAX] {
+            assert!(filter.apply(0, invalid).is_err());
+        }
+        assert_eq!(
+            filter.apply(0, 2.0).unwrap(),
+            reference.apply(0, 2.0).unwrap()
+        );
+    }
+
+    #[test]
+    fn circular_mean_handles_large_finite_angles_without_iteration() {
+        let result = circular_mean_degrees(&VecDeque::from([1e20]), 1e20);
+        assert!(result.is_finite());
+        assert_eq!(result, 1e20);
+    }
 
     fn estimate_amplitude(samples: &[f64], sample_rate_hz: f64, freq_hz: f64) -> f64 {
         let n = samples.len() as f64;

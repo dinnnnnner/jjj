@@ -190,6 +190,24 @@ control 接口是 TCP JSON 行协议。客户端连接 `control_addr`，发送�
 
 阈值会被规范化：扭矩阈值取绝对值并保证 `warn <= red <= purple`，T1、T2 和 S 的角度阈值分别取绝对值。旧客户端仍可发送 `angle_t_red`，collector 会将它同时用于 T1 和 T2。更新成功后 collector 会发布一条 `status` 消息到 UI feed。
 
+### 4.2 设置 CAN 三轴阈值
+
+```json
+{"type":"set_can_alarm_thresholds","high":[100,200,null],"low":[-100,-200,null]}
+```
+
+数组按 X、Y、Z 排列，`null` 禁用对应边界。阈值必须有限，且同一轴的下限必须小于上限。采集服务仅对 `CanAxis` 数据评估阈值，并按设备和轴分别产生 `can_x_h`、`can_x_l` 等告警与恢复事件；事件进入 UI feed 和数据库。UI 收到成功响应后才更新已应用阈值。
+
+### 4.3 设置 SENT 帧间隔阈值
+
+```json
+{"type":"set_sent_frame_gap_thresholds","t1_us":1500,"t2_us":3000,"s_us":1500}
+```
+
+三个阈值均为正整数，单位微秒。对应告警 ID 为 `sent_frame_gap_t1`、`sent_frame_gap_t2` 和 `sent_frame_gap_s`，可通过报警记录分组查询并显示在 SENT 回放中。
+
+控制接口的阈值保存在采集服务内存中，重启服务后需要重新应用。各命令统一返回 `{"ok":true}` 或带 `error` 字段的失败响应。
+
 ## 5. Health HTTP API
 
 ### 5.1 `GET /health`

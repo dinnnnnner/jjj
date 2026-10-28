@@ -164,6 +164,24 @@ struct ConfigFile {
     collector: Option<CollectorConfig>,
 }
 
+impl CollectorConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.bus_capacity > 0,
+            "collector.bus_capacity must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.ui_feed_capacity > 0,
+            "collector.ui_feed_capacity must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.max_payload <= u16::MAX as usize - 9,
+            "collector.max_payload exceeds the wire format limit (65526)"
+        );
+        Ok(())
+    }
+}
+
 pub fn load_collector_config() -> CollectorConfig {
     let path = "config.toml";
     let Ok(text) = fs::read_to_string(path) else {
@@ -273,6 +291,29 @@ fn parse_can_channel_list(value: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configuration_rejects_zero_queues_and_unencodable_payloads() {
+        for invalid in [
+            CollectorConfig {
+                bus_capacity: 0,
+                ..CollectorConfig::default()
+            },
+            CollectorConfig {
+                ui_feed_capacity: 0,
+                ..CollectorConfig::default()
+            },
+            CollectorConfig {
+                max_payload: usize::MAX,
+                ..CollectorConfig::default()
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
+        assert!(CollectorConfig::default().validate().is_ok());
+        let example: ConfigFile = toml::from_str(include_str!("../config.toml.example")).unwrap();
+        example.collector.unwrap().validate().unwrap();
+    }
 
     #[test]
     fn parse_can_channel_list_skips_empty_items() {

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -52,7 +52,6 @@ impl Default for SessionConfig {
 
 enum SessionMsg {
     Call(Command, oneshot::Sender<Result<Response, SessionError>>),
-    Stop,
 }
 
 struct PendingResponder {
@@ -165,7 +164,7 @@ impl SessionCore {
             return Vec::new();
         }
 
-        if self.pending.remove(&frame.request_id).is_some() {
+        if frame.kind != 0x34 && self.pending.remove(&frame.request_id).is_some() {
             return vec![SessionCoreEvent::CommandSucceeded(Response {
                 request_id: frame.request_id,
                 code: frame.kind,
@@ -211,6 +210,7 @@ fn command_frame(cmd: &Command) -> Frame {
 pub struct DeviceSessionHandle {
     device_id: DeviceId,
     tx: mpsc::Sender<SessionMsg>,
+    stop: watch::Sender<bool>,
 }
 
 impl DeviceSessionHandle {
@@ -224,7 +224,7 @@ impl DeviceSessionHandle {
     }
 
     pub async fn stop(&self) {
-        let _ = self.tx.send(SessionMsg::Stop).await;
+        let _ = self.stop.send(true);
     }
 
     pub fn device_id(&self) -> &str {
@@ -264,6 +264,7 @@ impl DeviceSession {
         config: SessionConfig,
     ) -> (DeviceSessionHandle, JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(256);
+        let (stop, mut stopped) = watch::channel(false);
         let mut session = Self {
             device_id: device_id.clone(),
             state: ConnState::Disconnected,
@@ -276,10 +277,25 @@ impl DeviceSession {
         };
 
         let join = tokio::spawn(async move {
-            session.run().await;
+            // Independent of the command queue: stop also cancels connect,
+            // writes and retry sleeps. Dropping the last handle stops the task.
+            tokio::select! {
+                biased;
+                _ = stopped.changed() => {}
+                _ = session.run() => {}
+            }
+            session.set_state(ConnState::Disconnected).await;
+            let _ = session.transport.close().await;
         });
 
-        (DeviceSessionHandle { device_id, tx }, join)
+        (
+            DeviceSessionHandle {
+                device_id,
+                tx,
+                stop,
+            },
+            join,
+        )
     }
 
     async fn run(&mut self) {
@@ -289,13 +305,12 @@ impl DeviceSession {
             self.set_state(ConnState::Connecting).await;
             match self.transport.connect().await {
                 Ok(()) => {
+                    backoff = self.config.reconnect_base;
                     self.set_state(ConnState::Handshaking).await;
                     self.set_state(ConnState::Ready).await;
                     info!(device_id = %self.device_id, "session connected");
 
                     if self.connection_loop().await.is_ok() {
-                        self.set_state(ConnState::Disconnected).await;
-                        let _ = self.transport.close().await;
                         break;
                     }
                 }
@@ -305,14 +320,12 @@ impl DeviceSession {
             }
 
             if !self.config.reconnect_enabled {
-                self.set_state(ConnState::Disconnected).await;
-                let _ = self.transport.close().await;
                 break;
             }
             self.set_state(ConnState::Reconnecting).await;
             let _ = self.transport.close().await;
             tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(self.config.reconnect_max);
+            backoff = backoff.saturating_mul(2).min(self.config.reconnect_max);
         }
     }
 
@@ -330,6 +343,10 @@ impl DeviceSession {
                     match msg {
                         Some(SessionMsg::Call(cmd, responder)) => {
                             let request_id = cmd.request_id;
+                            if responders.contains_key(&request_id) {
+                                let _ = responder.send(Err(SessionError::Busy));
+                                continue;
+                            }
                             responders.insert(request_id, PendingResponder {
                                 responder,
                             });
@@ -341,7 +358,7 @@ impl DeviceSession {
                                 return Err(SessionError::Closed);
                             }
                         }
-                        Some(SessionMsg::Stop) | None => {
+                        None => {
                             for id in core.close() {
                                 if let Some(pending) = responders.remove(&id) {
                                     let _ = pending.responder.send(Err(SessionError::Closed));
@@ -363,7 +380,10 @@ impl DeviceSession {
                     self.handle_core_events(events, &mut responders, connection_start).await?;
                 }
                 read_res = self.transport.read(&mut in_buf) => {
-                    let n = read_res?;
+                    let n = match read_res {
+                        Err(TransportError::Io(err)) if err.kind() == std::io::ErrorKind::TimedOut => continue,
+                        result => result?,
+                    };
                     if n == 0 {
                         return Err(SessionError::Closed);
                     }
@@ -559,6 +579,186 @@ mod tests {
     use super::*;
     use crate::domain::{CommandKind, RetryPolicy};
 
+    struct UnavailableTransport {
+        hang: bool,
+        entered: Arc<tokio::sync::Notify>,
+        closed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for UnavailableTransport {
+        async fn connect(&mut self) -> Result<(), TransportError> {
+            self.entered.notify_one();
+            if self.hang {
+                std::future::pending().await
+            } else {
+                Err(TransportError::NotConnected)
+            }
+        }
+        async fn read(&mut self, _: &mut BytesMut) -> Result<usize, TransportError> {
+            unreachable!()
+        }
+        async fn write_all(&mut self, _: &[u8]) -> Result<(), TransportError> {
+            unreachable!()
+        }
+        async fn close(&mut self) -> Result<(), TransportError> {
+            self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    async fn assert_unavailable_session_stops(hang: bool, drop_handle: bool) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (handle, mut session) = DeviceSession::spawn_with_join(
+            "unavailable".into(),
+            Box::new(UnavailableTransport {
+                hang,
+                entered: entered.clone(),
+                closed: closed.clone(),
+            }),
+            Arc::new(crate::protocol::SimpleFrameCodec::new(1024)),
+            EventBus::new(32),
+            Store::default(),
+            SessionConfig {
+                reconnect_base: Duration::from_secs(60),
+                reconnect_max: Duration::from_secs(60),
+                ..SessionConfig::default()
+            },
+        );
+        entered.notified().await;
+        let retained_handle = if drop_handle {
+            drop(handle);
+            None
+        } else {
+            handle.stop().await;
+            Some(handle)
+        };
+        let result = tokio::time::timeout(Duration::from_millis(500), &mut session).await;
+        if result.is_err() {
+            session.abort();
+        }
+        result.expect("session did not stop promptly").unwrap();
+        assert!(closed.load(std::sync::atomic::Ordering::SeqCst));
+        drop(retained_handle);
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_a_hanging_connect() {
+        assert_unavailable_session_stops(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn stop_interrupts_reconnect_backoff() {
+        assert_unavailable_session_stops(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_last_handle_cancels_a_hanging_connect() {
+        assert_unavailable_session_stops(true, true).await;
+    }
+
+    struct MockTransport {
+        incoming: mpsc::Receiver<Result<Vec<u8>, TransportError>>,
+        outgoing: mpsc::UnboundedSender<Vec<u8>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for MockTransport {
+        async fn connect(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+        async fn read(&mut self, dst: &mut BytesMut) -> Result<usize, TransportError> {
+            let bytes = self
+                .incoming
+                .recv()
+                .await
+                .ok_or(TransportError::NotConnected)??;
+            dst.extend_from_slice(&bytes);
+            Ok(bytes.len())
+        }
+        async fn write_all(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
+            self.outgoing
+                .send(bytes.to_vec())
+                .map_err(|_| TransportError::NotConnected)
+        }
+        async fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_and_duplicate_request_do_not_destroy_an_inflight_command() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (input, incoming) = mpsc::channel(8);
+            let (outgoing, mut output) = mpsc::unbounded_channel();
+            let codec = Arc::new(crate::protocol::SimpleFrameCodec::new(1024));
+            let (handle, session) = DeviceSession::spawn_with_join(
+                "test".into(),
+                Box::new(MockTransport { incoming, outgoing }),
+                codec.clone(),
+                EventBus::new(32),
+                Store::default(),
+                SessionConfig {
+                    enable_heartbeat: false,
+                    reconnect_enabled: false,
+                    ..SessionConfig::default()
+                },
+            );
+            let caller = handle.clone();
+            let original = tokio::spawn(async move {
+                caller
+                    .call(command(11, Duration::from_secs(2), 1, true))
+                    .await
+            });
+            output.recv().await.unwrap();
+            assert!(matches!(
+                handle
+                    .call(command(11, Duration::from_secs(2), 1, true))
+                    .await,
+                Err(SessionError::Busy)
+            ));
+            input
+                .send(Err(
+                    std::io::Error::from(std::io::ErrorKind::TimedOut).into()
+                ))
+                .await
+                .unwrap();
+            let mut telemetry = BytesMut::new();
+            codec
+                .encode(
+                    &Frame {
+                        request_id: 11,
+                        kind: 0x34,
+                        payload: b"sid=0,value=42".to_vec(),
+                    },
+                    &mut telemetry,
+                )
+                .unwrap();
+            input.send(Ok(telemetry.to_vec())).await.unwrap();
+            let mut ack = BytesMut::from(&output.recv().await.unwrap()[..]);
+            assert_eq!(codec.try_decode(&mut ack).unwrap().unwrap().kind, 0x90);
+            assert!(!original.is_finished());
+            let mut response = BytesMut::new();
+            codec
+                .encode(
+                    &Frame {
+                        request_id: 11,
+                        kind: 0x80,
+                        payload: b"ok".to_vec(),
+                    },
+                    &mut response,
+                )
+                .unwrap();
+            input.send(Ok(response.to_vec())).await.unwrap();
+            assert_eq!(original.await.unwrap().unwrap().payload, b"ok");
+            handle.stop().await;
+            session.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
     fn command(request_id: u64, timeout: Duration, max_attempts: u32, idempotent: bool) -> Command {
         Command {
             request_id,
@@ -678,5 +878,26 @@ mod tests {
             }
             _ => panic!("expected telemetry event"),
         }
+    }
+
+    #[test]
+    fn telemetry_id_collision_does_not_complete_a_pending_command() {
+        let now = Instant::now();
+        let mut core = SessionCore::new(SessionConfig::default(), now);
+        core.handle_command(command(11, Duration::from_secs(1), 1, true), now);
+        let events = core.handle_frame(
+            Frame {
+                request_id: 11,
+                kind: 0x34,
+                payload: b"sid=2,value=42.5".to_vec(),
+            },
+            now,
+            SystemTime::UNIX_EPOCH,
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [SessionCoreEvent::TelemetryReceived { .. }]
+        ));
+        assert!(core.pending.contains_key(&11));
     }
 }

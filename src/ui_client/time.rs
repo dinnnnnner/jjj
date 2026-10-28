@@ -58,7 +58,10 @@ pub(crate) fn parse_time_input(text: &str) -> Option<i64> {
         return None;
     }
     if let Ok(ts_ms) = trimmed.parse::<i64>() {
-        return Some(ts_ms);
+        let days = (ts_ms.div_euclid(1000) + DISPLAY_TZ_OFFSET_SECS).div_euclid(86_400);
+        return (1..=9999)
+            .contains(&civil_from_days(days).0)
+            .then_some(ts_ms);
     }
 
     let normalized = trimmed.replace('/', "-").replace('T', " ");
@@ -85,7 +88,8 @@ pub(crate) fn parse_time_input(text: &str) -> Option<i64> {
         return None;
     }
 
-    if !(1..=12).contains(&month)
+    if !(1..=9999).contains(&year)
+        || !(1..=12).contains(&month)
         || !(1..=31).contains(&day)
         || !(0..=23).contains(&hour)
         || !(0..=59).contains(&minute)
@@ -95,6 +99,9 @@ pub(crate) fn parse_time_input(text: &str) -> Option<i64> {
     }
 
     let days = days_from_civil(year, month, day);
+    if civil_from_days(days) != (year, month, day) {
+        return None;
+    }
     let local_seconds = days * 86_400 + hour * 3600 + minute * 60 + second;
     Some((local_seconds - DISPLAY_TZ_OFFSET_SECS) * 1000)
 }
@@ -121,4 +128,24 @@ pub(crate) fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let m = mp + if mp < 10 { 3 } else { -9 };
     let y = y + if m <= 2 { 1 } else { 0 };
     (y, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dates_reject_nonexistent_days_and_overflowing_years() {
+        for value in [
+            "2025-02-29",
+            "2026-04-31",
+            "9223372036854775807-01-01",
+            "9223372036854775807",
+            "-9223372036854775808",
+        ] {
+            assert_eq!(parse_time_input(value), None, "{value}");
+        }
+        let leap_day = parse_time_input("2024-02-29 12:34:56").unwrap();
+        assert_eq!(format_datetime_input(leap_day), "2024-02-29 12:34:56");
+    }
 }

@@ -18,6 +18,12 @@ impl SensorSeries {
     }
 
     pub fn push(&mut self, msg: &TelemetryMsg) {
+        if !msg.t_sec.is_finite() || !msg.value.is_finite() {
+            return;
+        }
+        if self.points.back().is_some_and(|last| msg.t_sec < last[0]) {
+            self.points.clear();
+        }
         self.points.push_back([msg.t_sec, msg.value]);
         self.latest = Some(msg.value);
         self.device_id = msg.device_id.clone();
@@ -89,6 +95,27 @@ pub(crate) fn downsample_for_chart(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restarting_source_does_not_connect_old_and_new_timelines() {
+        let mut series = SensorSeries::new();
+        let mut msg = TelemetryMsg {
+            captured_at_ms: 0,
+            device_id: "can://test:ch0".into(),
+            sensor_id: 0,
+            axis: String::new(),
+            alarm_bit: false,
+            t_sec: 100.0,
+            value: 1.0,
+            request_id: 1,
+            source_kind: demo2::bus::TelemetrySourceKind::CanSent,
+        };
+        series.push(&msg);
+        msg.t_sec = 0.0;
+        msg.value = 2.0;
+        series.push(&msg);
+        assert_eq!(series.points, VecDeque::from([[0.0, 2.0]]));
+    }
 
     #[test]
     fn chart_downsampling_keeps_endpoints_and_spikes() {
