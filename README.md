@@ -32,6 +32,8 @@ src/
 
 更细的架构说明见 `docs/architecture.md`，接口协议见 `docs/api.md`。
 
+本轮问题现象、修复措施和验证结果见 [采集项目问题修复与验证记录](docs/review-fixes-2026-10-28.md)。
+
 ## 环境要求
 
 - Rust stable，项目使用 edition 2024。
