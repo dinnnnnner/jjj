@@ -30,7 +30,7 @@ enum UiMsg {
     Alarm(AlarmUpdate),
     AlarmSnapshot(AlarmSnapshot),
     CanReplayProgress(ReplayMode, u64, u64),
-    CanReplayLoaded(ReplayMode, Result<CanReplayData, String>),
+    CanReplayLoaded(ReplayMode, Box<Result<CanReplayData, String>>),
     CanReplayExported(Result<String, String>),
     AlarmRecordsLoaded(Result<AlarmRecordData, String>),
 }

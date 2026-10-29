@@ -989,12 +989,12 @@ impl UiClientApp {
         };
 
         for window in &mut self.dynamic_windows {
-            if let Some(rect) = window.rect {
-                if rect.contains(pointer) {
-                    let factor = (1.0 + scroll_y * 0.0015).clamp(0.85, 1.2);
-                    window.scale = (window.scale * factor).clamp(SCALE_MIN, SCALE_MAX);
-                    break;
-                }
+            if let Some(rect) = window.rect
+                && rect.contains(pointer)
+            {
+                let factor = (1.0 + scroll_y * 0.0015).clamp(0.85, 1.2);
+                window.scale = (window.scale * factor).clamp(SCALE_MIN, SCALE_MAX);
+                break;
             }
         }
     }
@@ -1103,18 +1103,19 @@ impl UiClientApp {
         let mut segment: Vec<egui::Pos2> = Vec::with_capacity(chart_points.len());
         let mut prev_t: Option<f64> = None;
         for p in &chart_points {
-            if let Some(pt) = prev_t {
-                if p[0] - pt > LINE_BREAK_GAP_SECS {
-                    if segment.len() >= 2 {
-                        painter.add(egui::Shape::line(
-                            std::mem::take(&mut segment),
-                            egui::Stroke::new(1.6, egui::Color32::LIGHT_GREEN),
-                        ));
-                    } else {
-                        segment.clear();
-                    }
+            if let Some(pt) = prev_t
+                && p[0] - pt > LINE_BREAK_GAP_SECS
+            {
+                if segment.len() >= 2 {
+                    painter.add(egui::Shape::line(
+                        std::mem::take(&mut segment),
+                        egui::Stroke::new(1.6, egui::Color32::LIGHT_GREEN),
+                    ));
+                } else {
+                    segment.clear();
                 }
             }
+
             segment.push(to_screen(p[0], p[1]));
             prev_t = Some(p[0]);
         }
