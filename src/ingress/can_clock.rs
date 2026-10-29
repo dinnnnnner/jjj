@@ -15,12 +15,13 @@ pub(super) struct CanClock {
     origin: Option<SystemTime>,
     anchor: Option<(u64, SystemTime)>,
     last_timestamp_us: Option<u64>,
+    last_captured_at: Option<SystemTime>,
 }
 
 impl CanClock {
     pub fn capture(&mut self, timestamp_us: u64, received_at: SystemTime) -> FrameTime {
         let origin = *self.origin.get_or_insert(received_at);
-        let captured_at = if timestamp_us == 0 {
+        let mut captured_at = if timestamp_us == 0 {
             // A missing hardware timestamp must not acquire ingress queue delay.
             received_at
         } else {
@@ -38,6 +39,15 @@ impl CanClock {
                 .checked_add(Duration::from_micros(timestamp_us - anchor_us))
                 .unwrap_or(received_at)
         };
+        if let Some(last) = self.last_captured_at
+            && captured_at < last
+        {
+            captured_at = last;
+            if timestamp_us != 0 {
+                self.anchor = Some((timestamp_us, last));
+            }
+        }
+        self.last_captured_at = Some(captured_at);
         FrameTime {
             captured_at,
             t_sec: captured_at
@@ -76,7 +86,27 @@ mod tests {
         assert_eq!(clock.capture(0, start + Duration::from_secs(2)).t_sec, 2.0);
         assert_eq!(
             clock.capture(1_100, start + Duration::from_secs(3)).t_sec,
-            1.001
+            2.0
+        );
+        assert_eq!(
+            clock.capture(2_100, start + Duration::from_secs(4)).t_sec,
+            2.001
+        );
+    }
+
+    #[test]
+    fn callback_reordering_cannot_move_capture_time_backwards() {
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let mut clock = CanClock::default();
+        clock.capture(1_000, start);
+        let before = clock.capture(3_000, start + Duration::from_millis(2));
+        let late = clock.capture(2_000, start + Duration::from_millis(1));
+        assert!(late.captured_at >= before.captured_at);
+        assert!(
+            clock
+                .capture(4_000, start + Duration::from_millis(3))
+                .captured_at
+                >= late.captured_at
         );
     }
 }

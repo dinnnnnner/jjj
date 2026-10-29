@@ -6,6 +6,19 @@ use std::io::Write;
 use std::thread;
 use tokio_postgres::NoTls;
 
+fn sent_alarm_targets(alarm_id: &str, message: &str) -> [bool; 5] {
+    [
+        matches!(alarm_id, "sent_angle_jump_t1" | "sent_frame_gap_t1")
+            || UiClientApp::has_sent_error_flag(message, "t1"),
+        alarm_id == "sent_torque_jump_t1",
+        matches!(alarm_id, "sent_angle_jump_t2" | "sent_frame_gap_t2")
+            || UiClientApp::has_sent_error_flag(message, "t2"),
+        alarm_id == "sent_torque_jump_t2",
+        matches!(alarm_id, "sent_angle_jump_s" | "sent_frame_gap_s")
+            || UiClientApp::has_sent_error_flag(message, "s"),
+    ]
+}
+
 fn choose_replay_device(requested: &str, devices: &[String]) -> String {
     if requested.trim().is_empty() {
         devices.first().cloned().unwrap_or_default()
@@ -381,33 +394,27 @@ impl UiClientApp {
                                 }
                             }
                             ReplayMode::Sent => {
-                                let target = if alarm_id == "sent_torque_jump_t1" {
-                                    Some((&data.y_points, &mut data.y_alarm_points))
-                                } else if alarm_id == "sent_angle_jump_t1"
-                                    || message.contains("t1=1")
+                                let targets = sent_alarm_targets(&alarm_id, &message);
+                                for (index, (series, alarms)) in [
+                                    (&data.x_points, &mut data.x_alarm_points),
+                                    (&data.y_points, &mut data.y_alarm_points),
+                                    (&data.z_points, &mut data.z_alarm_points),
+                                    (&data.u_points, &mut data.u_alarm_points),
+                                    (&data.v_points, &mut data.v_alarm_points),
+                                ]
+                                .into_iter()
+                                .enumerate()
                                 {
-                                    Some((&data.x_points, &mut data.x_alarm_points))
-                                } else if alarm_id == "sent_torque_jump_t2" {
-                                    Some((&data.u_points, &mut data.u_alarm_points))
-                                } else if alarm_id == "sent_angle_jump_t2"
-                                    || message.contains("t2=1")
-                                {
-                                    Some((&data.z_points, &mut data.z_alarm_points))
-                                } else if alarm_id == "sent_angle_jump_s" || message.contains("s=1")
-                                {
-                                    Some((&data.v_points, &mut data.v_alarm_points))
-                                } else {
-                                    None
-                                };
-                                if let Some((series, alarms)) = target
-                                    && alarms.len() < CAN_REPLAY_MAX_ALARM_POINTS_PER_SERIES
-                                    && let Some(point) = nearest_plot_point(series, x_sec)
-                                {
-                                    alarms.push(AlarmPlotPoint {
-                                        point: [x_sec, point[1]],
-                                        level,
-                                        cleared,
-                                    });
+                                    if targets[index]
+                                        && alarms.len() < CAN_REPLAY_MAX_ALARM_POINTS_PER_SERIES
+                                        && let Some(point) = nearest_plot_point(series, x_sec)
+                                    {
+                                        alarms.push(AlarmPlotPoint {
+                                            point: [x_sec, point[1]],
+                                            level: level.clone(),
+                                            cleared,
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -892,6 +899,30 @@ impl UiClientApp {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn replay_maps_frame_gaps_and_all_flagged_sent_parts() {
+        assert_eq!(
+            super::sent_alarm_targets(
+                "sent_frame_gap_t1",
+                "signal=T1, frame_gap_us=2000, threshold_us=1500"
+            ),
+            [true, false, false, false, false]
+        );
+        assert_eq!(
+            super::sent_alarm_targets("can_signal_timeout_ch0_any", "timeout_ms=1000"),
+            [false; 5]
+        );
+        assert!(!crate::UiClientApp::has_sent_error_flag("s=10", "s"));
+        assert_eq!(
+            super::sent_alarm_targets("sent_frame_gap_t2", "signal=T2"),
+            [false, false, true, false, false]
+        );
+        assert_eq!(
+            super::sent_alarm_targets("sent_error_1", "t1=1,t2=1,s=1"),
+            [true, false, true, false, true]
+        );
+    }
+
     use super::*;
 
     #[test]

@@ -80,10 +80,10 @@ impl UiClientApp {
                 }
             }
             UiMsg::CanReplayLoaded(mode, result) => {
-                self.can_replay.loading = false;
                 if mode != self.can_replay.mode {
                     return;
                 }
+                self.can_replay.loading = false;
                 match result {
                     Ok(data) => {
                         self.can_replay.device_input = data.device_id.clone();
@@ -154,17 +154,17 @@ impl UiClientApp {
     }
 
     fn handle_status(&mut self, status: String) {
-        if status.contains("CAN self-test")
-            || status.contains("CAN 鑷")
-            || status.contains("CAN 鑷缁撴灉")
-        {
+        if status.contains("CAN self-test") || status.contains("CAN 自检") {
             self.last_can_self_test_result = status.clone();
         }
         self.status = status;
     }
 
     fn handle_sample(&mut self, sample: TelemetryMsg) {
-        if sample.sensor_id >= SENSOR_COUNT {
+        if sample.sensor_id >= SENSOR_COUNT
+            || !sample.t_sec.is_finite()
+            || !sample.value.is_finite()
+        {
             return;
         }
         if let Some(channel) = Self::can_channel_from_device_id(&sample.device_id) {
@@ -239,6 +239,51 @@ mod tests {
             String::new(),
             None,
         )
+    }
+
+    #[test]
+    fn chinese_can_self_test_status_updates_the_result() {
+        let mut app = app();
+        let status = "CAN 自检结果: X=1 Y=2 Z=3";
+        app.handle_status(status.to_string());
+        assert_eq!(app.last_can_self_test_result, status);
+        assert_eq!(app.status, status);
+    }
+
+    #[test]
+    fn unrelated_replay_result_does_not_finish_current_load() {
+        let mut app = app();
+        app.can_replay.mode = crate::ReplayMode::Sent;
+        app.can_replay.loading = true;
+        app.handle_ui_msg(UiMsg::CanReplayLoaded(
+            crate::ReplayMode::Can3Axis,
+            Err("old result".into()),
+        ));
+        assert!(app.can_replay.loading);
+    }
+
+    #[test]
+    fn alarm_records_cannot_replace_a_replay_while_it_is_loading() {
+        let mut app = app();
+        app.can_replay.mode = crate::ReplayMode::Sent;
+        app.can_replay.loading = true;
+        app.can_replay.start_ts_input = "100".into();
+        app.alarm_records.show_can_x = true;
+        app.alarm_records.data = Some(crate::AlarmRecordData {
+            records: vec![crate::AlarmRecordRow {
+                ts_ms: 1000,
+                device_id: "can://test".into(),
+                alarm_id: "can_x_h".into(),
+                level: "Warning".into(),
+                message: String::new(),
+                cleared: false,
+            }],
+            ..Default::default()
+        });
+        app.open_can_replay_from_alarm_records();
+        assert_eq!(app.can_replay.mode, crate::ReplayMode::Sent);
+        assert_eq!(app.can_replay.start_ts_input, "100");
+        assert!(app.can_replay.loading);
     }
     fn sample(device: &str, kind: TelemetrySourceKind, value: f64) -> TelemetryMsg {
         TelemetryMsg {

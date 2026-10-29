@@ -1,4 +1,4 @@
-use super::can_clock::{CanClock, FrameTime};
+﻿use super::can_clock::{CanClock, FrameTime};
 use crate::bus::{AppEvent, DeviceEvent, EventBus, TelemetrySourceKind};
 use crate::domain::{AlarmEvent, AlarmLevel};
 use crate::ingress::serial::publish_status;
@@ -197,7 +197,7 @@ impl CanIngressCore {
             });
             push_can_sent_value_events(&mut events, &device_id, frame_count, time, values);
         }
-        if let Some((sensor_id, value)) = decode_axis_sample(identifier, data) {
+        if !is_tx && let Some((sensor_id, value)) = decode_axis_sample(identifier, data) {
             events.push(CanIngressEvent::Telemetry {
                 device_id: device_id.clone(),
                 sensor_id,
@@ -752,6 +752,24 @@ fn format_can_frame(frame: &CanFrame) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transmitted_axis_echo_does_not_produce_measurements() {
+        let config = CanTransportConfig::default();
+        let mut core = CanIngressCore::new(
+            SentFilterConfig::default(),
+            &CanSignalWatchdogConfig::default(),
+            &config.channels,
+            Instant::now(),
+        );
+        let mut frame = axis_frame(0, 123);
+        frame.properties = 1;
+        assert!(
+            core.handle_frame(&config, frame)
+                .iter()
+                .all(|event| !matches!(event, CanIngressEvent::Telemetry { .. }))
+        );
+    }
 
     fn axis_frame(channel: u8, value: i32) -> CanFrame {
         let mut data = [0u8; 64];

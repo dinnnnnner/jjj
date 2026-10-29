@@ -1,12 +1,13 @@
 use crate::bus::{AppEvent, DeviceEvent, EventBus, TelemetrySourceKind};
 use crate::domain::alarm::{
-    SentAngleJumpState, SentJumpLevel, SentTorqueJumpState, SentTorqueJumpThresholds,
-    sent_angle_jump_alarm_event, sent_torque_jump_alarm_event,
+    CanAxisAlarmState, SentAngleJumpState, SentJumpLevel, SentTorqueJumpState,
+    SentTorqueJumpThresholds, can_threshold_alarm_event, sent_angle_jump_alarm_event,
+    sent_torque_jump_alarm_event,
 };
 use crate::domain::telemetry::{is_sent_angle_sample, is_sent_torque_sample};
 use crate::domain::{AlarmEvent, AlarmLevel};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
 const DEFAULT_SENT_TORQUE_WARN: f64 = 0.2;
@@ -137,6 +138,14 @@ pub struct AlarmService {
     sent_frame_gap_states: Arc<RwLock<HashMap<(String, SentFrameGapSignal), SentFrameGapState>>>,
     sent_jump_config: Arc<RwLock<SentJumpAlarmConfig>>,
     sent_frame_gap_config: Arc<RwLock<SentFrameGapAlarmConfig>>,
+    can_axis: Arc<Mutex<CanAxisAlarms>>,
+}
+
+#[derive(Default)]
+struct CanAxisAlarms {
+    high: [Option<f64>; 3],
+    low: [Option<f64>; 3],
+    states: HashMap<(String, usize), CanAxisAlarmState>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -207,6 +216,7 @@ impl AlarmService {
             sent_frame_gap_states: Arc::new(RwLock::new(HashMap::new())),
             sent_jump_config: Arc::new(RwLock::new(SentJumpAlarmConfig::default())),
             sent_frame_gap_config: Arc::new(RwLock::new(SentFrameGapAlarmConfig::default())),
+            can_axis: Arc::default(),
         }
     }
 
@@ -214,6 +224,57 @@ impl AlarmService {
     pub fn set_rule(&self, sensor_id: usize, rule: AlarmRule) {
         if let Ok(mut rules) = self.rules.write() {
             rules.insert(sensor_id, rule);
+        }
+    }
+
+    pub fn set_can_axis_thresholds(
+        &self,
+        high: [Option<f64>; 3],
+        low: [Option<f64>; 3],
+    ) -> Result<(), &'static str> {
+        for axis in 0..3 {
+            if high[axis]
+                .into_iter()
+                .chain(low[axis])
+                .any(|v| !v.is_finite())
+            {
+                return Err("CAN thresholds must be finite");
+            }
+            if let (Some(high), Some(low)) = (high[axis], low[axis])
+                && low >= high
+            {
+                return Err("CAN low threshold must be less than high threshold");
+            }
+        }
+        let mut alarms = self
+            .can_axis
+            .lock()
+            .map_err(|_| "CAN alarm state lock poisoned")?;
+        alarms.high = high;
+        alarms.low = low;
+        Ok(())
+    }
+
+    fn evaluate_can_axis(&self, device_id: &str, sensor_id: usize, value: f64) {
+        let Some(axis) = ["x", "y", "z"].get(sensor_id) else {
+            return;
+        };
+        let mut alarms = self.can_axis.lock().unwrap_or_else(|err| err.into_inner());
+        let key = (device_id.to_string(), sensor_id);
+        let previous = alarms.states.get(&key).copied().unwrap_or_default();
+        let (next, transitions) =
+            previous.evaluate_thresholds(alarms.high[sensor_id], alarms.low[sensor_id], value);
+        alarms.states.insert(key, next);
+        // Keep state transitions and event publication in the same order.
+        for transition in transitions {
+            self.publish_alarm(can_threshold_alarm_event(
+                device_id,
+                axis,
+                transition.bound,
+                transition.threshold,
+                value,
+                transition.cleared,
+            ));
         }
     }
 
@@ -259,6 +320,12 @@ impl AlarmService {
         value: f64,
         source_kind: TelemetrySourceKind,
     ) {
+        if !value.is_finite() || !t_sec.is_finite() {
+            return;
+        }
+        if source_kind == TelemetrySourceKind::CanAxis {
+            self.evaluate_can_axis(device_id, sensor_id, value);
+        }
         self.evaluate_rule_sample(device_id, sensor_id, value);
         self.evaluate_sent_jump_sample(device_id, sensor_id, value, source_kind);
         self.evaluate_sent_frame_gap(device_id, sensor_id, t_sec, source_kind);
@@ -280,7 +347,6 @@ impl AlarmService {
 
         let threshold_us = signal.threshold_us(self.sent_frame_gap_config());
         let key = (device_id.to_string(), signal);
-        let mut event = None;
         if let Ok(mut states) = self.sent_frame_gap_states.write() {
             let state = states.entry(key).or_default();
             let previous_t_sec = state.last_t_sec.replace(t_sec);
@@ -299,7 +365,7 @@ impl AlarmService {
 
             state.alarm_active = alarm_active;
             let state_label = if alarm_active { "exceeded" } else { "restored" };
-            event = Some(AlarmEvent {
+            self.publish_alarm(AlarmEvent {
                 device_id: device_id.to_string(),
                 alarm_id: signal.alarm_id().to_string(),
                 level: AlarmLevel::Warning,
@@ -312,10 +378,6 @@ impl AlarmService {
                 raised_at: SystemTime::now(),
                 cleared: !alarm_active,
             });
-        }
-
-        if let Some(event) = event {
-            self.publish_alarm(event);
         }
     }
 
@@ -335,10 +397,11 @@ impl AlarmService {
             let state = states.entry(key).or_default();
             evaluate_high(device_id, sensor_id, value, &rule, state, &mut events);
             evaluate_low(device_id, sensor_id, value, &rule, state, &mut events);
-        }
-
-        for event in events {
-            self.publish_alarm(event);
+            // Publish before another sample can change this state, otherwise
+            // a later clear can overtake its raise and leave a stale alarm.
+            for event in events {
+                self.publish_alarm(event);
+            }
         }
     }
 
@@ -393,10 +456,9 @@ impl AlarmService {
                 }
             }
             states.insert(key, next);
-        }
-
-        for event in events {
-            self.publish_alarm(event);
+            for event in events {
+                self.publish_alarm(event);
+            }
         }
     }
 
@@ -419,10 +481,9 @@ impl AlarmService {
                 ));
             }
             states.insert(key, next);
-        }
-
-        for event in events {
-            self.publish_alarm(event);
+            for event in events {
+                self.publish_alarm(event);
+            }
         }
     }
 
@@ -536,6 +597,84 @@ fn alarm_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_threshold_transitions_remain_in_order() {
+        const WORKERS: usize = 4;
+        const SAMPLES: usize = 2_000;
+        let bus = EventBus::new(WORKERS * SAMPLES + 1);
+        let mut rx = bus.subscribe();
+        let service = AlarmService::new(bus.clone());
+        service.set_rule(
+            1,
+            AlarmRule {
+                high: Some(10.0),
+                high_clear: Some(8.0),
+                low: None,
+                low_clear: None,
+                level: AlarmLevel::Warning,
+                name: "concurrent".into(),
+            },
+        );
+        let barrier = std::sync::Barrier::new(WORKERS);
+        std::thread::scope(|scope| {
+            for _ in 0..WORKERS {
+                let service = &service;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for sample in 0..SAMPLES {
+                        service.evaluate_sample(
+                            "dev",
+                            1,
+                            0.0,
+                            if sample % 2 == 0 { 11.0 } else { 7.0 },
+                            TelemetrySourceKind::Unknown,
+                        );
+                    }
+                });
+            }
+        });
+        let mut active = false;
+        while let Ok(AppEvent::Alarm(update)) = rx.try_recv() {
+            assert_eq!(
+                update.event.cleared, active,
+                "alarm transitions arrived out of order"
+            );
+            active = !update.event.cleared;
+        }
+        assert!(!active);
+        assert!(bus.alarm_snapshot().alarms.is_empty());
+    }
+
+    #[test]
+    fn can_thresholds_raise_and_clear_only_for_the_right_source_and_device() {
+        let bus = EventBus::new(32);
+        let service = AlarmService::new(bus.clone());
+        service
+            .set_can_axis_thresholds([Some(10.0), None, None], [Some(-10.0), None, None])
+            .unwrap();
+        service.evaluate_sample("can://test:ch0", 0, 0.0, 11.0, TelemetrySourceKind::CanSent);
+        assert!(bus.alarm_snapshot().alarms.is_empty());
+        service.evaluate_sample("can://test:ch0", 0, 0.0, 11.0, TelemetrySourceKind::CanAxis);
+        assert_eq!(bus.alarm_snapshot().alarms[0].alarm_id, "can_x_h");
+        service.evaluate_sample("can://test:ch1", 0, 0.0, 0.0, TelemetrySourceKind::CanAxis);
+        service.evaluate_sample(
+            "can://test:ch0",
+            0,
+            0.0,
+            f64::NAN,
+            TelemetrySourceKind::CanAxis,
+        );
+        assert_eq!(bus.alarm_snapshot().alarms.len(), 1);
+        service.evaluate_sample("can://test:ch0", 0, 0.0, 9.0, TelemetrySourceKind::CanAxis);
+        assert!(bus.alarm_snapshot().alarms.is_empty());
+        assert!(
+            service
+                .set_can_axis_thresholds([Some(10.0); 3], [Some(11.0); 3])
+                .is_err()
+        );
+    }
 
     fn next_alarm(bus_rx: &mut tokio::sync::broadcast::Receiver<AppEvent>) -> AlarmEvent {
         match bus_rx.try_recv().unwrap() {

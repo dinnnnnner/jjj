@@ -2,9 +2,46 @@ use crate::*;
 use demo2::bus::TelemetrySourceKind;
 use demo2::domain::telemetry::{sent_angle_label, sent_torque_label};
 use demo2::signal::{SignalKind, SignalSample};
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
 use std::time::Instant;
+
+async fn request_control_command(
+    address: &str,
+    payload: serde_json::Value,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    const MAX_RESPONSE: usize = 8192;
+    tokio::time::timeout(timeout, async {
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .map_err(|err| format!("connect collector control failed: {err}"))?;
+        stream
+            .write_all(format!("{payload}\n").as_bytes())
+            .await
+            .map_err(|err| format!("send collector control failed: {err}"))?;
+        let mut response = Vec::new();
+        BufReader::new(stream)
+            .take((MAX_RESPONSE + 1) as u64)
+            .read_until(b'\n', &mut response)
+            .await
+            .map_err(|err| format!("read collector control response failed: {err}"))?;
+        if response.len() > MAX_RESPONSE || !response.ends_with(b"\n") {
+            return Err("invalid collector control response length or missing newline".into());
+        }
+        let value: serde_json::Value = serde_json::from_slice(&response)
+            .map_err(|err| format!("parse collector control response failed: {err}"))?;
+        if value.get("ok").and_then(|ok| ok.as_bool()).unwrap_or(false) {
+            return Ok(());
+        }
+        let message = value
+            .get("error")
+            .and_then(|error| error.as_str())
+            .unwrap_or("unknown collector control error");
+        Err(format!("collector control rejected: {message}"))
+    })
+    .await
+    .map_err(|_| "collector control request timed out".to_string())?
+}
 
 impl UiClientApp {
     pub(crate) fn alarm_key(event: &AlarmEvent) -> String {
@@ -140,6 +177,12 @@ impl UiClientApp {
         let y_low = Self::validate_threshold_text(&self.can_alarm_thresholds.y_low_input)?;
         let z_high = Self::validate_threshold_text(&self.can_alarm_thresholds.z_high_input)?;
         let z_low = Self::validate_threshold_text(&self.can_alarm_thresholds.z_low_input)?;
+
+        self.send_control_command(serde_json::json!({
+            "type": "set_can_alarm_thresholds",
+            "high": ([&x_high, &y_high, &z_high].map(|v| Self::parse_optional_threshold(v))),
+            "low": ([&x_low, &y_low, &z_low].map(|v| Self::parse_optional_threshold(v))),
+        }))?;
 
         self.can_alarm_thresholds.x_high_applied = x_high;
         self.can_alarm_thresholds.x_low_applied = x_low;
@@ -341,27 +384,19 @@ impl UiClientApp {
     }
 
     fn send_control_command(&self, payload: serde_json::Value) -> Result<(), String> {
-        let mut stream = TcpStream::connect(&self.control_addr)
-            .map_err(|err| format!("connect collector control failed: {err}"))?;
-        writeln!(stream, "{payload}")
-            .map_err(|err| format!("send collector control failed: {err}"))?;
-
-        let mut reader = BufReader::new(stream);
-        let mut response = String::new();
-        reader
-            .read_line(&mut response)
-            .map_err(|err| format!("read collector control response failed: {err}"))?;
-        let value = serde_json::from_str::<serde_json::Value>(response.trim())
-            .map_err(|err| format!("parse collector control response failed: {err}"))?;
-        if value.get("ok").and_then(|ok| ok.as_bool()).unwrap_or(false) {
-            return Ok(());
-        }
-
-        let message = value
-            .get("error")
-            .and_then(|error| error.as_str())
-            .unwrap_or("unknown collector control error");
-        Err(format!("collector control rejected: {message}"))
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| format!("control runtime failed: {err}"))?;
+        let result = runtime.block_on(request_control_command(
+            &self.control_addr,
+            payload,
+            std::time::Duration::from_secs(2),
+        ));
+        // DNS resolution may use a blocking worker. Do not wait indefinitely
+        // for that worker when a timed-out request tears down its runtime.
+        runtime.shutdown_timeout(std::time::Duration::from_millis(50));
+        result
     }
 
     pub(crate) fn apply_signal_sample(&mut self, sample: SignalSample) {
@@ -392,5 +427,71 @@ impl UiClientApp {
                     .push(&msg);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::request_control_command;
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn control_timeout_includes_waiting_for_a_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(socket);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            assert!(request.ends_with('\n'));
+            std::future::pending::<()>().await;
+        });
+        let result = request_control_command(
+            &address,
+            serde_json::json!({"type":"test"}),
+            Duration::from_millis(100),
+        )
+        .await;
+        server.abort();
+        assert_eq!(result.unwrap_err(), "collector control request timed out");
+    }
+
+    async fn response_result(response: Vec<u8>) -> Result<(), String> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(socket);
+            reader.read_line(&mut String::new()).await.unwrap();
+            for chunk in response.chunks(7) {
+                if reader.get_mut().write_all(chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let result =
+            request_control_command(&address, serde_json::json!({}), Duration::from_secs(2)).await;
+        server.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn control_accepts_fragmented_success_and_reports_rejection() {
+        response_result(b"{\"ok\":true}\n".to_vec()).await.unwrap();
+        assert!(
+            response_result(b"{\"ok\":false,\"error\":\"bad threshold\"}\n".to_vec())
+                .await
+                .unwrap_err()
+                .contains("bad threshold")
+        );
+    }
+
+    #[tokio::test]
+    async fn control_rejects_unterminated_and_oversized_responses() {
+        assert!(response_result(b"{\"ok\":true}".to_vec()).await.is_err());
+        assert!(response_result(vec![b' '; 8193]).await.is_err());
     }
 }

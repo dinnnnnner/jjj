@@ -98,6 +98,10 @@ fn telemetry_msg_from_sample(
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ControlCmd {
+    SetCanAlarmThresholds {
+        high: [Option<f64>; 3],
+        low: [Option<f64>; 3],
+    },
     SetSentJumpThresholds {
         torque_warn: f64,
         torque_red: f64,
@@ -324,23 +328,20 @@ async fn run_ui_forwarder(
                     }
                 }
                 if let Ok(frame) = encode_feed_msg(&UiFeedMsg::Telemetry(msg)) {
-                    if ui_tx.send(frame).is_err() {
-                        stats.ui_drop.fetch_add(1, Ordering::Relaxed);
-                    }
+                    // No subscribers means there is no UI delivery to lose.
+                    let _ = ui_tx.send(frame);
                 }
             }
             Ok(AppEvent::Alarm(alarm)) => {
                 if let Ok(frame) = encode_feed_msg(&UiFeedMsg::Alarm(alarm)) {
-                    if ui_tx.send(frame).is_err() {
-                        stats.ui_drop.fetch_add(1, Ordering::Relaxed);
-                    }
+                    // No subscribers means there is no UI delivery to lose.
+                    let _ = ui_tx.send(frame);
                 }
             }
             Ok(AppEvent::System(msg)) => {
                 if let Ok(frame) = encode_feed_msg(&UiFeedMsg::Status(msg)) {
-                    if ui_tx.send(frame).is_err() {
-                        stats.ui_drop.fetch_add(1, Ordering::Relaxed);
-                    }
+                    // No subscribers means there is no UI delivery to lose.
+                    let _ = ui_tx.send(frame);
                 }
             }
             Ok(_) => {}
@@ -420,21 +421,24 @@ async fn serve_control_client(
     bus: EventBus,
 ) -> anyhow::Result<()> {
     let mut reader = BufReader::new(socket);
-    match handle_control_client(&mut reader, alarm_service, bus).await {
-        Ok(()) => reader.get_mut().write_all(b"{\"ok\":true}\n").await?,
-        Err(err) => {
-            let response = serde_json::json!({
-                "ok": false,
-                "error": err.to_string(),
-            });
-            reader
-                .get_mut()
-                .write_all(format!("{response}\n").as_bytes())
-                .await?;
-            return Err(err);
-        }
-    }
-    Ok(())
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        handle_control_client(&mut reader, alarm_service, bus),
+    )
+    .await
+    .unwrap_or_else(|_| Err(anyhow::anyhow!("control request timed out")));
+    let response = match &result {
+        Ok(()) => serde_json::json!({"ok": true}),
+        Err(err) => serde_json::json!({"ok": false, "error": err.to_string()}),
+    };
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        reader
+            .get_mut()
+            .write_all(format!("{response}\n").as_bytes()),
+    )
+    .await??;
+    result
 }
 
 async fn handle_control_client(
@@ -443,9 +447,18 @@ async fn handle_control_client(
     bus: EventBus,
 ) -> anyhow::Result<()> {
     let mut line = String::new();
-    reader.read_line(&mut line).await?;
+    (&mut *reader).take(8193).read_line(&mut line).await?;
+    anyhow::ensure!(
+        line.len() <= 8192 && line.ends_with('\n'),
+        "control request must be newline-terminated and at most 8192 bytes"
+    );
     let cmd = serde_json::from_str::<ControlCmd>(line.trim())?;
     match cmd {
+        ControlCmd::SetCanAlarmThresholds { high, low } => {
+            alarm_service
+                .set_can_axis_thresholds(high, low)
+                .map_err(anyhow::Error::msg)?;
+        }
         ControlCmd::SetSentJumpThresholds {
             torque_warn,
             torque_red,
@@ -581,6 +594,10 @@ async fn run_filtered_event_forwarder(
                 alarm_bit,
                 source_kind,
             })) => {
+                if !value.is_finite() || !t_sec.is_finite() {
+                    warn!(%device_id, sensor_id, "discarding non-finite telemetry");
+                    continue;
+                }
                 let filtered = filter.apply(telemetry_msg_from_sample(
                     captured_at_ms,
                     device_id,
@@ -675,7 +692,14 @@ pub async fn run() -> anyhow::Result<()> {
         .try_init();
 
     let cfg = load_collector_config();
-    info!(?cfg, "collector config loaded");
+    cfg.validate()?;
+    info!(
+        ingress_addr = %cfg.ingress_addr,
+        ui_feed_addr = %cfg.ui_feed_addr,
+        control_addr = %cfg.control_addr,
+        health_addr = %cfg.health_addr,
+        "collector config loaded"
+    );
 
     let stats = Arc::new(CollectorStats::default());
     let raw_bus = EventBus::new(cfg.bus_capacity);
@@ -902,4 +926,88 @@ pub async fn run() -> anyhow::Result<()> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     run().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ui_forwarder_without_subscribers_does_not_report_data_loss() {
+        let bus = EventBus::new(16);
+        let (ui_tx, _) = broadcast::channel(4);
+        let stats = Arc::new(CollectorStats::default());
+        let worker = tokio::spawn(run_ui_forwarder(bus.subscribe(), ui_tx, stats.clone()));
+        bus.publish(AppEvent::System("collector running without UI".into()));
+        drop(bus);
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stats.ui_drop.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn control_endpoint_applies_can_thresholds_and_rejects_invalid_changes() {
+        let bus = EventBus::new(16);
+        let service = AlarmService::new(bus.clone());
+        for (low, expected_ok) in [(0, true), (20, false)] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server_service = service.clone();
+            let server_bus = bus.clone();
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                serve_control_client(socket, server_service, server_bus).await
+            });
+            let mut socket = TcpStream::connect(address).await.unwrap();
+            let request = serde_json::json!({"type": "set_can_alarm_thresholds",
+                "high": [10, null, null], "low": [low, null, null]});
+            socket
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+            let mut response = String::new();
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                BufReader::new(socket).read_line(&mut response),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["ok"], expected_ok);
+            assert_eq!(server.await.unwrap().is_ok(), expected_ok);
+        }
+        service.evaluate_sample("can://test:ch0", 0, 1.0, 11.0, TelemetrySourceKind::CanAxis);
+        let snapshot = bus.alarm_snapshot();
+        assert_eq!(snapshot.alarms.len(), 1);
+        assert_eq!(snapshot.alarms[0].alarm_id, "can_x_h");
+    }
+
+    #[tokio::test]
+    async fn oversized_control_request_is_rejected_without_waiting_for_newline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let bus = EventBus::new(16);
+        let service = AlarmService::new(bus.clone());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            serve_control_client(socket, service, bus).await
+        });
+        let mut socket = TcpStream::connect(address).await.unwrap();
+        socket.write_all(&vec![b' '; 8193]).await.unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            BufReader::new(socket).read_line(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["ok"], false);
+        assert!(value["error"].as_str().unwrap().contains("8192"));
+        assert!(server.await.unwrap().is_err());
+    }
 }

@@ -59,12 +59,16 @@ pub struct SerialTransportConfig {
 pub struct SerialTransport {
     config: SerialTransportConfig,
     port: Arc<Mutex<Option<Box<dyn serialport::SerialPort>>>>,
+    pending_read: Option<SerialReadTask>,
 }
 
 pub struct ConnectedSerialTransport {
     port: Arc<Mutex<Option<Box<dyn serialport::SerialPort>>>>,
     read_chunk: usize,
+    pending_read: Option<SerialReadTask>,
 }
+
+type SerialReadTask = tokio::task::JoinHandle<Result<(usize, Vec<u8>), TransportError>>;
 
 fn serial_port_type_priority(port_type: &SerialPortType) -> u8 {
     match port_type {
@@ -169,6 +173,7 @@ impl SerialTransport {
         Self {
             config,
             port: Arc::new(Mutex::new(None)),
+            pending_read: None,
         }
     }
 }
@@ -178,6 +183,7 @@ impl ConnectedSerialTransport {
         Self {
             port: Arc::new(Mutex::new(Some(port))),
             read_chunk,
+            pending_read: None,
         }
     }
 }
@@ -206,8 +212,11 @@ async fn serial_read_into(
     port: Arc<Mutex<Option<Box<dyn serialport::SerialPort>>>>,
     read_chunk: usize,
     dst: &mut BytesMut,
+    pending_read: &mut Option<SerialReadTask>,
 ) -> Result<usize, TransportError> {
-    let (n, buf) =
+    // select! may cancel the caller while a blocking OS read is still running.
+    // Keep its handle on the transport and deliver the same result on the next poll.
+    let task = pending_read.get_or_insert_with(|| {
         tokio::task::spawn_blocking(move || -> Result<(usize, Vec<u8>), TransportError> {
             let mut buf = vec![0u8; read_chunk];
             let mut guard = port.lock().map_err(|_| TransportError::LockPoisoned)?;
@@ -215,8 +224,10 @@ async fn serial_read_into(
             let n = port.read(&mut buf)?;
             Ok((n, buf))
         })
-        .await
-        .map_err(join_to_io)??;
+    });
+    let result = task.await;
+    *pending_read = None;
+    let (n, buf) = result.map_err(join_to_io)??;
 
     if n > 0 {
         dst.extend_from_slice(&buf[..n]);
@@ -329,7 +340,13 @@ impl Transport for SerialTransport {
     }
 
     async fn read(&mut self, dst: &mut BytesMut) -> Result<usize, TransportError> {
-        serial_read_into(self.port.clone(), self.config.read_chunk, dst).await
+        serial_read_into(
+            self.port.clone(),
+            self.config.read_chunk,
+            dst,
+            &mut self.pending_read,
+        )
+        .await
     }
 
     async fn write_all(&mut self, data: &[u8]) -> Result<(), TransportError> {
@@ -337,6 +354,10 @@ impl Transport for SerialTransport {
     }
 
     async fn close(&mut self) -> Result<(), TransportError> {
+        if let Some(task) = self.pending_read.as_mut() {
+            let _ = task.await;
+        }
+        self.pending_read = None;
         serial_close(self.port.clone()).await
     }
 }
@@ -353,7 +374,13 @@ impl Transport for ConnectedSerialTransport {
     }
 
     async fn read(&mut self, dst: &mut BytesMut) -> Result<usize, TransportError> {
-        serial_read_into(self.port.clone(), self.read_chunk, dst).await
+        serial_read_into(
+            self.port.clone(),
+            self.read_chunk,
+            dst,
+            &mut self.pending_read,
+        )
+        .await
     }
 
     async fn write_all(&mut self, data: &[u8]) -> Result<(), TransportError> {
@@ -361,6 +388,45 @@ impl Transport for ConnectedSerialTransport {
     }
 
     async fn close(&mut self) -> Result<(), TransportError> {
+        if let Some(task) = self.pending_read.as_mut() {
+            let _ = task.await;
+        }
+        self.pending_read = None;
         serial_close(self.port.clone()).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_serial_read_delivers_bytes_on_the_next_poll() {
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let mut pending = Some(tokio::spawn(async move {
+            wait.await.unwrap();
+            Ok((3, b"abc".to_vec()))
+        }));
+        let port = Arc::new(Mutex::new(None));
+        let mut bytes = BytesMut::new();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(5),
+                serial_read_into(port.clone(), 16, &mut bytes, &mut pending)
+            )
+            .await
+            .is_err()
+        );
+        assert!(pending.is_some());
+        assert!(bytes.is_empty());
+        release.send(()).unwrap();
+        assert_eq!(
+            serial_read_into(port, 16, &mut bytes, &mut pending)
+                .await
+                .unwrap(),
+            3
+        );
+        assert_eq!(&bytes[..], b"abc");
+        assert!(pending.is_none());
     }
 }

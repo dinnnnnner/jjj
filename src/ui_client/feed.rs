@@ -40,43 +40,6 @@ fn try_send_ui_msg(tx: &SyncSender<UiMsg>, stats: &FeedStats, msg: UiMsg) -> boo
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn full_queue_drops_telemetry_but_delivers_alarm_snapshot() {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        let stats = FeedStats::default();
-        tx.send(UiMsg::Status("occupied".into())).unwrap();
-        assert!(try_send_ui_msg(
-            &tx,
-            &stats,
-            UiMsg::Status("droppable".into())
-        ));
-        assert_eq!(stats.dropped_messages.load(Ordering::Relaxed), 1);
-        let producer = thread::spawn(move || {
-            try_send_ui_msg(
-                &tx,
-                &stats,
-                UiMsg::AlarmSnapshot(crate::AlarmSnapshot {
-                    epoch: uuid::Uuid::nil(),
-                    revision: 1,
-                    alarms: vec![],
-                }),
-            )
-        });
-        assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            UiMsg::Status(_)
-        ));
-        assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            UiMsg::AlarmSnapshot(_)
-        ));
-        assert!(producer.join().unwrap());
-    }
-}
-
 fn read_feed_frame(reader: &mut BufReader<TcpStream>) -> io::Result<Vec<u8>> {
     let mut len_buf = [0_u8; 4];
     reader.read_exact(&mut len_buf)?;
@@ -136,24 +99,38 @@ pub fn resilient_feed_thread(feed_addr: String, tx: SyncSender<UiMsg>, stats: Ar
         let stream = match TcpStream::connect(&feed_addr) {
             Ok(s) => s,
             Err(err) => {
-                let _ = tx.try_send(UiMsg::Status(format!("waiting for collector: {err}")));
+                if !try_send_ui_msg(
+                    &tx,
+                    &stats,
+                    UiMsg::Status(format!("waiting for collector: {err}")),
+                ) {
+                    return;
+                }
                 thread::sleep(Duration::from_millis(500));
                 continue;
             }
         };
 
-        let _ = tx.try_send(UiMsg::Status(format!(
-            "connected to collector feed: {feed_addr}"
-        )));
+        if !try_send_ui_msg(
+            &tx,
+            &stats,
+            UiMsg::Status(format!("connected to collector feed: {feed_addr}")),
+        ) {
+            return;
+        }
         let mut reader = BufReader::new(stream);
 
         loop {
             let frame = match read_feed_frame(&mut reader) {
                 Ok(frame) => frame,
                 Err(_) => {
-                    let _ = tx.try_send(UiMsg::Status(
-                        "collector feed disconnected, reconnecting".to_string(),
-                    ));
+                    if !try_send_ui_msg(
+                        &tx,
+                        &stats,
+                        UiMsg::Status("collector feed disconnected, reconnecting".to_string()),
+                    ) {
+                        return;
+                    }
                     break;
                 }
             };
@@ -164,5 +141,72 @@ pub fn resilient_feed_thread(feed_addr: String, tx: SyncSender<UiMsg>, stats: Ar
         }
 
         thread::sleep(Duration::from_millis(300));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disconnected_ui_stops_collector_retry_loop() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        drop(rx);
+        let (finished, done) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            resilient_feed_thread("127.0.0.1:0".into(), tx, Arc::default());
+            let _ = finished.send(());
+        });
+        done.recv_timeout(Duration::from_secs(5))
+            .expect("feed thread kept reconnecting after UI closed");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn disconnected_ui_closes_a_new_feed_connection() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        drop(rx);
+        let worker = thread::spawn(move || resilient_feed_thread(address, tx, Arc::default()));
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        assert_eq!(
+            peer.read(&mut [0; 1]).expect("feed socket was not closed"),
+            0
+        );
+        worker.join().unwrap();
+    }
+    #[test]
+    fn full_queue_drops_telemetry_but_delivers_alarm_snapshot() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let stats = FeedStats::default();
+        tx.send(UiMsg::Status("occupied".into())).unwrap();
+        assert!(try_send_ui_msg(
+            &tx,
+            &stats,
+            UiMsg::Status("droppable".into())
+        ));
+        assert_eq!(stats.dropped_messages.load(Ordering::Relaxed), 1);
+        let producer = thread::spawn(move || {
+            try_send_ui_msg(
+                &tx,
+                &stats,
+                UiMsg::AlarmSnapshot(crate::AlarmSnapshot {
+                    epoch: uuid::Uuid::nil(),
+                    revision: 1,
+                    alarms: vec![],
+                }),
+            )
+        });
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            UiMsg::Status(_)
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            UiMsg::AlarmSnapshot(_)
+        ));
+        assert!(producer.join().unwrap());
     }
 }

@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$WithDocker,
     [switch]$WithSender,
     [string]$SenderBin = "sender_1min"
@@ -6,6 +6,12 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+# Rust emits UTF-8; keep native output and the console on the same encoding.
+$utf8Encoding = New-Object System.Text.UTF8Encoding($false)
+[Console]::InputEncoding = $utf8Encoding
+[Console]::OutputEncoding = $utf8Encoding
+$OutputEncoding = $utf8Encoding
 
 function Test-WriteDelete {
     param([Parameter(Mandatory = $true)][string]$Dir)
@@ -35,15 +41,20 @@ function Start-WorkerWindow {
 
     $cmd = @"
 `$Host.UI.RawUI.WindowTitle = '$Title'
+`$utf8Encoding = New-Object System.Text.UTF8Encoding(`$false)
+[Console]::InputEncoding = `$utf8Encoding
+[Console]::OutputEncoding = `$utf8Encoding
+`$OutputEncoding = `$utf8Encoding
 Set-Location '$WorkingDir'
 `$env:CARGO_TARGET_DIR = '$TargetDir'
 `$env:CARGO_INCREMENTAL = '0'
 $Command
 "@
+    $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))
     Start-Process powershell -ArgumentList @(
         "-NoExit",
         "-ExecutionPolicy", "Bypass",
-        "-Command", $cmd
+        "-EncodedCommand", $encodedCommand
     ) | Out-Null
 }
 
@@ -108,7 +119,7 @@ Start-WorkerWindow `
     -Title "demo2-ui_client" `
     -WorkingDir $repoRoot `
     -TargetDir $uiTarget `
-    -Command "cargo run --bin ui_client -j 1"
+    -Command "`$env:DEMO2_UI_EMBED_COLLECTOR = '0'; cargo run --bin ui_client -j 1"
 
 if ($WithSender) {
     if (Test-Path $senderRepo) {
