@@ -207,7 +207,7 @@ impl CanIngressCore {
                 source_kind: TelemetrySourceKind::CanAxis,
             });
         }
-        if frame_count <= 5 || frame_count % 100 == 0 {
+        if frame_count <= 5 || frame_count.is_multiple_of(100) {
             let msg = format!(
                 "{} frame={} {}",
                 device_id,

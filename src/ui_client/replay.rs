@@ -116,7 +116,7 @@ impl ReplaySeriesSampler {
         self.last = Some(point);
 
         let offset_ms = (point.x * 1000.0).clamp(0.0, self.span_ms as f64);
-        let bucket_index = (((offset_ms as f64 / self.span_ms as f64) * self.buckets.len() as f64)
+        let bucket_index = (((offset_ms / self.span_ms as f64) * self.buckets.len() as f64)
             as usize)
             .min(self.buckets.len() - 1);
         match &mut self.buckets[bucket_index] {
@@ -317,7 +317,7 @@ impl UiClientApp {
                             raw_point_count = raw_point_count.saturating_add(1);
                         }
                         processed_rows = processed_rows.saturating_add(1);
-                        if processed_rows % CAN_REPLAY_PROGRESS_REPORT_INTERVAL == 0 {
+                        if processed_rows.is_multiple_of(CAN_REPLAY_PROGRESS_REPORT_INTERVAL) {
                             let _ = progress_tx.try_send(UiMsg::CanReplayProgress(
                                 mode,
                                 processed_rows,
@@ -419,7 +419,7 @@ impl UiClientApp {
                             }
                         }
                         processed_rows = processed_rows.saturating_add(1);
-                        if processed_rows % CAN_REPLAY_PROGRESS_REPORT_INTERVAL == 0 {
+                        if processed_rows.is_multiple_of(CAN_REPLAY_PROGRESS_REPORT_INTERVAL) {
                             let _ = progress_tx.try_send(UiMsg::CanReplayProgress(
                                 mode,
                                 processed_rows,
@@ -435,7 +435,7 @@ impl UiClientApp {
                 })
             })();
 
-            let _ = tx.send(UiMsg::CanReplayLoaded(mode, result));
+            let _ = tx.send(UiMsg::CanReplayLoaded(mode, Box::new(result)));
         });
     }
 

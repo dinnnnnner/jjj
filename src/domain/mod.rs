@@ -61,6 +61,7 @@ pub struct Response {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+
 pub enum ConnState {
     Disconnected,
     Connecting,

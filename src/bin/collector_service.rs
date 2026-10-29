@@ -1,5 +1,5 @@
 use demo2::app::{AlarmService, SentFrameGapAlarmConfig, SentJumpAlarmConfig};
-use demo2::bus::{AppEvent, DeviceEvent, EventBus, Store, TelemetrySourceKind};
+use demo2::bus::{AlarmFeedEvent, AppEvent, DeviceEvent, EventBus, Store, TelemetrySourceKind};
 use demo2::config::{CollectorConfig, collector_can_channels, env_flag, load_collector_config};
 use demo2::db::retry::{PgSink, WriteBatch, retry_write};
 use demo2::db::writer::{DbCmd, TelemetryRow};
@@ -254,19 +254,10 @@ async fn serve_ui_client(
     bus: EventBus,
 ) {
     stats.ui_clients.fetch_add(1, Ordering::Relaxed);
-    let mut snapshot_tick = tokio::time::interval(Duration::from_secs(1));
-    snapshot_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Initial repair follows the same ordered stream as pending transitions.
+    bus.publish_alarm_snapshot();
     loop {
-        let next = tokio::select! {
-            biased;
-            _ = snapshot_tick.tick() => {
-                match encode_feed_msg(&UiFeedMsg::AlarmSnapshot(bus.alarm_snapshot())) {
-                    Ok(frame) => Ok(frame),
-                    Err(err) => { warn!(%err, "alarm snapshot encode failed"); break; }
-                }
-            }
-            event = rx.recv() => event,
-        };
+        let next = rx.recv().await;
         let line = match next {
             Ok(line) => line,
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
@@ -332,12 +323,6 @@ async fn run_ui_forwarder(
                     let _ = ui_tx.send(frame);
                 }
             }
-            Ok(AppEvent::Alarm(alarm)) => {
-                if let Ok(frame) = encode_feed_msg(&UiFeedMsg::Alarm(alarm)) {
-                    // No subscribers means there is no UI delivery to lose.
-                    let _ = ui_tx.send(frame);
-                }
-            }
             Ok(AppEvent::System(msg)) => {
                 if let Ok(frame) = encode_feed_msg(&UiFeedMsg::Status(msg)) {
                     // No subscribers means there is no UI delivery to lose.
@@ -351,6 +336,49 @@ async fn run_ui_forwarder(
                 continue;
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+// Only this task sends alarms and snapshots to the UI. The general forwarder
+// ignores alarm copies, which can arrive later through the telemetry pipeline.
+async fn run_alarm_ui_forwarder(
+    bus: EventBus,
+    mut sub: broadcast::Receiver<AlarmFeedEvent>,
+    ui_tx: broadcast::Sender<Vec<u8>>,
+    stats: Arc<CollectorStats>,
+) {
+    let mut snapshot_tick = tokio::time::interval(Duration::from_secs(1));
+    snapshot_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let next = tokio::select! {
+            _ = snapshot_tick.tick() => {
+                bus.publish_alarm_snapshot();
+                continue;
+            }
+            event = sub.recv() => event,
+        };
+        let msg = match next {
+            Ok(AlarmFeedEvent::Update(update)) => UiFeedMsg::Alarm(update),
+            Ok(AlarmFeedEvent::Snapshot(snapshot)) => UiFeedMsg::AlarmSnapshot(snapshot),
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(skipped, "alarm UI forwarder lagged, skipping lost history");
+                stats.ui_drop.fetch_add(skipped, Ordering::Relaxed);
+                // Periodic snapshots repair state after retained transitions.
+                // Publishing on each Lagged error could perpetuate overflow.
+                continue;
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        };
+        match encode_feed_msg(&msg) {
+            Ok(frame) => {
+                // No subscribers is normal; queue loss is counted on Lagged.
+                let _ = ui_tx.send(frame);
+            }
+            Err(err) => {
+                warn!(%err, "alarm UI feed encode failed");
+                stats.ui_drop.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -729,6 +757,12 @@ pub async fn run() -> anyhow::Result<()> {
     let alarm_service = AlarmService::new(processed_bus.clone());
     let control_listener = TcpListener::bind(&cfg.control_addr).await?;
     let health_listener = TcpListener::bind(&cfg.health_addr).await?;
+    tokio::spawn(run_alarm_ui_forwarder(
+        processed_bus.clone(),
+        processed_bus.subscribe_alarm_feed(),
+        ui_tx.clone(),
+        stats.clone(),
+    ));
     tokio::spawn(run_ui_forwarder(
         processed_bus.subscribe(),
         ui_tx.clone(),
@@ -931,6 +965,163 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use demo2::domain::alarm_sync::AlarmTracker;
+    use demo2::domain::{AlarmEvent, AlarmLevel};
+    use demo2::feed::decode_feed_msg;
+
+    fn test_alarm() -> AlarmEvent {
+        AlarmEvent {
+            device_id: "can://test:ch0".into(),
+            alarm_id: "jump".into(),
+            level: AlarmLevel::Critical,
+            message: "jump".into(),
+            raised_at: std::time::SystemTime::UNIX_EPOCH,
+            cleared: false,
+        }
+    }
+
+    async fn read_ui_message(client: &mut TcpStream) -> UiFeedMsg {
+        let len = client.read_u32().await.unwrap() as usize;
+        let mut frame = vec![0; len];
+        client.read_exact(&mut frame).await.unwrap();
+        decode_feed_msg(&frame).unwrap()
+    }
+
+    #[tokio::test]
+    async fn socket_delivers_alarm_history_before_snapshot_despite_delayed_forwarding() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let raw = EventBus::new(32);
+            let processed = raw.processing_stage(32);
+            let alarm_sub = processed.subscribe_alarm_feed();
+            let mut raw_sub = raw.subscribe();
+            let general_sub = processed.subscribe();
+            let (ui_tx, ui_rx) = broadcast::channel(32);
+            let stats = Arc::new(CollectorStats::default());
+            raw.publish(AppEvent::Device(DeviceEvent::AlarmRaised(test_alarm())));
+            let delayed_raise = raw_sub.try_recv().unwrap();
+            processed.publish(AppEvent::Device(DeviceEvent::AlarmCleared(test_alarm())));
+            // Neither transition has reached the UI yet; state is already revision 2.
+            processed.publish_alarm_snapshot();
+            processed.publish_forwarded(delayed_raise);
+            processed.publish(AppEvent::System("general forwarding drained".into()));
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            let socket_task = tokio::spawn(serve_ui_client(
+                server,
+                ui_rx,
+                stats.clone(),
+                processed.clone(),
+            ));
+            let alarm_task = tokio::spawn(run_alarm_ui_forwarder(
+                processed,
+                alarm_sub,
+                ui_tx.clone(),
+                stats.clone(),
+            ));
+            let general_task = tokio::spawn(run_ui_forwarder(general_sub, ui_tx, stats.clone()));
+            let mut tracker = AlarmTracker::default();
+            let mut history = Vec::new();
+            let mut repaired = false;
+            let mut general_drained = false;
+            while !repaired || !general_drained {
+                match read_ui_message(&mut client).await {
+                    UiFeedMsg::Alarm(update) => {
+                        assert!(
+                            tracker.apply_update(&update),
+                            "history must precede repair without duplicates"
+                        );
+                        history.push((update.revision, update.event.cleared));
+                    }
+                    UiFeedMsg::AlarmSnapshot(snapshot) => {
+                        assert_eq!(snapshot.revision, 2);
+                        assert_eq!(history, vec![(1, false), (2, true)]);
+                        tracker.apply_snapshot(&snapshot);
+                        repaired = true;
+                    }
+                    UiFeedMsg::Status(msg) if msg == "general forwarding drained" => {
+                        general_drained = true
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(tracker.active().count(), 0);
+            assert_eq!(history, vec![(1, false), (2, true)]);
+            assert_eq!(stats.ui_drop.load(Ordering::Relaxed), 0);
+            socket_task.abort();
+            alarm_task.abort();
+            general_task.abort();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_alarm_snapshots_do_not_count_as_drops_and_new_clients_receive_state() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let bus = EventBus::new(32);
+            let sub = bus.subscribe_alarm_feed();
+            let mut observer = bus.subscribe_alarm_feed();
+            let (ui_tx, _) = broadcast::channel(32);
+            let stats = Arc::new(CollectorStats::default());
+            bus.publish(AppEvent::Device(DeviceEvent::AlarmRaised(test_alarm())));
+            let alarm_task = tokio::spawn(run_alarm_ui_forwarder(
+                bus.clone(),
+                sub,
+                ui_tx.clone(),
+                stats.clone(),
+            ));
+            let mut snapshots = 0;
+            while snapshots < 2 {
+                if matches!(observer.recv().await.unwrap(), AlarmFeedEvent::Snapshot(_)) {
+                    snapshots += 1;
+                }
+            }
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            let socket_task = tokio::spawn(serve_ui_client(
+                server,
+                ui_tx.subscribe(),
+                stats.clone(),
+                bus,
+            ));
+            let UiFeedMsg::AlarmSnapshot(snapshot) = read_ui_message(&mut client).await else {
+                panic!("new client must receive current alarm state");
+            };
+            assert_eq!(snapshot.revision, 1);
+            assert_eq!(snapshot.alarms.len(), 1);
+            assert_eq!(stats.ui_drop.load(Ordering::Relaxed), 0);
+            socket_task.abort();
+            alarm_task.abort();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn connected_socket_still_counts_real_queue_overflow() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let bus = EventBus::new(8);
+            let stats = Arc::new(CollectorStats::default());
+            let (ui_tx, ui_rx) = broadcast::channel(1);
+            for msg in ["lost", "retained"] {
+                ui_tx.send(encode_feed_msg(&UiFeedMsg::Status(msg.into())).unwrap()).unwrap();
+            }
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            let task = tokio::spawn(serve_ui_client(server, ui_rx, stats.clone(), bus));
+            assert!(matches!(read_ui_message(&mut client).await, UiFeedMsg::Status(msg) if msg == "retained"));
+            assert_eq!(stats.ui_drop.load(Ordering::Relaxed), 1);
+            task.abort();
+        }).await.unwrap();
+    }
 
     #[tokio::test]
     async fn ui_forwarder_without_subscribers_does_not_report_data_loss() {
