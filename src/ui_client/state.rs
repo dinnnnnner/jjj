@@ -12,6 +12,9 @@ use super::series::SensorSeries;
 
 pub(crate) struct UiClientState {
     pub(crate) status: String,
+    pub(crate) fps_window_started_at: Option<Instant>,
+    pub(crate) fps_frame_count: u32,
+    pub(crate) fps: Option<f64>,
     pub(crate) source_series: HashMap<(String, TestSignalView, usize), SensorSeries>,
     pub(crate) selected_devices: HashMap<TestSignalView, String>,
     pub(crate) view_initialized: bool,
@@ -48,6 +51,9 @@ impl UiClientState {
     pub(crate) fn new(pg_dsn: String, max_alarm_history: usize) -> Self {
         Self {
             status: "starting...".to_string(),
+            fps_window_started_at: None,
+            fps_frame_count: 0,
+            fps: None,
             source_series: HashMap::new(),
             selected_devices: HashMap::new(),
             view_initialized: false,
