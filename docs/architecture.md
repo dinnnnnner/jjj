@@ -154,7 +154,7 @@ sender_stress_report / sender_1min
 TSMaster callback
   -> CanTransport
   -> run_can_ingress
-  -> decode_sent_values
+  -> decode_sent_data
   -> optional SentMovingAverage
   -> TelemetrySample(source_kind=CanSent)
   -> raw_bus

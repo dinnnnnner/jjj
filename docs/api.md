@@ -286,9 +286,9 @@ pause:       4-bit
 | `0x102` | `1` | `y` |
 | `0x104` | `2` | `z` |
 
-SENT over CAN 按 ID 互斥选择格式。ID 1 使用 offset 4/6/8 的小端 `i16`，分别发布 S angle（4）、T2 angle（2）、T2 torque（3）；ID 2 使用 offset 6/8，发布 T1 angle（0）、T1 torque（1）。这两类帧要求至少 10 字节，填充到 64 字节也不进入浮点解码器。
+SENT over CAN 按 ID 互斥选择格式。ID `0x003` 要求 64 字节，使用下表的 `f32` 小端布局，同时发布五路数值及三个状态；byte 0 是循环计数，不作为类型选择标记。非 TX、非 ID 1/2/3 且至少 53 字节的帧也沿用下表数值偏移，但不返回状态。
 
-非 TX、非 ID 1/2/3 且至少 53 字节的帧使用以下 `f32` 小端偏移：
+旧 ID 1 帧仍使用 offset 4/6/8 的小端 `i16`，分别发布 S angle（4）、T2 angle（2）、T2 torque（3）；ID 2 使用 offset 6/8，发布 T1 angle（0）、T1 torque（1）。旧数据帧至少需要 10 字节，ID 1/2 填充到 64 字节时仍使用旧布局，不返回状态。
 
 | sensor_id | 信号 | offset |
 | --- | --- | --- |
@@ -298,7 +298,11 @@ SENT over CAN 按 ID 互斥选择格式。ID 1 使用 offset 4/6/8 的小端 `i1
 | `3` | T2 torque | `5` |
 | `4` | S angle | `49` |
 
-`identifier = 3` 表示 SENT error 帧，会被转换为告警事件。`sent_filter_enabled` 对上述三种数据格式都生效，按设备、通道、信号维护独立窗口，只更新当前帧含有的信号。
+64 字节 ID `0x003` 的 byte 9、33、53 分别为 T2、T1、S 状态，`0` 为正常，任意非零值为故障。产生独立的 Critical 告警 `sent_status_t2`、`sent_status_t1`、`sent_status_s`；按 CAN 通道维护状态，同码去重，故障码变化更新详情，恢复为 `0` 清除对应告警。byte 10–24、34–48、54–60 的保留区及 61–63 的原有尾部数据不参与这五路数值和三路状态的解析。新状态告警沿用现有告警增量、快照和持久化协议，SENT UI 的三个指示灯显示对应活动故障，报警记录和 SENT 回放可定位对应信号。
+
+`identifier = 3` 且长度为 4–8 字节时仍兼容旧 SENT error 帧；64 字节帧只进入新数据/状态解析，避免把循环计数和浮点数字节误作旧错误码，其他长度忽略。`sent_filter_enabled` 对数值数据生效，按设备、通道、信号维护独立窗口；状态原样处理，不滤波。
+
+数值和可选状态统一由 `decode_sent_data` 返回：新 `0x003` 完整帧为 `SentCanData { values, status: Some([T1, T2, S]) }`；其他 ID 的旧帧为 `status: None`。采集端仅在 `status` 存在时评估三个状态告警，不对其他帧额外扫描状态偏移。
 
 ## 8. 数据库表
 

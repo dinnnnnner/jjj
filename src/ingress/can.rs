@@ -1,10 +1,10 @@
-﻿use super::can_clock::{CanClock, FrameTime};
+use super::can_clock::{CanClock, FrameTime};
 use crate::bus::{AppEvent, DeviceEvent, EventBus, TelemetrySourceKind};
 use crate::domain::{AlarmEvent, AlarmLevel};
 use crate::ingress::serial::publish_status;
 use crate::protocol::can_data::{
-    SentCanError, decode_axis_sample, decode_self_test_response, decode_sent_1, decode_sent_2,
-    decode_sent_error, decode_sent_values,
+    SentCanError, decode_axis_sample, decode_self_test_response, decode_sent_data,
+    decode_sent_error,
 };
 use crate::signal::SentMovingAverage;
 use crate::transport::can::{
@@ -148,6 +148,7 @@ impl CanIngressCore {
             .or_insert_with(|| CanChannelRuntime {
                 frame_count: 0,
                 sent_filter: SentMovingAverage::new(self.sent_filter_config.window_size),
+                sent_status: [0; 3],
                 active_sent_errors: HashSet::new(),
                 clock: CanClock::default(),
             });
@@ -180,14 +181,18 @@ impl CanIngressCore {
             );
         }
 
-        // Select exactly one wire format, including padded CAN FD frames.
-        let sent_values = match identifier {
-            1 => decode_sent_1(is_tx, identifier, data),
-            2 => decode_sent_2(is_tx, identifier, data),
-            _ => decode_sent_values(is_tx, identifier, data).map(Vec::from),
-        };
-        if let Some(values) = sent_values {
-            let values = values.into_iter().map(|(sensor_id, value)| {
+        // Status belongs to the decoded frame, never to a second payload scan.
+        if let Some(decoded) = decode_sent_data(is_tx, identifier, data) {
+            if let Some(status) = decoded.status {
+                reconcile_sent_status_events(
+                    &device_id,
+                    status,
+                    &mut state.sent_status,
+                    now,
+                    &mut events,
+                );
+            }
+            let values = decoded.values.into_iter().map(|(sensor_id, value)| {
                 let value = if self.sent_filter_config.enabled {
                     state.sent_filter.apply_sample(sensor_id, value)
                 } else {
@@ -605,6 +610,7 @@ fn push_can_sent_value_events(
 struct CanChannelRuntime {
     frame_count: u64,
     sent_filter: SentMovingAverage,
+    sent_status: [u8; 3],
     active_sent_errors: HashSet<u8>,
     clock: CanClock,
 }
@@ -681,6 +687,40 @@ fn signal_timeout_alarm_event(
         ),
         raised_at: now,
         cleared,
+    }
+}
+
+fn reconcile_sent_status_events(
+    device_id: &str,
+    status: [u8; 3],
+    previous: &mut [u8; 3],
+    now: SystemTime,
+    events: &mut Vec<CanIngressEvent>,
+) {
+    for (index, (part, offset)) in [("t1", 33), ("t2", 9), ("s", 53)].into_iter().enumerate() {
+        let value = status[index];
+        if previous[index] == value {
+            continue;
+        }
+        previous[index] = value;
+        let cleared = value == 0;
+        let alarm = AlarmEvent {
+            device_id: device_id.to_string(),
+            alarm_id: format!("sent_status_{part}"),
+            level: AlarmLevel::Critical,
+            message: format!(
+                "CAN 0x003 {} 状态{}: byte={offset}, status=0x{value:02X}",
+                part.to_uppercase(),
+                if cleared { "恢复正常" } else { "异常" },
+            ),
+            raised_at: now,
+            cleared,
+        };
+        if cleared {
+            events.push(CanIngressEvent::AlarmCleared(alarm));
+        } else {
+            events.push(CanIngressEvent::AlarmRaised(alarm));
+        }
     }
 }
 
@@ -868,7 +908,7 @@ mod tests {
     }
 
     #[test]
-    fn padded_sent_frames_are_exclusive_and_constant_input_never_raises_jump_alarms() {
+    fn legacy_padded_sent_frames_are_exclusive_and_constant_input_never_raises_jump_alarms() {
         let config = CanTransportConfig::default();
         let mut core = CanIngressCore::new(
             SentFilterConfig {
@@ -902,6 +942,120 @@ mod tests {
             rx.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn full_sent_status_alarms_are_independent_deduplicated_and_snapshot_safe() {
+        let config = two_channel_config();
+        let mut core = CanIngressCore::new(
+            SentFilterConfig {
+                enabled: false,
+                window_size: 10,
+            },
+            &CanSignalWatchdogConfig::default(),
+            &config.channels,
+            Instant::now(),
+        );
+        let mut frame = axis_frame(0, 0);
+        frame.identifier = 0x003;
+        frame.dlc = 15;
+        frame.data = [0; 64];
+        frame.data[25..29].copy_from_slice(&1.25_f32.to_le_bytes());
+        frame.data[0] = 2; // Counter must not become legacy sent_error_2.
+        let normal = core.handle_frame(&config, frame);
+        assert_eq!(
+            sent_samples(&normal),
+            vec![(0, 1.25), (1, 0.0), (2, 0.0), (3, 0.0), (4, 0.0)]
+        );
+        assert!(alarm_ids(&normal).is_empty());
+
+        frame.data[9] = 2;
+        frame.data[33] = 128;
+        frame.data[53] = 255;
+        let raised = core.handle_frame(&config, frame);
+        assert_eq!(
+            alarm_ids(&raised),
+            HashSet::from([
+                "sent_status_t1".to_string(),
+                "sent_status_t2".to_string(),
+                "sent_status_s".to_string(),
+            ])
+        );
+        let bus = EventBus::new(64);
+        for event in raised {
+            publish_can_ingress_event(&bus, event);
+        }
+        assert_eq!(bus.alarm_snapshot().alarms.len(), 3);
+        assert!(
+            bus.alarm_snapshot()
+                .alarms
+                .iter()
+                .all(|event| matches!(event.level, AlarmLevel::Critical))
+        );
+        assert!(alarm_ids(&core.handle_frame(&config, frame)).is_empty());
+
+        // A new nonzero code updates the same alarm rather than creating a fourth one.
+        frame.data[33] = 3;
+        for event in core.handle_frame(&config, frame) {
+            publish_can_ingress_event(&bus, event);
+        }
+        let snapshot = bus.alarm_snapshot();
+        assert_eq!(snapshot.alarms.len(), 3);
+        assert!(snapshot.alarms.iter().any(
+            |alarm| alarm.alarm_id == "sent_status_t1" && alarm.message.contains("status=0x03")
+        ));
+
+        // Other IDs may carry nonzero data at the same offsets, but have no status fields.
+        for identifier in [1, 2, 0x200] {
+            let mut legacy = frame;
+            legacy.identifier = identifier;
+            legacy.data[9] = 0xFF;
+            legacy.data[33] = 0xFF;
+            legacy.data[53] = 0xFF;
+            assert!(alarm_ids(&core.handle_frame(&config, legacy)).is_empty());
+            legacy.data = [0; 64];
+            assert!(alarm_ids(&core.handle_frame(&config, legacy)).is_empty());
+        }
+
+        // TX echoes, incomplete frames and another channel cannot clear these alarms.
+        let mut ignored = frame;
+        ignored.data = [0; 64];
+        ignored.properties = 1;
+        assert!(alarm_ids(&core.handle_frame(&config, ignored)).is_empty());
+        ignored.properties = 0;
+        ignored.dlc = 14;
+        assert!(alarm_ids(&core.handle_frame(&config, ignored)).is_empty());
+        ignored.dlc = 15;
+        ignored.channel = 1;
+        assert!(alarm_ids(&core.handle_frame(&config, ignored)).is_empty());
+        ignored.channel = 0;
+        ignored.identifier = 0x003;
+        ignored.dlc = 4;
+        assert!(alarm_ids(&core.handle_frame(&config, ignored)).is_empty());
+
+        frame.data[33] = 0;
+        let cleared = core.handle_frame(&config, frame);
+        assert_eq!(
+            alarm_ids(&cleared),
+            HashSet::from(["sent_status_t1".to_string()])
+        );
+        assert!(
+            cleared
+                .iter()
+                .any(|event| matches!(event, CanIngressEvent::AlarmCleared(_)))
+        );
+        for event in cleared {
+            publish_can_ingress_event(&bus, event);
+        }
+        assert_eq!(bus.alarm_snapshot().alarms.len(), 2);
+
+        frame.data[9] = 0;
+        frame.data[53] = 0;
+        for event in core.handle_frame(&config, frame) {
+            publish_can_ingress_event(&bus, event);
+        }
+        assert!(bus.alarm_snapshot().alarms.is_empty());
+        assert!(alarm_ids(&core.handle_frame(&config, frame)).is_empty());
     }
 
     #[test]

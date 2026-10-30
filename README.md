@@ -1,4 +1,4 @@
-﻿# demo2
+# demo2
 
 面向上位机 V2 的 Rust MVP。项目把设备接入、协议解码、会话管理、事件分发、告警、持久化和 UI 展示拆成相对清晰的模块，当前推荐按“采集服务 + UI 客户端”两个进程运行。
 
@@ -172,7 +172,7 @@ ui_feed_capacity = 10000
 
 ### T1 / T2 / S 数据处理
 
-CAN SENT 解码器位于 `src/protocol/can_data.rs`。ID 1 根据首字节标志选择小端 `i16` 数据：标志 1 解出 T2 angle、T2 torque，标志 2 解出 S angle；ID 2 解出 T1 angle、T1 torque。即使填充到 64 字节，这两种格式也只解码一次。其他非 TX 且非 ID 1/2/3 的足长帧通过 `decode_sent_values` 解析为 `f32`：
+CAN SENT 解码器位于 `src/protocol/can_data.rs`。ID 1 根据首字节标志选择小端 `i16` 数据：标志 1 解出 T2 angle、T2 torque，标志 2 解出 S angle；ID 2 解出 T1 angle、T1 torque。即使填充到 64 字节，这两种格式也只解码一次。其他非 TX 且非 ID 1/2/3 的足长帧通过 `decode_sent_data` 解析为 `f32`：
 
 - T1 angle：offset 25
 - T1 torque：offset 29
@@ -201,6 +201,21 @@ CAN SENT 解码器位于 `src/protocol/can_data.rs`。ID 1 根据首字节标志
 - `DEMO2_UI_EMBED_COLLECTOR=1`：让 `ui_client` 启动内嵌 collector；优先级高于 `config.toml` 中的 `[ui].embed_collector`。
 - `DEMO2_COLLECTOR_CONTROL_ADDR`：覆盖 UI 客户端连接的控制接口地址。
 - `DEMO2_PG_DSN`：覆盖 UI 查询历史数据使用的数据库连接串。
+
+## CAN FD 0x003 状态帧
+
+接收 ID `0x003` 的 64 字节帧时，按以下布局解析（字节下标从 0 开始，角度和扭矩沿用小端 `f32`）：
+
+| 字节 | 内容 |
+| --- | --- |
+| 0 | 循环计数，不再作为旧协议的类型选择标记 |
+| 1–4 / 5–8 / 9 | T2 角度 / 扭矩 / 状态 |
+| 25–28 / 29–32 / 33 | T1 角度 / 扭矩 / 状态 |
+| 49–52 / 53 | S 角度 / 状态 |
+
+数值与状态由 `decode_sent_data` 一次解析，返回 `SentCanData { values, status }`。仅完整的新 `0x003` 帧返回 `status = Some([T1, T2, S])`；其他 ID 的旧帧返回 `status = None`，即使字节 9、33、53 非零也不触发状态告警。其余字节不作为角度、扭矩或状态解析。状态 `0` 表示正常，任意非零值表示故障；三个独立告警为 `sent_status_t1`、`sent_status_t2`、`sent_status_s`。同一通道的同一状态码不会重复报警，恢复为 `0` 时单独清除对应告警，故障码变化时更新告警详情。告警及恢复通过现有链路同步 UI 和报警记录。
+
+SENT 视图新增“CAN SENT 状态”窗口，显示 T1、T2、S 三个指示灯：无对应活动故障时为绿灯，任一 CAN 通道存在对应故障时为红灯，悬停可查看设备和原始状态码。旧 `0x001`、`0x002` 数据帧即使填充到 64 字节也始终沿用旧布局且不返回状态。`0x003` 的 4–8 字节旧错误帧仍兼容；64 字节帧只解析新数据和状态，不再触发旧 `sent_error_*` 告警，其他长度忽略。
 
 ## 二进制入口
 

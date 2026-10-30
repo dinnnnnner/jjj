@@ -8,14 +8,20 @@ use tokio_postgres::NoTls;
 
 fn sent_alarm_targets(alarm_id: &str, message: &str) -> [bool; 5] {
     [
-        matches!(alarm_id, "sent_angle_jump_t1" | "sent_frame_gap_t1")
-            || UiClientApp::has_sent_error_flag(message, "t1"),
-        alarm_id == "sent_torque_jump_t1",
-        matches!(alarm_id, "sent_angle_jump_t2" | "sent_frame_gap_t2")
-            || UiClientApp::has_sent_error_flag(message, "t2"),
-        alarm_id == "sent_torque_jump_t2",
-        matches!(alarm_id, "sent_angle_jump_s" | "sent_frame_gap_s")
-            || UiClientApp::has_sent_error_flag(message, "s"),
+        matches!(
+            alarm_id,
+            "sent_status_t1" | "sent_angle_jump_t1" | "sent_frame_gap_t1"
+        ) || UiClientApp::has_sent_error_flag(message, "t1"),
+        matches!(alarm_id, "sent_status_t1" | "sent_torque_jump_t1"),
+        matches!(
+            alarm_id,
+            "sent_status_t2" | "sent_angle_jump_t2" | "sent_frame_gap_t2"
+        ) || UiClientApp::has_sent_error_flag(message, "t2"),
+        matches!(alarm_id, "sent_status_t2" | "sent_torque_jump_t2"),
+        matches!(
+            alarm_id,
+            "sent_status_s" | "sent_angle_jump_s" | "sent_frame_gap_s"
+        ) || UiClientApp::has_sent_error_flag(message, "s"),
     ]
 }
 
@@ -901,6 +907,16 @@ impl UiClientApp {
 mod tests {
     #[test]
     fn replay_maps_frame_gaps_and_all_flagged_sent_parts() {
+        for (part, targets) in [
+            ("t1", [true, true, false, false, false]),
+            ("t2", [false, false, true, true, false]),
+            ("s", [false, false, false, false, true]),
+        ] {
+            assert_eq!(
+                super::sent_alarm_targets(&format!("sent_status_{part}"), "status=0x80"),
+                targets
+            );
+        }
         assert_eq!(
             super::sent_alarm_targets(
                 "sent_frame_gap_t1",

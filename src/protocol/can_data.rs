@@ -6,14 +6,40 @@ pub struct SentCanError {
     pub s_error: bool,
 }
 
-pub fn decode_sent_values(is_tx: bool, identifier: u32, data: &[u8]) -> Option<[(usize, f64); 5]> {
-    if is_tx || matches!(identifier, 1..=3) {
-        return None;
-    }
-    if data.len() < 53 {
-        return None;
-    }
+#[derive(Debug, PartialEq)]
+pub struct SentCanData {
+    pub values: Vec<(usize, f64)>,
+    /// T1, T2, S. Legacy frames have no status fields, including padded frames.
+    pub status: Option<[u8; 3]>,
+}
 
+/// Decode values and optional status together, selecting exactly one format by CAN ID.
+/// Only the full 0x003 layout defines status bytes; other IDs never return status.
+pub fn decode_sent_data(is_tx: bool, identifier: u32, data: &[u8]) -> Option<SentCanData> {
+    if is_tx {
+        return None;
+    }
+    if identifier == 0x003 {
+        if data.len() != 64 {
+            return None;
+        }
+        return Some(SentCanData {
+            values: read_sent_values(data)?.to_vec(),
+            status: Some([data[33], data[9], data[53]]),
+        });
+    }
+    let values = match identifier {
+        1 => decode_sent_1(data),
+        2 => decode_sent_2(data),
+        _ => read_sent_values(data).map(Vec::from),
+    }?;
+    Some(SentCanData {
+        values,
+        status: None,
+    })
+}
+
+fn read_sent_values(data: &[u8]) -> Option<[(usize, f64); 5]> {
     Some([
         (0, read_f32_le(data, 25)? as f64), // T1 angle
         (1, read_f32_le(data, 29)? as f64), // T1 torque
@@ -23,11 +49,7 @@ pub fn decode_sent_values(is_tx: bool, identifier: u32, data: &[u8]) -> Option<[
     ])
 }
 
-pub fn decode_sent_1(is_tx: bool, identifier: u32, data: &[u8]) -> Option<Vec<(usize, f64)>> {
-    if is_tx || identifier != 1 {
-        return None;
-    }
-
+fn decode_sent_1(data: &[u8]) -> Option<Vec<(usize, f64)>> {
     let flag: u8 = data.first().copied()?;
     match flag {
         1 => {
@@ -49,11 +71,7 @@ pub fn decode_sent_1(is_tx: bool, identifier: u32, data: &[u8]) -> Option<Vec<(u
     }
 }
 
-pub fn decode_sent_2(is_tx: bool, identifier: u32, data: &[u8]) -> Option<Vec<(usize, f64)>> {
-    if is_tx || identifier != 2 {
-        return None;
-    }
-
+fn decode_sent_2(data: &[u8]) -> Option<Vec<(usize, f64)>> {
     let t1_angle: i16 = read_i16_le(data, 6)?;
     let t1_torque: i16 = read_i16_le(data, 8)?;
 
@@ -67,7 +85,8 @@ pub fn decode_sent_error(is_tx: bool, identifier: u32, data: &[u8]) -> Option<Se
     if is_tx || identifier != 3 {
         return None;
     }
-    if data.len() < 4 {
+    // The full 0x003 layout is handled by decode_sent_data, not this legacy decoder.
+    if !(4..=8).contains(&data.len()) {
         return None;
     }
     Some(SentCanError {
@@ -122,33 +141,86 @@ mod tests {
     use super::*;
 
     #[test]
+    fn full_sent_frame_uses_float_layout_and_independent_status_bytes() {
+        let mut data = [0u8; 64];
+        for (offset, value) in [(25, 1.25_f32), (29, -2.5), (1, 3.75), (5, -4.5), (49, 5.5)] {
+            data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        data[9] = 2;
+        data[33] = 128;
+        data[53] = 255;
+        // Reserved fields and the preserved tail must not become samples.
+        data[10..25].fill(0xFF);
+        data[34..49].fill(0xFF);
+        data[54..64].fill(0xFF);
+        for counter in [0, 1, 2, 255] {
+            data[0] = counter;
+            let decoded = decode_sent_data(false, 0x003, &data).unwrap();
+            assert_eq!(
+                decoded.values,
+                vec![(0, 1.25), (1, -2.5), (2, 3.75), (3, -4.5), (4, 5.5)],
+            );
+            assert_eq!(decoded.status, Some([128, 2, 255]));
+        }
+        assert!(decode_sent_data(true, 0x003, &data).is_none());
+        for id in [0, 1, 2, 0x100] {
+            assert!(
+                decode_sent_data(false, id, &data).is_none_or(|decoded| decoded.status.is_none())
+            );
+        }
+        for len in 0..64 {
+            assert!(decode_sent_data(false, 0x003, &data[..len]).is_none());
+        }
+    }
+
+    #[test]
+    fn legacy_ids_keep_values_without_interpreting_payload_bytes_as_status() {
+        let mut data = [0u8; 64];
+        data[0] = 1;
+        data[6..8].copy_from_slice(&2100_i16.to_le_bytes());
+        data[8..10].copy_from_slice(&2200_i16.to_le_bytes());
+        data[33] = 128;
+        data[53] = 255;
+        // Byte 9 is part of legacy torque data, not a status byte.
+        for id in [1, 2] {
+            let decoded = decode_sent_data(false, id, &data).unwrap();
+            let expected = if id == 1 {
+                decode_sent_1(&data).unwrap()
+            } else {
+                decode_sent_2(&data).unwrap()
+            };
+            assert_eq!(decoded.values, expected);
+            assert_eq!(decoded.status, None);
+        }
+
+        let decoded = decode_sent_data(false, 0x200, &data).unwrap();
+        assert_eq!(decoded.values, read_sent_values(&data).unwrap());
+        assert_eq!(decoded.status, None);
+
+        // The legacy decoder itself no longer switches formats just because of padding.
+        assert_eq!(decode_sent_1(&data).unwrap().len(), 2);
+        let decoded = decode_sent_data(false, 1, &data[..12]).unwrap();
+        assert_eq!(decoded.status, None);
+        assert_eq!(decoded.values.len(), 2);
+    }
+
+    #[test]
     fn sent_1_flag_selects_t2_or_s_values() {
         let mut data = [0u8; 10];
         data[0] = 1;
         data[6..8].copy_from_slice(&i16::MIN.to_le_bytes());
         data[8..10].copy_from_slice(&i16::MAX.to_le_bytes());
         assert_eq!(
-            decode_sent_1(false, 1, &data),
+            decode_sent_1(&data),
             Some(vec![(2, 340.3225806451613), (3, -90.37362098553567)])
         );
 
         data[0] = 2;
         data[4..6].copy_from_slice(&0x1234_i16.to_le_bytes());
-        assert_eq!(
-            decode_sent_1(false, 1, &data),
-            Some(vec![(4, 189.42696354294102)])
-        );
+        assert_eq!(decode_sent_1(&data), Some(vec![(4, 189.42696354294102)]));
 
         data[0] = 3;
-        assert!(decode_sent_1(false, 1, &data).is_none());
-    }
-
-    #[test]
-    fn specialized_sent_ids_skip_the_generic_decoder() {
-        let data = [0u8; 64];
-        for identifier in [1, 2, 3] {
-            assert!(decode_sent_values(false, identifier, &data).is_none());
-        }
+        assert!(decode_sent_1(&data).is_none());
     }
 
     #[test]
@@ -165,5 +237,10 @@ mod tests {
         assert!(error.t1_error);
         assert!(!error.t2_error);
         assert!(error.s_error);
+        let mut data = [0u8; 64];
+        data[..4].copy_from_slice(&[2, 1, 0, 1]);
+        assert!(decode_sent_error(false, 3, &data).is_none());
+        assert!(decode_sent_error(false, 3, &data[..48]).is_none());
+        assert!(decode_sent_error(false, 3, &data[..8]).is_some());
     }
 }
