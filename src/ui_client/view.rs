@@ -1154,7 +1154,7 @@ impl UiClientApp {
                 egui::Align2::LEFT_BOTTOM,
                 format!("{:.3}", last[1]),
                 egui::FontId::proportional(11.0),
-                egui::Color32::YELLOW,
+                egui::Color32::from_rgb(190, 40, 35),
             );
         }
     }
