@@ -152,9 +152,9 @@ impl UiClientApp {
                                  OR ($4 AND alarm_id IN ('can_y_h', 'can_y_l'))
                                  OR ($5 AND alarm_id IN ('can_z_h', 'can_z_l'))
                                  OR ($6 AND alarm_id LIKE 'can_signal_timeout_%')
-                                 OR ($7 AND (alarm_id IN ('sent_torque_jump_t1', 'sent_angle_jump_t1', 'sent_frame_gap_t1') OR message ~ '(^|[[:space:],])t1=1([[:space:],]|$)'))
-                                 OR ($8 AND (alarm_id IN ('sent_torque_jump_t2', 'sent_angle_jump_t2', 'sent_frame_gap_t2') OR message ~ '(^|[[:space:],])t2=1([[:space:],]|$)'))
-                                 OR ($9 AND (alarm_id IN ('sent_angle_jump_s', 'sent_frame_gap_s') OR message ~ '(^|[[:space:],])s=1([[:space:],]|$)')))",
+                                 OR ($7 AND (alarm_id IN ('sent_status_t1', 'sent_torque_jump_t1', 'sent_angle_jump_t1', 'sent_frame_gap_t1') OR message ~ '(^|[[:space:],])t1=1([[:space:],]|$)'))
+                                 OR ($8 AND (alarm_id IN ('sent_status_t2', 'sent_torque_jump_t2', 'sent_angle_jump_t2', 'sent_frame_gap_t2') OR message ~ '(^|[[:space:],])t2=1([[:space:],]|$)'))
+                                 OR ($9 AND (alarm_id IN ('sent_status_s', 'sent_angle_jump_s', 'sent_frame_gap_s') OR message ~ '(^|[[:space:],])s=1([[:space:],]|$)')))",
                             &[
                                 &start_ts_ms,
                                 &end_ts_ms,
@@ -181,9 +181,9 @@ impl UiClientApp {
                                  OR ($4 AND alarm_id IN ('can_y_h', 'can_y_l'))
                                  OR ($5 AND alarm_id IN ('can_z_h', 'can_z_l'))
                                  OR ($6 AND alarm_id LIKE 'can_signal_timeout_%')
-                                 OR ($7 AND (alarm_id IN ('sent_torque_jump_t1', 'sent_angle_jump_t1', 'sent_frame_gap_t1') OR message ~ '(^|[[:space:],])t1=1([[:space:],]|$)'))
-                                 OR ($8 AND (alarm_id IN ('sent_torque_jump_t2', 'sent_angle_jump_t2', 'sent_frame_gap_t2') OR message ~ '(^|[[:space:],])t2=1([[:space:],]|$)'))
-                                 OR ($9 AND (alarm_id IN ('sent_angle_jump_s', 'sent_frame_gap_s') OR message ~ '(^|[[:space:],])s=1([[:space:],]|$)')))
+                                 OR ($7 AND (alarm_id IN ('sent_status_t1', 'sent_torque_jump_t1', 'sent_angle_jump_t1', 'sent_frame_gap_t1') OR message ~ '(^|[[:space:],])t1=1([[:space:],]|$)'))
+                                 OR ($8 AND (alarm_id IN ('sent_status_t2', 'sent_torque_jump_t2', 'sent_angle_jump_t2', 'sent_frame_gap_t2') OR message ~ '(^|[[:space:],])t2=1([[:space:],]|$)'))
+                                 OR ($9 AND (alarm_id IN ('sent_status_s', 'sent_angle_jump_s', 'sent_frame_gap_s') OR message ~ '(^|[[:space:],])s=1([[:space:],]|$)')))
                              ORDER BY ts_ms ASC, id ASC
                              LIMIT $10 OFFSET $11",
                             &[

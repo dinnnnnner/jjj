@@ -242,6 +242,90 @@ mod tests {
     }
 
     #[test]
+    fn sent_status_lamps_follow_snapshots_and_clear_independently() {
+        let mut app = app();
+        let event = |part: &str, channel: u8, cleared| AlarmEvent {
+            device_id: format!("can://TC1016:ch{channel}"),
+            alarm_id: format!("sent_status_{part}"),
+            level: AlarmLevel::Critical,
+            message: "status=0x80".to_string(),
+            raised_at: std::time::SystemTime::UNIX_EPOCH,
+            cleared,
+        };
+        app.apply_alarm_snapshot(crate::AlarmSnapshot {
+            epoch: uuid::Uuid::nil(),
+            revision: 5,
+            alarms: vec![event("t1", 0, false), event("s", 1, false)],
+        });
+        assert!(app.sent_status_alarm("sent_status_t1").is_some());
+        assert!(app.sent_status_alarm("sent_status_t2").is_none());
+        assert!(app.sent_status_alarm("sent_status_s").is_some());
+
+        // Draw the actual lamp window; two faults must paint two red lamps and one green lamp.
+        let ctx = eframe::egui::Context::default();
+        let mut input = eframe::egui::RawInput {
+            time: Some(0.0),
+            screen_rect: Some(eframe::egui::Rect::from_min_size(
+                eframe::egui::Pos2::ZERO,
+                eframe::egui::vec2(1400.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input.clone(), |ctx| app.draw_sent_status_indicators(ctx));
+        input.time = Some(1.0); // Let the window's appearance animation finish.
+        let output = ctx.run(input, |ctx| app.draw_sent_status_indicators(ctx));
+        let lamps: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                eframe::egui::epaint::Shape::Circle(circle) if circle.radius == 6.0 => {
+                    Some(circle.fill)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lamps
+                .iter()
+                .filter(|&&color| color == eframe::egui::Color32::from_rgb(220, 64, 52))
+                .count(),
+            2
+        );
+        assert_eq!(
+            lamps
+                .iter()
+                .filter(|&&color| color == eframe::egui::Color32::from_rgb(64, 170, 92))
+                .count(),
+            1
+        );
+
+        app.apply_alarm(crate::AlarmUpdate {
+            epoch: uuid::Uuid::nil(),
+            revision: 6,
+            event: event("t1", 0, true),
+        });
+        assert!(app.sent_status_alarm("sent_status_t1").is_none());
+        assert!(app.sent_status_alarm("sent_status_s").is_some());
+        app.apply_alarm_snapshot(crate::AlarmSnapshot {
+            epoch: uuid::Uuid::nil(),
+            revision: 7,
+            alarms: vec![],
+        });
+        assert!(app.sent_status_alarm("sent_status_s").is_none());
+
+        // Recovered alarms remain discoverable in the existing SENT record group.
+        let record = crate::AlarmRecordRow {
+            ts_ms: 0,
+            device_id: "can://TC1016:ch0".into(),
+            alarm_id: "sent_status_t1".into(),
+            level: "critical".into(),
+            message: "status=0x00".into(),
+            cleared: true,
+        };
+        assert_eq!(UiClientApp::alarm_record_groups(&record), "SENT T1");
+    }
+
+    #[test]
     fn chinese_can_self_test_status_updates_the_result() {
         let mut app = app();
         let status = "CAN 自检结果: X=1 Y=2 Z=3";

@@ -66,34 +66,6 @@ fn decode_and_send_frame(frame: &[u8], tx: &SyncSender<UiMsg>, stats: &FeedStats
     }
 }
 
-#[allow(dead_code)]
-pub fn feed_thread(feed_addr: String, tx: SyncSender<UiMsg>, stats: Arc<FeedStats>) {
-    let stream = match TcpStream::connect(&feed_addr) {
-        Ok(s) => s,
-        Err(err) => {
-            let _ = tx.try_send(UiMsg::Status(format!("connect failed: {err}")));
-            return;
-        }
-    };
-
-    let _ = tx.try_send(UiMsg::Status(format!("connected to {feed_addr}")));
-    let mut reader = BufReader::new(stream);
-
-    loop {
-        let frame = match read_feed_frame(&mut reader) {
-            Ok(frame) => frame,
-            Err(_) => {
-                let _ = tx.try_send(UiMsg::Status("feed closed".to_string()));
-                break;
-            }
-        };
-
-        if !decode_and_send_frame(&frame, &tx, &stats) {
-            return;
-        }
-    }
-}
-
 pub fn resilient_feed_thread(feed_addr: String, tx: SyncSender<UiMsg>, stats: Arc<FeedStats>) {
     loop {
         let stream = match TcpStream::connect(&feed_addr) {

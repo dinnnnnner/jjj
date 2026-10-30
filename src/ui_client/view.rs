@@ -129,50 +129,6 @@ impl UiClientApp {
             });
     }
 
-    /*    fn draw_can_alarm_indicator(&self, ctx: &egui::Context) {
-            if self.selected_view != TestSignalView::CanFrame {
-                return;
-            }
-
-            egui::Window::new("告警指示器")
-                .title_bar(true)
-                .resizable(false)
-                .collapsible(false)
-                .default_pos(egui::pos2(648.0, 40.0))
-                .fixed_size(egui::vec2(260.0, 110.0))
-                .show(ctx, |ui| {
-                    let (label, color, detail, message) = match self.can_alarm_indicator() {
-                        Some((item, true)) => (
-                            "告警",
-                            Self::alarm_level_color(&item.event.level),
-                            "当前激活".to_string(),
-                            format!("{} | {}", item.event.alarm_id, item.event.device_id),
-                        ),
-                        Some((item, false)) => (
-                            "已清除",
-                            egui::Color32::from_rgb(64, 170, 92),
-                            "最近一次".to_string(),
-                            format!("{} | {}", item.event.alarm_id, item.event.device_id),
-                        ),
-                        None => (
-                            "正常",
-                            egui::Color32::from_rgb(64, 170, 92),
-                            "没有can告警".to_string(),
-                            "等待告警事件...".to_string(),
-                        ),
-                    };
-
-                    ui.vertical_centered(|ui| {
-                        ui.heading("CAN 告警");
-                        ui.add_space(6.0);
-                        ui.colored_label(color, egui::RichText::new(label).size(28.0).strong());
-                        ui.label(detail);
-                        ui.small(message);
-                    });
-                });
-        }
-
-    */
     pub(crate) fn can_alarm_indicator(&self) -> Option<(&AlarmViewItem, bool)> {
         self.active_alarms
             .values()
@@ -229,11 +185,11 @@ impl UiClientApp {
             });
     }
 
-    pub(crate) fn sent_alarm_indicator(&self) -> Option<(&AlarmViewItem, bool)> {
-        self.active_alarms
-            .values()
-            .find(|item| item.event.alarm_id.starts_with("sent_error_"))
-            .map(|item| (item, true))
+    pub(crate) fn sent_alarm_indicator(&self) -> Option<&AlarmViewItem> {
+        self.active_alarms.values().find(|item| {
+            item.event.alarm_id.starts_with("sent_error_")
+                || item.event.alarm_id.starts_with("sent_status_")
+        })
     }
 
     pub(crate) fn draw_sent_alarm_indicator(&self, ctx: &egui::Context) {
@@ -249,23 +205,17 @@ impl UiClientApp {
             .fixed_size(egui::vec2(280.0, 110.0))
             .show(ctx, |ui| {
                 let (label, color, detail, message) = match self.sent_alarm_indicator() {
-                    Some((item, true)) => (
+                    Some(item) => (
                         "ALARM",
                         Self::alarm_level_color(&item.event.level),
                         "active".to_string(),
-                        format!("{} | {}", item.event.alarm_id, item.event.message),
-                    ),
-                    Some((item, false)) => (
-                        "LAST",
-                        egui::Color32::from_rgb(255, 180, 0),
-                        "latest SENT alarm".to_string(),
                         format!("{} | {}", item.event.alarm_id, item.event.message),
                     ),
                     None => (
                         "OK",
                         egui::Color32::from_rgb(64, 170, 92),
                         "no SENT alarm".to_string(),
-                        "waiting for SENT error frame...".to_string(),
+                        "waiting for CAN 0x003 status...".to_string(),
                     ),
                 };
 
@@ -276,6 +226,52 @@ impl UiClientApp {
                     ui.label(detail);
                     ui.small(message);
                 });
+            });
+    }
+
+    pub(crate) fn sent_status_alarm(&self, alarm_id: &str) -> Option<&AlarmViewItem> {
+        self.active_alarms
+            .values()
+            .filter(|item| item.event.alarm_id == alarm_id)
+            .min_by(|left, right| left.event.device_id.cmp(&right.event.device_id))
+    }
+
+    pub(crate) fn draw_sent_status_indicators(&self, ctx: &egui::Context) {
+        if self.selected_view != TestSignalView::Sent {
+            return;
+        }
+        egui::Window::new("CAN SENT 状态")
+            .resizable(false)
+            .collapsible(false)
+            .default_pos(egui::pos2(940.0, 40.0))
+            .fixed_size(egui::vec2(280.0, 90.0))
+            .show(ctx, |ui| {
+                for (label, alarm_id) in [
+                    ("T1 状态", "sent_status_t1"),
+                    ("T2 状态", "sent_status_t2"),
+                    ("S 状态", "sent_status_s"),
+                ] {
+                    let alarm = self.sent_status_alarm(alarm_id);
+                    let color = if alarm.is_some() {
+                        egui::Color32::from_rgb(220, 64, 52)
+                    } else {
+                        egui::Color32::from_rgb(64, 170, 92)
+                    };
+                    ui.horizontal(|ui| {
+                        let (rect, response) =
+                            ui.allocate_exact_size(egui::vec2(16.0, 20.0), egui::Sense::hover());
+                        ui.painter().circle_filled(rect.center(), 6.0, color);
+                        if let Some(item) = alarm {
+                            response.on_hover_text(format!(
+                                "{}\n{}",
+                                item.event.device_id, item.event.message,
+                            ));
+                        }
+                        ui.label(label);
+                        ui.colored_label(color, if alarm.is_some() { "故障" } else { "正常" });
+                    });
+                }
+                ui.small("任一 CAN 通道故障时亮红灯");
             });
     }
 
@@ -1291,6 +1287,7 @@ impl eframe::App for UiClientApp {
         self.draw_alarm_panel(ctx);
         self.draw_demo_alarm_indicator(ctx);
         self.draw_sent_alarm_indicator(ctx);
+        self.draw_sent_status_indicators(ctx);
         self.draw_sent_jump_indicator(ctx);
         self.draw_sent_jump_threshold_panel(ctx);
         self.draw_sent_angle_jump_indicator(ctx);

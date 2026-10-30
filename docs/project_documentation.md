@@ -373,7 +373,7 @@ CAN 数据解析约定：
 - `identifier = 0x100` -> sensor 0 / axis x
 - `identifier = 0x102` -> sensor 1 / axis y
 - `identifier = 0x104` -> sensor 2 / axis z
-- `identifier = 3` -> SENT error
+- `identifier = 3` -> 64 字节新数值/状态帧；4–8 字节兼容旧 SENT error
 - `identifier = 1` -> 首字节标志为 1 时，从 offset 6/8 读取 T2 angle / T2 torque；标志为 2 时，从 offset 4 读取 S angle。字段均为小端 i16。
 - `identifier = 2` -> 小端 i16，offset 6/8 对应 T1 angle / T1 torque。
 - ID 1 的 T2 数据和 ID 2 要求至少 10 字节，ID 1 的 S 数据要求至少 6 字节；填充到 64 字节也只走整数解码器。
@@ -917,7 +917,7 @@ sender_stress_report / sender_1min
   -> processed_bus
   -> run_ui_forwarder
   -> length-prefixed binary frame on 127.0.0.1:19011
-  -> ui_client feed_thread
+  -> ui_client resilient_feed_thread
   -> egui 曲线窗口
 ```
 
@@ -939,7 +939,7 @@ SerialTransport
 TSMaster callback
   -> CanTransport
   -> run_can_ingress
-  -> decode_sent_values
+  -> decode_sent_data
   -> optional SentMovingAverage
   -> TelemetrySample source_kind=CanSent
   -> raw_bus
