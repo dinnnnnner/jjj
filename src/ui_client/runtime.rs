@@ -53,7 +53,11 @@ fn run_ui(config_error: Option<String>) -> eframe::Result<()> {
         resilient_feed_thread(feed_addr_for_thread, tx, feed_stats_for_thread);
     });
 
-    let options = eframe::NativeOptions::default();
+    let options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Glow,
+        vsync: false,
+        ..Default::default()
+    };
     let app_creator = move |cc: &eframe::CreationContext<'_>| -> Result<
         Box<dyn eframe::App>,
         Box<dyn std::error::Error + Send + Sync>,
@@ -61,7 +65,7 @@ fn run_ui(config_error: Option<String>) -> eframe::Result<()> {
         setup_chinese_fonts(&cc.egui_ctx);
         cc.egui_ctx
             .options_mut(|options| options.warn_on_id_clash = false);
-        Ok(Box::new(UiClientApp::new(
+        let mut app = UiClientApp::new(
             rx,
             ui_tx.clone(),
             feed_stats,
@@ -69,7 +73,9 @@ fn run_ui(config_error: Option<String>) -> eframe::Result<()> {
             control_addr,
             pg_dsn,
             config_error,
-        )))
+        );
+        app.vsync_control = super::vsync::VsyncControl::new(cc);
+        Ok(Box::new(app))
     };
 
     eframe::run_native("demo2_ui_client", options, Box::new(app_creator))

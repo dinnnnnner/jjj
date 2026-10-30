@@ -1,5 +1,6 @@
 use crate::*;
 use demo2::domain::AlarmLevel;
+use std::time::Instant;
 
 impl UiClientApp {
     pub(crate) fn sensor_label(&self, sensor_id: usize) -> String {
@@ -1182,14 +1183,46 @@ impl UiClientApp {
 
 impl eframe::App for UiClientApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let feed_backlog = self.drain_messages();
+        // Count each frame once, even when egui requests another layout pass.
+        if ctx.current_pass_index() == 0 {
+            let now = Instant::now();
+            if let Some(started_at) = self.fps_window_started_at {
+                self.fps_frame_count += 1;
+                let elapsed = now.duration_since(started_at).as_secs_f64();
+                if elapsed >= 1.0 {
+                    self.fps = Some(f64::from(self.fps_frame_count) / elapsed);
+                    self.fps_frame_count = 0;
+                    self.fps_window_started_at = Some(now);
+                }
+            } else {
+                self.fps_window_started_at = Some(now);
+            }
+        }
+        self.drain_messages();
         self.apply_ctrl_wheel_zoom(ctx);
 
         egui::TopBottomPanel::top("self_test_result_top")
             .resizable(false)
             .default_height(24.0)
             .show(ctx, |ui| {
-                ui.label(format!("最近自检结果: {}", self.last_can_self_test_result));
+                ui.horizontal(|ui| {
+                    ui.label(format!("最近自检结果: {}", self.last_can_self_test_result));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let displayed = self.display_monitor.snapshot();
+                        let display_text = match displayed.fps {
+                            Some(fps) => format!("Displayed FPS: {fps:.1}"),
+                            None => "Displayed FPS: --（悬停查看原因）".to_string(),
+                        };
+                        ui.monospace(display_text).on_hover_text(displayed.status);
+                        ui.separator();
+                        let text = match self.fps {
+                            Some(fps) => format!("UI FPS: {fps:.1}"),
+                            None => "UI FPS: --".to_string(),
+                        };
+                        ui.monospace(text)
+                            .on_hover_text("界面帧率，每秒更新一次；不是采样率或显示器刷新率。");
+                    });
+                });
             });
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
@@ -1199,7 +1232,7 @@ impl eframe::App for UiClientApp {
                 ui.colored_label(egui::Color32::RED, error);
             }
             ui.label("serial data path: serial -> collector_service -> ui_client");
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("重排窗口并重置缩放").clicked() {
                     self.reset_layout();
                 }
@@ -1223,6 +1256,7 @@ impl eframe::App for UiClientApp {
                 }
                 ui.separator();
                 ui.checkbox(&mut self.realtime_downsampling_enabled, "实时曲线降采样");
+                self.vsync_control.ui(ui);
             });
             ui.horizontal(|ui| {
                 ui.label("Test signal");
@@ -1393,10 +1427,7 @@ impl eframe::App for UiClientApp {
             self.dynamic_windows.remove(idx);
         }
 
-        if feed_backlog {
-            ctx.request_repaint();
-        } else {
-            ctx.request_repaint_after(Duration::from_millis(16));
-        }
+        // Keep drawing as fast as the backend allows, without a frame delay.
+        ctx.request_repaint();
     }
 }

@@ -121,6 +121,77 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "observes the running collector feed; set DEMO2_PROBE_SECONDS if needed"]
+    fn live_feed_timing_probe() {
+        use std::collections::HashMap;
+        use std::time::{Instant, SystemTime, UNIX_EPOCH};
+        let address =
+            std::env::var("DEMO2_UI_FEED_ADDR").unwrap_or_else(|_| "127.0.0.1:19011".into());
+        let seconds = std::env::var("DEMO2_PROBE_SECONDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(15);
+        let stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        let started = Instant::now();
+        let mut streams: HashMap<(String, usize), (u64, Instant, Vec<f64>, Vec<f64>)> =
+            HashMap::new();
+        while started.elapsed() < Duration::from_secs(seconds) {
+            // A timeout may occur partway through a frame, so stop rather than
+            // attempting to resume at a guessed frame boundary.
+            let Ok(frame) = read_feed_frame(&mut reader) else {
+                break;
+            };
+            if let Ok(FeedMsg::Telemetry(sample)) = decode_feed_msg(&frame) {
+                let now = Instant::now();
+                let age = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64
+                    - sample.captured_at_ms;
+                let entry = streams
+                    .entry((sample.device_id, sample.sensor_id))
+                    .or_insert_with(|| (0, now, Vec::new(), Vec::new()));
+                if entry.0 > 0 {
+                    entry
+                        .2
+                        .push(now.duration_since(entry.1).as_secs_f64() * 1000.0);
+                }
+                entry.0 += 1;
+                entry.1 = now;
+                entry.3.push(age.max(0) as f64);
+            }
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        let mut streams = streams.into_iter().collect::<Vec<_>>();
+        streams.sort_by(|a, b| a.0.cmp(&b.0));
+        for ((device, channel), (count, _, mut gaps, mut ages)) in streams {
+            gaps.sort_by(f64::total_cmp);
+            ages.sort_by(f64::total_cmp);
+            let percentile = |items: &[f64], percent: usize| {
+                items
+                    .get((items.len().saturating_sub(1) * percent) / 100)
+                    .copied()
+                    .unwrap_or(0.0)
+            };
+            eprintln!(
+                "{device} sid={channel}: count={count}, rate={:.1}/s, receive_gap_p95={:.3}ms max={:.3}ms, capture_to_probe_p95={:.1}ms max={:.1}ms",
+                count as f64 / elapsed,
+                percentile(&gaps, 95),
+                percentile(&gaps, 100),
+                percentile(&ages, 95),
+                percentile(&ages, 100)
+            );
+        }
+        eprintln!(
+            "probe duration={elapsed:.3}s (includes time before/after the sender; not UI queue latency)"
+        );
+    }
+
+    #[test]
     fn disconnected_ui_stops_collector_retry_loop() {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         drop(rx);

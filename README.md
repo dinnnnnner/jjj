@@ -14,6 +14,28 @@
 - PostgreSQL 持久化：写入遥测、告警和系统事件，遥测表按日期分区。
 - UI 客户端：展示多传感器实时曲线、状态、告警记录和历史数据回放视图。
 
+## 界面帧率（Windows）
+
+UI 顶部同时显示 `UI FPS`（界面更新频率）和 `Displayed FPS`（Windows 显示事件统计）。
+主 UI 默认关闭垂直同步，并在每帧请求立即重绘，不再主动等待 16ms。顶部“垂直同步”开关可立即启用/关闭同步，无需重启；当前开关支持 Windows WGL/Glow 后端，通过驱动交换间隔接口切换并读回确认。不支持时禁用开关，失败时显示原因；重启恢复默认关闭。
+实际速率受渲染耗时、驱动和窗口系统影响，关闭同步后 CPU/GPU 占用可能增加。
+`Displayed FPS` 仍受显示器及系统呈现方式约束，不一定与 `UI FPS` 一同升高。
+首次运行 `powershell -File scripts/install_presentmon.ps1` 下载并校验官方 PresentMon 2.3.1 独立采集程序，不安装系统服务。
+启动 UI 时自动在后台采集当前进程，无额外控制台窗口；退出 UI 时结束自己的采集会话。
+ETW 采集要求管理员权限，或将账户加入 Windows `Performance Log Users` 用户组并重新登录。
+权限不足、采集失败、无显示数据时显示 `--`，悬停查看原因，不回退成 UI FPS，也不把未知数据当成零帧。
+
+默认寻找 UI 可执行文件旁的 `PresentMon-2.3.1-x64.exe`、其 `tools/presentmon` 子目录，以及开发目录的 `tools/presentmon`。
+也可以通过 `DEMO2_PRESENTMON_PATH` 指定兼容的 2.3.1 可执行文件路径。分发时附带安装脚本下载的 `LICENSE.txt`。
+
+统计使用 `CPUStartTime + DisplayLatency` 得到呈现时间，仅计入 `DisplayedTime > 0` 的帧，
+按约 1 秒窗口的显示时间间隔计算，每 250ms 发布一次。ETW 事件本身有延迟；超过 3 秒没有有效事件时清除旧值。
+同一进程出现多个呈现链时取最近最活跃的一条，不累加帧率；该项目目前只有一个原生主窗口。
+这是系统追踪的呈现帧率，不是显示器物理发光测量，也不比较相邻帧的像素是否相同。
+OpenGL 的事件可用性依赖驱动和窗口状态。
+
+官方接口说明：https://github.com/GameTechDev/PresentMon/blob/v2.3.1/README-ConsoleApplication.md
+
 ## 项目结构
 
 ```text
@@ -95,6 +117,27 @@ cargo run --bin ui_client
 ```powershell
 cargo run --bin sender_stress_report
 ```
+
+不带参数默认测试 4 路信号、目标 3500 tick/s（每路 3500 条/秒，合计 14000 条/秒），连续运行 60 秒。
+参数可以覆盖默认值，例如改为每路 3000 条/秒并运行 30 秒：
+
+```powershell
+cargo run --release --bin sender_stress_report -- --channels 4 --tick-hz 3000 --seconds 30
+```
+
+一个 tick 发送每路各一个样本。只运行一个连续阶段，没有扫频或阶段间停顿。
+发送器采用截止时间计时，高频测试会短暂忙等以避免普通休眠的计时粒度影响，并保留逐条 ACK，
+实际达到的速率以 `actual` 为准。ACK 成功仅代表采集端确认，不代表 UI 无丢弃。
+每次连接会打印 `UI device: tcp://...`，在 UI 的 TCP 视图中选择本次连接的设备；再次运行时端口可能变化。
+
+采集服务的 UI 转发连接启用 TCP_NODELAY，并将长度前缀和正文合并成一次写入，减少小包等待造成的批量到达。
+可用以下手动诊断检查接收间隔和采集至探针延迟（运行中的采集服务默认位于 19011；支持 `DEMO2_UI_FEED_ADDR` 和 `DEMO2_PROBE_SECONDS`）：
+
+```powershell
+cargo test --bin ui_client live_feed_timing_probe -- --ignored --nocapture
+```
+
+探针不测量 UI 内部队列或显示帧率；其平均接收速率包含发送前后的观察空档，不能直接作为发送器实际速率。
 
 也可以使用 `sender_1min` 回放导出的 CAN 数据文件：
 

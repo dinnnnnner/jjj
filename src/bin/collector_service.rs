@@ -253,6 +253,13 @@ async fn serve_ui_client(
     stats: Arc<CollectorStats>,
     bus: EventBus,
 ) {
+    // Telemetry is latency-sensitive. Do not let a tiny length prefix leave
+    // the payload waiting for Nagle/delayed ACK; send one complete wire frame.
+    if let Err(error) = socket.set_nodelay(true) {
+        warn!(%error, "cannot configure low-latency UI feed");
+        return;
+    }
+    let mut wire_frame = Vec::new();
     stats.ui_clients.fetch_add(1, Ordering::Relaxed);
     // Initial repair follows the same ordered stream as pending transitions.
     bus.publish_alarm_snapshot();
@@ -272,10 +279,10 @@ async fn serve_ui_client(
             stats.ui_drop.fetch_add(1, Ordering::Relaxed);
             continue;
         };
-        if socket.write_all(&len.to_be_bytes()).await.is_err() {
-            break;
-        }
-        if socket.write_all(&line).await.is_err() {
+        wire_frame.clear();
+        wire_frame.extend_from_slice(&len.to_be_bytes());
+        wire_frame.extend_from_slice(&line);
+        if socket.write_all(&wire_frame).await.is_err() {
             break;
         }
     }
@@ -985,6 +992,54 @@ mod tests {
         let mut frame = vec![0; len];
         client.read_exact(&mut frame).await.unwrap();
         decode_feed_msg(&frame).unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "measures localhost UI feed latency; timing depends on the host"]
+    async fn ui_feed_latency_probe() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            let (tx, rx) = broadcast::channel(256);
+            let task = tokio::spawn(serve_ui_client(
+                server,
+                rx,
+                Arc::default(),
+                EventBus::new(8),
+            ));
+            let origin = std::time::Instant::now();
+            let producer = tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_millis(16));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                for _ in 0..120 {
+                    tick.tick().await;
+                    let msg = UiFeedMsg::Status(origin.elapsed().as_nanos().to_string());
+                    tx.send(encode_feed_msg(&msg).unwrap()).unwrap();
+                }
+            });
+            let mut delays = Vec::new();
+            for _ in 0..120 {
+                let UiFeedMsg::Status(sent) = read_ui_message(&mut client).await else {
+                    panic!("unexpected message")
+                };
+                delays.push(
+                    (origin.elapsed().as_nanos() - sent.parse::<u128>().unwrap()) as f64
+                        / 1_000_000.0,
+                );
+            }
+            delays.sort_by(f64::total_cmp);
+            eprintln!(
+                "UI feed latency (120 frames): p50={:.3}ms p95={:.3}ms max={:.3}ms",
+                delays[60], delays[114], delays[119]
+            );
+            producer.await.unwrap();
+            task.await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

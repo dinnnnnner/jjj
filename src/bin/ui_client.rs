@@ -8,7 +8,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, SyncSender};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[path = "collector_service.rs"]
 mod embedded_collector_service;
@@ -43,6 +43,8 @@ struct UiClientApp {
     control_addr: String,
     config_error: Option<String>,
     state: UiClientState,
+    display_monitor: ui_client::presentmon::DisplayMonitor,
+    vsync_control: ui_client::vsync::VsyncControl,
 }
 
 impl Deref for UiClientApp {
@@ -86,6 +88,8 @@ impl UiClientApp {
             control_addr,
             config_error,
             state: UiClientState::new(pg_dsn, Self::MAX_ALARM_HISTORY),
+            display_monitor: ui_client::presentmon::DisplayMonitor::start(),
+            vsync_control: ui_client::vsync::VsyncControl::unavailable("尚未初始化 OpenGL"),
         }
     }
 

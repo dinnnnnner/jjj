@@ -12,6 +12,64 @@ const DEFAULT_INGRESS_ADDR: &str = "127.0.0.1:19010";
 const CONNECT_MAX_RETRIES: u32 = 30;
 const CONNECT_RETRY_MS: u64 = 300;
 
+#[derive(Debug, PartialEq)]
+struct Options {
+    channels: usize,
+    tick_hz: u64,
+    seconds: u64,
+}
+
+impl Options {
+    fn parse(args: impl Iterator<Item = String>) -> anyhow::Result<Self> {
+        let mut options = Self {
+            channels: 4,
+            tick_hz: 3500,
+            seconds: 60,
+        };
+        let mut args = args;
+        while let Some(arg) = args.next() {
+            let value = args
+                .next()
+                .with_context(|| format!("missing value for {arg}"))?;
+            match arg.as_str() {
+                "--channels" => {
+                    options.channels = value.parse().context("invalid channel count")?
+                }
+                "--tick-hz" => options.tick_hz = value.parse().context("invalid tick rate")?,
+                "--seconds" => options.seconds = value.parse().context("invalid duration")?,
+                _ => {
+                    anyhow::bail!("unknown option {arg}; use --channels N --tick-hz N --seconds N")
+                }
+            }
+        }
+        anyhow::ensure!(
+            (1..=SENSOR_COUNT).contains(&options.channels),
+            "channels must be 1..={SENSOR_COUNT}"
+        );
+        anyhow::ensure!(
+            (1..=100_000).contains(&options.tick_hz),
+            "tick-hz must be 1..=100000"
+        );
+        anyhow::ensure!(
+            (1..=3600).contains(&options.seconds),
+            "seconds must be 1..=3600"
+        );
+        Ok(options)
+    }
+}
+
+fn wait_until(deadline: Instant) {
+    // Ordinary Windows sleeps are too coarse for a 333 us tick. Sleep for
+    // the long part and spin only the final <= 1 ms of a stress-test tick.
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        if remaining > Duration::from_millis(1) {
+            thread::sleep(remaining - Duration::from_micros(200));
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+}
+
 fn crc16(data: &[u8]) -> u16 {
     let mut crc: u16 = 0xFFFF;
     for b in data {
@@ -132,11 +190,14 @@ fn run_stage(
     stream: &mut TcpStream,
     target_tick_hz: u64,
     stage_secs: u64,
+    channels: usize,
+    signal_start: Instant,
     req_id_seed: &mut u64,
     sys: &mut System,
 ) -> StageResult {
-    let interval = Duration::from_micros((1_000_000 / target_tick_hz).max(1));
+    let interval = Duration::from_secs_f64(1.0 / target_tick_hz as f64);
     let stage_start = Instant::now();
+    let mut next_tick = stage_start;
 
     let mut ticks = 0_u64;
     let mut sent_frames = 0_u64;
@@ -144,9 +205,9 @@ fn run_stage(
     let mut ack_fail = 0_u64;
 
     while stage_start.elapsed() < Duration::from_secs(stage_secs) {
-        let t = stage_start.elapsed().as_secs_f64();
+        let t = signal_start.elapsed().as_secs_f64();
 
-        for sid in 0..SENSOR_COUNT {
+        for sid in 0..channels {
             let value = sensor_value(sid, t);
             let payload = format!("sid={sid},value={value:.3}").into_bytes();
 
@@ -166,7 +227,12 @@ fn run_stage(
         }
 
         ticks = ticks.saturating_add(1);
-        thread::sleep(interval);
+        next_tick += interval;
+        // Avoid bursts of catch-up traffic when the receiver cannot keep up.
+        if next_tick < Instant::now() {
+            next_tick = Instant::now();
+        }
+        wait_until(next_tick);
     }
 
     let duration_s = stage_start.elapsed().as_secs_f64();
@@ -188,7 +254,7 @@ fn run_stage(
 
     StageResult {
         target_tick_hz,
-        target_frame_hz: target_tick_hz * SENSOR_COUNT as u64,
+        target_frame_hz: target_tick_hz * channels as u64,
         duration_s,
         ticks,
         sent_frames,
@@ -202,6 +268,17 @@ fn run_stage(
 }
 
 fn main() -> anyhow::Result<()> {
+    if std::env::args().any(|arg| arg == "--help" || arg == "-h") {
+        println!(
+            "sender_stress_report [--channels 1..10] [--tick-hz 1..100000] [--seconds 1..3600]"
+        );
+        println!(
+            "Default: 4 channels, target 3500 tick/s (14000 samples/s), one continuous 60s stage."
+        );
+        println!("Use --tick-hz to override the target; one tick updates all selected channels.");
+        return Ok(());
+    }
+    let options = Options::parse(std::env::args().skip(1))?;
     let ingress_addr =
         std::env::var("DEMO2_INGRESS_ADDR").unwrap_or_else(|_| DEFAULT_INGRESS_ADDR.to_string());
     println!("connecting demo2 ingress: {ingress_addr}");
@@ -214,22 +291,37 @@ fn main() -> anyhow::Result<()> {
     stream
         .set_read_timeout(Some(Duration::from_millis(120)))
         .context("set read timeout failed")?;
+    stream.set_write_timeout(Some(Duration::from_millis(120)))?;
+    stream.set_nodelay(true)?;
+    println!(
+        "UI device: tcp://{} (select this device in the TCP view)",
+        stream.local_addr()?
+    );
 
     let mut sys = System::new_all();
     let mut req = 50_000_u64;
 
-    let stages_tick_hz = [2_u64, 5, 10, 20, 40, 80];
-    let stage_secs = 8_u64;
+    let stages_tick_hz = [options.tick_hz];
+    let stage_secs = options.seconds;
+    let signal_start = Instant::now();
 
     println!("=== sender stress report start ===");
     println!(
         "sensor_count={}, target_tick_hz={:?}, each {}s",
-        SENSOR_COUNT, stages_tick_hz, stage_secs
+        options.channels, stages_tick_hz, stage_secs
     );
 
     let mut results = Vec::new();
     for tick_hz in stages_tick_hz {
-        let r = run_stage(&mut stream, tick_hz, stage_secs, &mut req, &mut sys);
+        let r = run_stage(
+            &mut stream,
+            tick_hz,
+            stage_secs,
+            options.channels,
+            signal_start,
+            &mut req,
+            &mut sys,
+        );
         println!(
             "stage target={}tick/s({}frame/s) actual={:.1}tick/s({:.1}frame/s) sent={} ack_ok={} ack_fail={} loss={:.2}% mem={:.2}MB",
             r.target_tick_hz,
@@ -243,7 +335,6 @@ fn main() -> anyhow::Result<()> {
             r.mem_mb
         );
         results.push(r);
-        thread::sleep(Duration::from_millis(400));
     }
 
     let best = results
@@ -273,8 +364,8 @@ fn main() -> anyhow::Result<()> {
 
     if let Some(b) = best {
         println!(
-            "suggested upper bound (loss<=1%): {:.1} frame/s (~{:.1} tick/s, {} sensors)",
-            b.actual_frame_hz, b.actual_tick_hz, SENSOR_COUNT
+            "best observed rate (ACK failure<=1%; not UI delivery guarantee): {:.1} frame/s (~{:.1} tick/s, {} sensors)",
+            b.actual_frame_hz, b.actual_tick_hz, options.channels
         );
     } else {
         println!("no stage met loss<=1%, reduce sender rate or optimize receiver path");
@@ -282,4 +373,41 @@ fn main() -> anyhow::Result<()> {
 
     println!("=== sender stress report done ===");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_four_channels_at_3000_ticks() {
+        let options = Options::parse(
+            ["--channels", "4", "--tick-hz", "3000", "--seconds", "15"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(
+            options,
+            Options {
+                channels: 4,
+                tick_hz: 3000,
+                seconds: 15
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_and_missing_values() {
+        for args in [
+            vec!["--channels", "0"],
+            vec!["--channels", "11"],
+            vec!["--tick-hz", "0"],
+            vec!["--seconds", "0"],
+            vec!["--tick-hz"],
+            vec!["--wrong", "1"],
+        ] {
+            assert!(Options::parse(args.into_iter().map(str::to_owned)).is_err());
+        }
+    }
 }
